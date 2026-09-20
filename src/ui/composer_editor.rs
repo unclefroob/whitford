@@ -128,7 +128,7 @@ fn document(initial_json: &str, nonce: &str) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
-<style>:root{{color-scheme:light dark}}html,body{{min-height:100%;margin:0;background:transparent;color:inherit;font:15px system-ui}}#editor{{box-sizing:border-box;min-height:250px;padding:14px;outline:none;line-height:1.5}}blockquote{{border-left:3px solid #7b8490;margin-left:8px;padding-left:12px;color:#69727d}}a{{color:#3584e4}}img{{max-width:100%;height:auto}}</style></head>
+<style>:root{{color-scheme:light dark}}html,body{{min-height:100%;margin:0;background:transparent;color:#2e3436;font:15px system-ui}}#editor{{box-sizing:border-box;min-height:250px;padding:14px;outline:none;line-height:1.5;caret-color:currentColor}}blockquote{{border-left:3px solid #7b8490;margin-left:8px;padding-left:12px;color:#5e6670}}a{{color:#1c71d8}}img{{max-width:100%;height:auto}}@media(prefers-color-scheme:dark){{html,body{{color:#f6f5f4}}blockquote{{color:#b6bbc0}}a{{color:#62a0ea}}}}</style></head>
 <body><div id="editor" contenteditable="true" role="textbox" aria-label="Message body" aria-multiline="true"></div><script nonce="{nonce}">
 const editor=document.getElementById('editor'); editor.innerHTML={initial_json}; let timer;
 const initialQuote=editor.querySelector('blockquote');if(initialQuote)initialQuote.hidden=true;
@@ -182,5 +182,14 @@ mod tests {
         assert!(html.contains("<script nonce=\"test-nonce\">"));
         assert!(html.contains("clipboardData.getData('text/plain')"));
         assert!(!html.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn editor_has_legible_colours_in_both_system_themes() {
+        let html = document("\"\"", "test-nonce");
+        assert!(html.contains("color:#2e3436"));
+        assert!(html.contains("prefers-color-scheme:dark"));
+        assert!(html.contains("color:#f6f5f4"));
+        assert!(html.contains("caret-color:currentColor"));
     }
 }
