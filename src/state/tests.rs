@@ -735,13 +735,13 @@ fn reply_requires_loaded_context_and_prevents_duplicate_send() {
     let send = state.dispatch(Action::SendReply);
     let (request_id, generation) = match send.effects.as_slice() {
         [
-            Effect::SendWorker(WorkerCommand::SendReply {
+            Effect::SendWorker(WorkerCommand::SendMessage {
                 request_id,
                 generation,
                 submission,
                 ..
             }),
-        ] if submission.body == "Thanks" => (*request_id, *generation),
+        ] if submission.draft.text == "Thanks" => (*request_id, *generation),
         other => panic!("unexpected send effect: {other:?}"),
     };
     assert!(state.dispatch(Action::SendReply).effects.is_empty());
@@ -777,7 +777,7 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
     state.dispatch(Action::UpdateReplyBody("Hello".into()));
     let send = state.dispatch(Action::SendReply);
     let (request_id, generation) = match send.effects[0] {
-        Effect::SendWorker(WorkerCommand::SendReply {
+        Effect::SendWorker(WorkerCommand::SendMessage {
             request_id,
             generation,
             ..
@@ -797,11 +797,17 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
         request_id,
         generation,
     }));
-    assert_eq!(complete.feedback, Some("Reply sent"));
-    assert!(matches!(
-        complete.effects.as_slice(),
-        [Effect::SendWorker(WorkerCommand::Refresh { .. })]
-    ));
+    assert_eq!(complete.feedback, Some("Message sent"));
+    assert!(
+        complete
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
+    );
+    assert!(complete.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::DeleteDraft { .. })
+    )));
     assert!(matches!(state.snapshot().composer, ComposerState::Closed));
 }
 
@@ -813,7 +819,7 @@ fn uncertain_reply_requires_explicit_resend_confirmation() {
     state.dispatch(Action::UpdateReplyBody("Hello".into()));
     let send = state.dispatch(Action::SendReply);
     let (request_id, generation) = match send.effects[0] {
-        Effect::SendWorker(WorkerCommand::SendReply {
+        Effect::SendWorker(WorkerCommand::SendMessage {
             request_id,
             generation,
             ..
@@ -839,7 +845,7 @@ fn uncertain_reply_requires_explicit_resend_confirmation() {
     ));
     assert!(matches!(
         state.dispatch(Action::ConfirmResend).effects.as_slice(),
-        [Effect::SendWorker(WorkerCommand::SendReply { .. })]
+        [Effect::SendWorker(WorkerCommand::SendMessage { .. })]
     ));
 }
 
@@ -864,4 +870,368 @@ fn disconnect_is_blocked_without_discarding_an_in_flight_reply() {
         ComposerState::Sending { ref draft, .. } if draft.body == "Keep this draft"
     ));
     assert!(!state.snapshot().can_disconnect);
+}
+
+#[test]
+fn reply_all_and_forward_create_distinct_generic_drafts() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReplyAll);
+    let snapshot = state.snapshot();
+    let ComposerState::Editing { draft } = snapshot.composer else {
+        panic!()
+    };
+    assert!(matches!(
+        draft.compose.kind,
+        crate::composer::ComposeKind::ReplyAll { .. }
+    ));
+    assert!(draft.compose.thread.is_some());
+    state.dispatch(Action::DiscardDraft);
+
+    state.dispatch(Action::BeginForward);
+    let snapshot = state.snapshot();
+    let ComposerState::Editing { draft } = snapshot.composer else {
+        panic!()
+    };
+    assert!(matches!(
+        draft.compose.kind,
+        crate::composer::ComposeKind::Forward { .. }
+    ));
+    assert!(draft.compose.to.is_empty());
+    assert!(draft.compose.thread.is_none());
+}
+
+#[test]
+fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateReplyBody("kept locally".into()));
+    let hidden = state.dispatch(Action::HideComposer);
+    let (operation_id, draft_id, revision) = hidden
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SaveDraft {
+                operation_id,
+                draft,
+            }) => Some((*operation_id, draft.id.clone(), draft.dirty_revision)),
+            _ => None,
+        })
+        .expect("close save");
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { .. }
+    ));
+    assert!(state.snapshot().composer_close_pending);
+    let saved = state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
+        operation_id,
+        account_email: "person@example.com".into(),
+        draft_id,
+        revision,
+    }));
+    assert_eq!(saved.feedback, Some("Draft saved on this device"));
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+
+    state.dispatch(Action::ResumeDraft);
+    assert!(matches!(state.snapshot().composer,
+        ComposerState::Editing { ref draft } if draft.body == "kept locally"));
+    let discarded = state.dispatch(Action::DiscardDraft);
+    assert!(discarded.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::DeleteDraft { .. })
+    )));
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+}
+
+#[test]
+fn staging_blocks_send_until_the_attachment_finishes_or_fails() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateReplyBody("with a file".into()));
+    let stage = state.dispatch(Action::StageAttachment {
+        source: "/tmp/report.pdf".into(),
+        display_name: "report.pdf".into(),
+        media_type: "application/pdf".into(),
+    });
+    let operation_id = stage
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::StageAttachment { operation_id, .. }) => {
+                Some(*operation_id)
+            }
+            _ => None,
+        })
+        .expect("stage operation");
+    assert_eq!(state.snapshot().pending_attachment_staging, 1);
+    let blocked = state.dispatch(Action::SendReply);
+    assert_eq!(
+        blocked.feedback,
+        Some("Wait for attachments to finish loading")
+    );
+    assert!(blocked.effects.is_empty());
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { .. }
+    ));
+
+    state.dispatch(Action::Worker(WorkerEvent::DraftOperationFailed {
+        operation_id,
+        account_email: "person@example.com".into(),
+    }));
+    assert_eq!(state.snapshot().pending_attachment_staging, 0);
+    assert!(matches!(
+        state.dispatch(Action::SendReply).effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::SendMessage { .. })]
+    ));
+}
+
+#[test]
+fn close_waits_for_acknowledged_save_and_failure_keeps_composer_visible() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateReplyBody("must survive".into()));
+    let closing = state.dispatch(Action::HideComposerAndCloseApp);
+    let operation_id = closing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SaveDraft { operation_id, .. }) => {
+                Some(*operation_id)
+            }
+            _ => None,
+        })
+        .expect("save before close");
+    assert!(state.snapshot().composer_close_pending);
+    assert_eq!(state.snapshot().draft_save_state, DraftSaveState::Saving);
+
+    state.dispatch(Action::Worker(WorkerEvent::DraftOperationFailed {
+        operation_id,
+        account_email: "person@example.com".into(),
+    }));
+    let snapshot = state.snapshot();
+    assert!(!snapshot.composer_close_pending);
+    assert_eq!(snapshot.draft_save_state, DraftSaveState::Failed);
+    assert!(matches!(snapshot.composer, ComposerState::Editing { .. }));
+
+    let retry = state.dispatch(Action::HideComposerAndCloseApp);
+    let (operation_id, draft_id, revision) = retry
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SaveDraft {
+                operation_id,
+                draft,
+            }) => Some((*operation_id, draft.id.clone(), draft.dirty_revision)),
+            _ => None,
+        })
+        .expect("retry save");
+    let saved = state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
+        operation_id,
+        account_email: "person@example.com".into(),
+        draft_id,
+        revision,
+    }));
+    assert!(matches!(
+        saved.effects.as_slice(),
+        [Effect::CloseApplicationWindow]
+    ));
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+}
+
+#[test]
+fn worker_loss_releases_composer_save_and_staging_locks() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::StageAttachment {
+        source: "/tmp/report.pdf".into(),
+        display_name: "report.pdf".into(),
+        media_type: "application/pdf".into(),
+    });
+    state.dispatch(Action::HideComposer);
+    assert!(state.snapshot().pending_attachment_staging > 0);
+    state.dispatch(Action::WorkerUnavailable);
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.pending_attachment_staging, 0);
+    assert!(!snapshot.composer_close_pending);
+    assert_eq!(snapshot.draft_save_state, DraftSaveState::Failed);
+    assert!(matches!(snapshot.composer, ComposerState::Editing { .. }));
+}
+
+#[test]
+fn inline_stage_creates_cid_marker_and_resume_summary_is_exposed() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    let draft_id = match state.snapshot().composer {
+        ComposerState::Editing { draft } => draft.compose.id,
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AttachmentStaged {
+        account_email: "person@example.com".into(),
+        operation_id: DraftOperationId(77),
+        draft_id,
+        attachment: crate::composer::DraftAttachment {
+            id: "image-1".into(),
+            display_name: "photo.png".into(),
+            media_type: "image/png".into(),
+            staged_file: "image-1".into(),
+            bytes: 42,
+        },
+        inline: true,
+    }));
+    let snapshot = state.snapshot();
+    let ComposerState::Editing { draft } = snapshot.composer else {
+        panic!()
+    };
+    assert_eq!(
+        draft.compose.inline_images[0].content_id,
+        "whitford-image-1@local"
+    );
+    assert!(
+        draft
+            .compose
+            .html
+            .contains("src=\"cid:whitford-image-1@local\"")
+    );
+    assert!(snapshot.saved_draft.is_some());
+    let html = draft.compose.html.clone();
+    state.dispatch(Action::UpdateHtml {
+        html,
+        text: "inline image".into(),
+    });
+    assert!(matches!(state.snapshot().composer,
+        ComposerState::Editing { draft }
+            if draft.compose.html.contains("cid:whitford-image-1@local")));
+    let removal = state.dispatch(Action::RemoveAttachment("image-1".into()));
+    assert!(removal.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::RemoveStaged { .. })
+    )));
+}
+
+#[test]
+fn manual_recipients_are_deduplicated_across_visible_and_bcc_fields() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    let recipient = |email: &str| crate::composer::Recipient {
+        name: None,
+        email: email.into(),
+    };
+    state.dispatch(Action::UpdateRecipients {
+        to: vec![recipient("same@example.com"), recipient("SAME@example.com")],
+        cc: vec![recipient("same@example.com"), recipient("cc@example.com")],
+        bcc: vec![recipient("CC@example.com"), recipient("secret@example.com")],
+    });
+    let ComposerState::Editing { draft } = state.snapshot().composer else {
+        panic!()
+    };
+    assert_eq!(draft.compose.to.len(), 1);
+    assert_eq!(draft.compose.cc.len(), 1);
+    assert_eq!(draft.compose.bcc.len(), 1);
+}
+
+#[test]
+fn oversized_editor_snapshot_is_rejected_without_replacing_the_draft() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    let before = match state.snapshot().composer {
+        ComposerState::Editing { draft } => draft.compose.html,
+        _ => panic!(),
+    };
+    let update = state.dispatch(Action::UpdateHtml {
+        html: "x".repeat(crate::composer::MAX_HTML_BYTES + 1),
+        text: "x".into(),
+    });
+    assert_eq!(update.feedback, Some("Message body is too large"));
+    assert!(matches!(state.snapshot().composer,
+        ComposerState::Editing { draft } if draft.compose.html == before));
+}
+
+#[test]
+fn beginning_another_message_resumes_the_single_saved_draft() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    let original_id = match state.snapshot().composer {
+        ComposerState::Editing { draft } => draft.compose.id,
+        _ => panic!(),
+    };
+    let hidden = state.dispatch(Action::HideComposer);
+    let (operation_id, revision) = hidden
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SaveDraft {
+                operation_id,
+                draft,
+            }) => Some((*operation_id, draft.dirty_revision)),
+            _ => None,
+        })
+        .expect("close save");
+    state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
+        operation_id,
+        account_email: "person@example.com".into(),
+        draft_id: original_id.clone(),
+        revision,
+    }));
+    let update = state.dispatch(Action::BeginForward);
+    assert_eq!(
+        update.feedback,
+        Some("Resumed the draft already saved on this device")
+    );
+    assert!(matches!(state.snapshot().composer,
+        ComposerState::Editing { draft } if draft.compose.id == original_id));
+}
+
+#[test]
+fn stale_cross_account_draft_and_signature_events_are_ignored() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    let draft_op = state.pending_draft_load.expect("draft load");
+    let signature_op = state.pending_signature_load.expect("signature load");
+    state.dispatch(Action::Worker(WorkerEvent::DraftsLoaded {
+        operation_id: draft_op,
+        account_email: "other@example.com".into(),
+        drafts: vec![],
+    }));
+    state.dispatch(Action::Worker(WorkerEvent::SignatureLoaded {
+        operation_id: signature_op,
+        account_email: "other@example.com".into(),
+        preference: crate::drafts::SignaturePreference {
+            html: "<b>Other account</b>".into(),
+            enabled: true,
+        },
+    }));
+    let snapshot = state.snapshot();
+    assert!(snapshot.saved_draft.is_none());
+    assert!(snapshot.signature.html.is_empty());
+}
+
+#[test]
+fn signature_is_sanitized_saved_and_only_applied_to_new_drafts() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    let update = state.dispatch(Action::UpdateSignature {
+        html: "<b>Ryan</b><script>bad()</script>".into(),
+        enabled: true,
+    });
+    assert!(update.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::SaveSignature { .. })
+    )));
+    state.dispatch(Action::BeginReply);
+    let snapshot = state.snapshot();
+    let ComposerState::Editing { draft } = snapshot.composer else {
+        panic!()
+    };
+    assert!(draft.compose.html.contains("<b>Ryan</b>"));
+    assert!(!draft.compose.html.contains("script"));
+    assert_eq!(snapshot.signature.html, "<b>Ryan</b>");
 }

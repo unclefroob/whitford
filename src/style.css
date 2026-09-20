@@ -173,6 +173,19 @@
   background-color: @whitford_surface_2;
 }
 
+.whitford-composer-toolbar {
+  padding: 6px;
+  border: 1px solid @whitford_border;
+  border-radius: 9px;
+  background-color: @whitford_surface_2;
+}
+
+.whitford-composer-toolbar button {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 4px;
+}
+
 .whitford-reader-action {
   min-height: 42px;
   padding: 0 18px;

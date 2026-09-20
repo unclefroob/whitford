@@ -1,7 +1,10 @@
-use crate::model::{ReplyAddress, ReplyContext};
+use crate::{
+    composer::{self, Recipient, ThreadHeaders},
+    model::{ReplyAddress, ReplyContext},
+};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{Mailbox, header},
+    message::{Attachment, Mailbox, MultiPart, SinglePart, header},
     transport::smtp::authentication::{Credentials, Mechanism},
 };
 use std::{collections::HashSet, fmt, time::Duration};
@@ -10,6 +13,7 @@ use tokio::time::timeout;
 pub const SMTP_HOST: &str = "smtp.gmail.com";
 pub const MAX_REPLY_BYTES: usize = 1024 * 1024;
 const MAX_RECIPIENTS: usize = 100;
+pub const MAX_RAW_PART_BYTES: usize = 18 * 1024 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +52,139 @@ impl fmt::Display for SmtpError {
 }
 
 impl std::error::Error for SmtpError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionPart {
+    pub display_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InlineSubmissionPart {
+    pub part: SubmissionPart,
+    pub content_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MailSubmission {
+    pub account_email: String,
+    pub to: Vec<Recipient>,
+    pub cc: Vec<Recipient>,
+    pub bcc: Vec<Recipient>,
+    pub subject: String,
+    pub html: String,
+    pub attachments: Vec<SubmissionPart>,
+    pub inline_images: Vec<InlineSubmissionPart>,
+    pub thread: Option<ThreadHeaders>,
+}
+
+/// Builds a bounded MIME message. Body sanitization is deliberately repeated
+/// here because persisted drafts and the WebView are both untrusted inputs.
+pub fn build_message(submission: &MailSubmission) -> Result<Message, SmtpError> {
+    let all_recipients = submission
+        .to
+        .iter()
+        .chain(&submission.cc)
+        .chain(&submission.bcc)
+        .cloned()
+        .collect::<Vec<_>>();
+    if submission.to.is_empty() && submission.cc.is_empty() && submission.bcc.is_empty() {
+        return Err(SmtpError::MissingRecipient);
+    }
+    if all_recipients.len() > MAX_RECIPIENTS {
+        return Err(SmtpError::TooManyRecipients);
+    }
+    composer::validate_recipients(&all_recipients).map_err(|error| match error {
+        composer::ComposeError::TooManyRecipients => SmtpError::TooManyRecipients,
+        _ => SmtpError::InvalidAddress,
+    })?;
+    let html = composer::sanitize_html(&submission.html);
+    let text = composer::html_to_plain(&html);
+    if text.trim().is_empty() && submission.inline_images.is_empty() {
+        return Err(SmtpError::EmptyBody);
+    }
+    let raw_bytes = text
+        .len()
+        .checked_add(html.len())
+        .and_then(|total| {
+            submission
+                .attachments
+                .iter()
+                .chain(submission.inline_images.iter().map(|inline| &inline.part))
+                .try_fold(total, |value, part| value.checked_add(part.bytes.len()))
+        })
+        .ok_or(SmtpError::BodyTooLarge)?;
+    if raw_bytes > MAX_RAW_PART_BYTES {
+        return Err(SmtpError::BodyTooLarge);
+    }
+
+    let from = mailbox_recipient(&Recipient {
+        name: None,
+        email: submission.account_email.clone(),
+    })?;
+    let mut builder = Message::builder()
+        .from(from)
+        .subject(clean_subject(&submission.subject))
+        .date_now()
+        .message_id(None);
+    for recipient in &submission.to {
+        builder = builder.to(mailbox_recipient(recipient)?);
+    }
+    for recipient in &submission.cc {
+        builder = builder.cc(mailbox_recipient(recipient)?);
+    }
+    // Lettre derives the SMTP envelope before dropping Bcc from serialized headers.
+    for recipient in &submission.bcc {
+        builder = builder.bcc(mailbox_recipient(recipient)?);
+    }
+    if let Some(thread) = &submission.thread
+        && let Some(parent) = thread.in_reply_to.as_deref().and_then(canonical_message_id)
+    {
+        builder = builder.header(header::InReplyTo::from(parent.clone()));
+        let references = generic_references(thread, &parent);
+        if !references.is_empty() {
+            builder = builder.header(header::References::from(references));
+        }
+    }
+
+    let html_part = SinglePart::html(html);
+    let rich_part = if submission.inline_images.is_empty() {
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(text))
+            .singlepart(html_part)
+    } else {
+        let mut related = MultiPart::related().singlepart(html_part);
+        for inline in &submission.inline_images {
+            let content_type = content_type(&inline.part.media_type)?;
+            related = related.singlepart(
+                Attachment::new_inline_with_name(
+                    clean_content_id(&inline.content_id)?,
+                    clean_file_name(&inline.part.display_name),
+                )
+                .body(inline.part.bytes.clone(), content_type),
+            );
+        }
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(text))
+            .multipart(related)
+    };
+    let mime = if submission.attachments.is_empty() {
+        rich_part
+    } else {
+        let mut mixed = MultiPart::mixed().multipart(rich_part);
+        for attachment in &submission.attachments {
+            mixed = mixed.singlepart(
+                Attachment::new(clean_file_name(&attachment.display_name)).body(
+                    attachment.bytes.clone(),
+                    content_type(&attachment.media_type)?,
+                ),
+            );
+        }
+        mixed
+    };
+    builder.multipart(mime).map_err(|_| SmtpError::Build)
+}
 
 /// Builds a plain-text RFC 5322 reply without performing network I/O.
 pub fn build_reply(
@@ -201,6 +338,81 @@ fn mailbox(address: &ReplyAddress) -> Result<Mailbox, SmtpError> {
     Ok(Mailbox::new(address.name.clone(), email))
 }
 
+fn mailbox_recipient(address: &Recipient) -> Result<Mailbox, SmtpError> {
+    let email = address
+        .email
+        .trim()
+        .parse()
+        .map_err(|_| SmtpError::InvalidAddress)?;
+    let name = address.name.as_ref().map(|name| {
+        name.chars()
+            .filter(|character| !character.is_control())
+            .take(256)
+            .collect()
+    });
+    Ok(Mailbox::new(name, email))
+}
+
+fn content_type(value: &str) -> Result<header::ContentType, SmtpError> {
+    value.parse().map_err(|_| SmtpError::Build)
+}
+
+fn clean_file_name(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .filter(|character| !character.is_control() && !matches!(character, '/' | '\\'))
+        .take(255)
+        .collect();
+    let value = value.trim();
+    if value.is_empty() {
+        "attachment".into()
+    } else {
+        value.into()
+    }
+}
+
+fn clean_content_id(value: &str) -> Result<String, SmtpError> {
+    let value = value.trim().trim_start_matches('<').trim_end_matches('>');
+    (!value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'-' | b'_')))
+    .then(|| value.to_owned())
+    .ok_or(SmtpError::Build)
+}
+
+fn clean_subject(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(composer::MAX_SUBJECT_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn generic_references(thread: &ThreadHeaders, parent: &str) -> String {
+    let mut ids: Vec<_> = thread
+        .references
+        .iter()
+        .filter_map(|value| canonical_message_id(value))
+        .collect();
+    if ids.last().is_none_or(|last| last != parent) {
+        ids.push(parent.to_owned());
+    }
+    while ids.join(" ").len() > 900 && ids.len() > 1 {
+        ids.remove(0);
+    }
+    ids.join(" ")
+}
+
 fn reply_subject(subject: &str) -> String {
     let subject = subject
         .chars()
@@ -285,6 +497,51 @@ mod tests {
             references: vec!["<root@example.com>".into()],
             sent_at_unix: None,
         }
+    }
+
+    fn recipient(email: &str) -> Recipient {
+        Recipient {
+            name: None,
+            email: email.into(),
+        }
+    }
+
+    #[test]
+    fn generic_message_builds_full_mime_tree_without_bcc_header() {
+        let message = build_message(&MailSubmission {
+            account_email: "me@example.com".into(),
+            to: vec![recipient("to@example.com")],
+            cc: Vec::new(),
+            bcc: vec![recipient("secret@example.com")],
+            subject: "Topic".into(),
+            html: r#"<p>Hello<img src="cid:image-1"></p>"#.into(),
+            attachments: vec![SubmissionPart {
+                display_name: "notes.txt".into(),
+                media_type: "text/plain".into(),
+                bytes: b"notes".to_vec(),
+            }],
+            inline_images: vec![InlineSubmissionPart {
+                part: SubmissionPart {
+                    display_name: "image.png".into(),
+                    media_type: "image/png".into(),
+                    bytes: vec![1, 2, 3],
+                },
+                content_id: "image-1".into(),
+            }],
+            thread: Some(ThreadHeaders {
+                in_reply_to: Some("parent@example.com".into()),
+                references: Vec::new(),
+            }),
+        })
+        .unwrap();
+        let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
+        assert!(formatted.contains("multipart/mixed"));
+        assert!(formatted.contains("multipart/alternative"));
+        assert!(formatted.contains("multipart/related"));
+        assert!(formatted.contains("Content-ID: <image-1>"));
+        assert!(formatted.contains("In-Reply-To: <parent@example.com>"));
+        assert!(!formatted.contains("Bcc:"));
+        assert!(!formatted.contains("secret@example.com"));
     }
 
     #[test]

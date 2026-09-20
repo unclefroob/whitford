@@ -15,7 +15,11 @@ use crate::{
     },
     worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     if ui.search.text().as_str() != snapshot.search_query {
@@ -56,27 +60,191 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
         ComposerState::Closed => {
             ui.composer_window.set_visible(false);
             *ui.composer_message_id.borrow_mut() = None;
+            ui.composer_inline_ids.borrow_mut().clear();
+            ui.composer_attachment_fingerprint.set(u64::MAX);
             return;
         }
         ComposerState::Editing { draft } => (draft, false, None),
         ComposerState::Sending { draft, .. } => (draft, true, None),
         ComposerState::Failed { draft, failure } => (draft, false, Some(*failure)),
     };
-    if ui.composer_message_id.borrow().as_ref() != Some(&draft.message_id) {
-        ui.composer_to.set_text(&format!("To: {}", draft.recipient));
-        ui.composer_subject
-            .set_text(&reply_subject_label(&draft.subject));
-        ui.composer_body.buffer().set_text(&draft.body);
-        *ui.composer_message_id.borrow_mut() = Some(draft.message_id.clone());
+    if ui.composer_message_id.borrow().as_deref() != Some(&draft.compose.id) {
+        *ui.composer_message_id.borrow_mut() = Some(draft.compose.id.clone());
+        ui.composer_to
+            .set_text(&format_recipients(&draft.compose.to));
+        ui.composer_cc
+            .set_text(&format_recipients(&draft.compose.cc));
+        ui.composer_bcc
+            .set_text(&format_recipients(&draft.compose.bcc));
+        ui.composer_subject.set_text(&draft.compose.subject);
+        ui.composer_cc_bcc
+            .set_visible(!draft.compose.cc.is_empty() || !draft.compose.bcc.is_empty());
+        ui.composer_editor.load(&draft.compose.html);
+        *ui.composer_inline_ids.borrow_mut() = draft
+            .compose
+            .inline_images
+            .iter()
+            .map(|v| v.content_id.clone())
+            .collect();
         ui.composer_window.present();
-        ui.composer_body.grab_focus();
+        ui.composer_editor.view.grab_focus();
     }
-    ui.composer_body.set_editable(!sending);
-    ui.composer_send.set_sensitive(!sending);
-    ui.composer_cancel.set_sensitive(!sending);
+    let current_inline = draft
+        .compose
+        .inline_images
+        .iter()
+        .map(|v| v.content_id.clone())
+        .collect::<Vec<_>>();
+    let previous_inline = ui.composer_inline_ids.borrow().clone();
+    for content_id in current_inline
+        .iter()
+        .filter(|id| !previous_inline.contains(id))
+    {
+        ui.composer_editor.command("insertCid", Some(content_id));
+    }
+    for content_id in previous_inline
+        .iter()
+        .filter(|id| !current_inline.contains(id))
+    {
+        ui.composer_editor.command("removeCid", Some(content_id));
+    }
+    *ui.composer_inline_ids.borrow_mut() = current_inline;
+    let staging = snapshot.pending_attachment_staging > 0;
+    let closing = snapshot.composer_close_pending;
+    let locked = sending || closing;
+    for entry in [
+        &ui.composer_to,
+        &ui.composer_cc,
+        &ui.composer_bcc,
+        &ui.composer_subject,
+    ] {
+        entry.set_editable(!locked);
+    }
+    ui.composer_editor.view.set_sensitive(!locked);
+    ui.composer_send
+        .set_sensitive(!sending && !staging && !closing);
+    ui.composer_hide
+        .set_sensitive(!sending && !staging && !closing);
+    ui.composer_discard.set_sensitive(!sending && !closing);
+    ui.composer_attach.set_sensitive(!locked);
+    ui.composer_inline.set_sensitive(!locked);
+    ui.composer_signature.set_sensitive(!locked);
+    let mut hasher = DefaultHasher::new();
+    draft.compose.attachments.hash(&mut hasher);
+    draft.compose.inline_images.hash(&mut hasher);
+    let attachment_fingerprint = hasher.finish();
+    if ui.composer_attachment_fingerprint.get() != attachment_fingerprint {
+        while let Some(child) = ui.composer_attachments.first_child() {
+            ui.composer_attachments.remove(&child);
+        }
+        let mut total = 0_u64;
+        for attachment in &draft.compose.attachments {
+            total = total.saturating_add(attachment.bytes);
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            row.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+            row.append(
+                &gtk::Label::builder()
+                    .label(&attachment.display_name)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .build(),
+            );
+            row.append(
+                &gtk::Label::builder()
+                    .label(format_bytes(attachment.bytes))
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            let remove = gtk::Button::builder()
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Remove attachment")
+                .build();
+            remove.update_property(&[gtk::accessible::Property::Label("Remove attachment")]);
+            let id = attachment.id.clone();
+            let weak = ui.downgrade();
+            remove.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.dispatch(Action::RemoveAttachment(id.clone()))
+                }
+            });
+            row.append(&remove);
+            ui.composer_attachments.append(&row);
+        }
+        for inline in &draft.compose.inline_images {
+            let attachment = &inline.attachment;
+            total = total.saturating_add(attachment.bytes);
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            row.append(&gtk::Image::from_icon_name("insert-image-symbolic"));
+            row.append(
+                &gtk::Label::builder()
+                    .label(format!("{} (inline)", attachment.display_name))
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .build(),
+            );
+            let remove = gtk::Button::builder()
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Remove inline image")
+                .build();
+            remove.update_property(&[gtk::accessible::Property::Label("Remove inline image")]);
+            let id = attachment.id.clone();
+            let content_id = inline.content_id.clone();
+            let weak = ui.downgrade();
+            remove.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.composer_editor.command("removeCid", Some(&content_id));
+                    ui.dispatch(Action::RemoveAttachment(id.clone()))
+                }
+            });
+            row.append(&remove);
+            ui.composer_attachments.append(&row);
+        }
+        let total_text = if total == 0 {
+            "No attachments".into()
+        } else {
+            format!("{} total", format_bytes(total))
+        };
+        ui.composer_attachment_total.set_text(&total_text);
+        ui.composer_attachment_fingerprint
+            .set(attachment_fingerprint);
+    }
     let was_sending = ui.composer_progress.is_visible();
-    ui.composer_progress.set_spinning(sending);
-    ui.composer_progress.set_visible(sending);
+    ui.composer_progress
+        .set_spinning(sending || staging || closing);
+    ui.composer_progress
+        .set_visible(sending || staging || closing);
+    let save_status = if staging {
+        if snapshot.pending_attachment_staging == 1 {
+            "Adding attachment…"
+        } else {
+            "Adding attachments…"
+        }
+    } else if closing {
+        "Saving before closing…"
+    } else {
+        match snapshot.draft_save_state {
+            crate::state::DraftSaveState::Saving => "Saving…",
+            crate::state::DraftSaveState::Saved => "Saved on this device",
+            crate::state::DraftSaveState::Failed => "Save failed",
+        }
+    };
+    ui.composer_draft_status.set_text(save_status);
+    if matches!(
+        snapshot.draft_save_state,
+        crate::state::DraftSaveState::Failed
+    ) {
+        ui.composer_draft_status.add_css_class("error");
+    } else {
+        ui.composer_draft_status.remove_css_class("error");
+    }
     if sending && !was_sending {
         ui.composer_window
             .announce("Sending reply", gtk::AccessibleAnnouncementPriority::Medium);
@@ -95,6 +263,24 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
     }
 }
 
+fn format_recipients(values: &[crate::composer::Recipient]) -> String {
+    values
+        .iter()
+        .map(|recipient| {
+            recipient
+                .name
+                .as_ref()
+                .filter(|v| !v.trim().is_empty())
+                .map_or_else(
+                    || recipient.email.clone(),
+                    |name| format!("{name} <{}>", recipient.email),
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
 fn reply_subject_label(subject: &str) -> String {
     let subject = subject.trim();
     if subject.to_ascii_lowercase().starts_with("re:") {
@@ -429,6 +615,13 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         "Forward",
         "win.forward",
     ));
+    if snapshot.saved_draft.is_some() {
+        replies.append(&text_action(
+            "document-edit-symbolic",
+            "Resume draft",
+            "win.resume-draft",
+        ));
+    }
     ui.reader.append(&replies);
 }
 

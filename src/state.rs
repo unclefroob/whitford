@@ -1,17 +1,18 @@
 use crate::{
     cache,
+    composer::{self, ComposeDraft, Recipient},
     model::{
         AccountIdentity, CacheUsage, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, MessageBody,
         MessageId, MessageSummary,
     },
     smtp,
     worker::{
-        BodyFailure, BodyRequestId, CacheOperationId, FailureKind, OperationId, ReplySubmission,
+        BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind, OperationId,
         SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent,
         WorkerPhase,
     },
 };
-use std::{sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -33,6 +34,15 @@ pub struct AppState {
     reader: ReaderState,
     cache_usage: CacheUsage,
     composer: ComposerState,
+    saved_draft: Option<ComposeDraft>,
+    signature: crate::drafts::SignaturePreference,
+    next_draft_operation: u64,
+    pending_draft_load: Option<DraftOperationId>,
+    pending_signature_load: Option<DraftOperationId>,
+    pending_attachment_staging: HashSet<DraftOperationId>,
+    latest_draft_save: Option<DraftOperationId>,
+    pending_composer_close: Option<(DraftOperationId, bool)>,
+    draft_save_state: DraftSaveState,
     list_revision: u64,
     reader_revision: u64,
 }
@@ -84,6 +94,7 @@ pub struct ReplyDraft {
     pub subject: String,
     pub body: String,
     pub context: crate::model::ReplyContext,
+    pub compose: ComposeDraft,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComposerState {
@@ -100,6 +111,13 @@ pub enum ComposerState {
         draft: ReplyDraft,
         failure: SendFailure,
     },
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DraftSaveState {
+    #[default]
+    Saved,
+    Saving,
+    Failed,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewStatus {
@@ -129,7 +147,38 @@ pub enum Action {
     SetCacheLimit(usize),
     RetryBody,
     BeginReply,
+    BeginReplyAll,
+    BeginForward,
     UpdateReplyBody(String),
+    UpdateRecipients {
+        to: Vec<Recipient>,
+        cc: Vec<Recipient>,
+        bcc: Vec<Recipient>,
+    },
+    UpdateSubject(String),
+    UpdateHtml {
+        html: String,
+        text: String,
+    },
+    StageAttachment {
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+    },
+    StageInlineImage {
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+    },
+    UpdateSignature {
+        html: String,
+        enabled: bool,
+    },
+    RemoveAttachment(String),
+    HideComposer,
+    HideComposerAndCloseApp,
+    ResumeDraft,
+    DiscardDraft,
     CancelReply,
     SendReply,
     ConfirmResend,
@@ -149,6 +198,7 @@ pub enum Effect {
     PresentDisconnectConfirmation,
     PresentClearCacheConfirmation,
     PresentUncertainResendConfirmation,
+    CloseApplicationWindow,
 }
 #[derive(Default, Debug)]
 pub struct Update {
@@ -177,9 +227,20 @@ pub struct ViewSnapshot {
     pub cache_limit: usize,
     pub reader: ReaderState,
     pub composer: ComposerState,
+    pub saved_draft: Option<SavedDraftSummary>,
+    pub signature: crate::drafts::SignaturePreference,
+    pub pending_attachment_staging: usize,
+    pub draft_save_state: DraftSaveState,
+    pub composer_close_pending: bool,
     pub cache_usage: CacheUsage,
     pub list_revision: u64,
     pub reader_revision: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedDraftSummary {
+    pub id: String,
+    pub kind: composer::ComposeKind,
+    pub subject: String,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EscapeContext {
@@ -193,6 +254,12 @@ pub enum EscapeOutcome {
     ShowMessageList,
     HideFolders,
     None,
+}
+#[derive(Clone, Copy)]
+enum ComposeStart {
+    Reply,
+    ReplyAll,
+    Forward,
 }
 pub fn escape_outcome(c: EscapeContext) -> EscapeOutcome {
     if c.search_active {
@@ -232,6 +299,18 @@ impl AppState {
             reader: ReaderState::Closed,
             cache_usage: CacheUsage::default(),
             composer: ComposerState::Closed,
+            saved_draft: None,
+            signature: crate::drafts::SignaturePreference {
+                html: String::new(),
+                enabled: true,
+            },
+            next_draft_operation: 1,
+            pending_draft_load: None,
+            pending_signature_load: None,
+            pending_attachment_staging: HashSet::new(),
+            latest_draft_save: None,
+            pending_composer_close: None,
+            draft_save_state: DraftSaveState::Saved,
             list_revision: 1,
             reader_revision: 1,
         }
@@ -319,6 +398,13 @@ impl AppState {
                         failure: SendFailure::DeliveryUncertain,
                     };
                 }
+                if self.latest_draft_save.take().is_some()
+                    || self.pending_composer_close.take().is_some()
+                    || !self.pending_attachment_staging.is_empty()
+                {
+                    self.pending_attachment_staging.clear();
+                    self.draft_save_state = DraftSaveState::Failed;
+                }
                 let failure = ServiceFailure {
                     kind: FailureKind::WorkerUnavailable,
                     retryable: false,
@@ -354,7 +440,28 @@ impl AppState {
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::RetryBody => self.retry_body(),
             Action::BeginReply => self.begin_reply(),
+            Action::BeginReplyAll => self.begin_compose(ComposeStart::ReplyAll),
+            Action::BeginForward => self.begin_compose(ComposeStart::Forward),
             Action::UpdateReplyBody(body) => self.update_reply_body(body),
+            Action::UpdateRecipients { to, cc, bcc } => self.update_recipients(to, cc, bcc),
+            Action::UpdateSubject(subject) => self.update_subject(subject),
+            Action::UpdateHtml { html, text } => self.update_html(html, text),
+            Action::StageAttachment {
+                source,
+                display_name,
+                media_type,
+            } => self.stage_attachment(source, display_name, media_type),
+            Action::StageInlineImage {
+                source,
+                display_name,
+                media_type,
+            } => self.stage_file(source, display_name, media_type, true),
+            Action::UpdateSignature { html, enabled } => self.update_signature(html, enabled),
+            Action::RemoveAttachment(id) => self.remove_attachment(&id),
+            Action::HideComposer => self.hide_composer(),
+            Action::HideComposerAndCloseApp => self.hide_composer_and_close_app(),
+            Action::ResumeDraft => self.resume_draft(),
+            Action::DiscardDraft => self.discard_draft(),
             Action::CancelReply => {
                 if !matches!(self.composer, ComposerState::Sending { .. }) {
                     self.composer = ComposerState::Closed;
@@ -419,6 +526,8 @@ impl AppState {
         self.cache_generation = self.cache_generation.wrapping_add(1);
         self.send_generation = self.send_generation.wrapping_add(1);
         self.composer = ComposerState::Closed;
+        self.pending_draft_load = None;
+        self.pending_signature_load = None;
         self.reader = ReaderState::Closed;
         self.bump_reader();
         self.session = SessionState::Disconnecting;
@@ -544,9 +653,26 @@ impl AppState {
                 if !matches || generation != self.send_generation {
                     return Update::default();
                 }
+                let sent = match &self.composer {
+                    ComposerState::Sending { draft, .. } => Some(draft.compose.clone()),
+                    _ => None,
+                };
                 self.composer = ComposerState::Closed;
+                self.saved_draft = None;
+                self.pending_draft_load = None;
+                self.pending_signature_load = None;
                 let mut update = self.start(SyncKind::Refresh);
-                update.feedback = Some("Reply sent");
+                update.feedback = Some("Message sent");
+                if let Some(draft) = sent {
+                    let operation_id = self.allocate_draft_operation();
+                    update
+                        .effects
+                        .push(Effect::SendWorker(WorkerCommand::DeleteDraft {
+                            operation_id,
+                            account_email: draft.account_email,
+                            draft_id: draft.id,
+                        }));
+                }
                 update
             }
             WorkerEvent::ReplyFailed {
@@ -573,6 +699,192 @@ impl AppState {
                     ..Default::default()
                 }
             }
+            WorkerEvent::DraftsLoaded {
+                operation_id,
+                account_email,
+                drafts,
+            } => {
+                if self.pending_draft_load != Some(operation_id)
+                    || !self.current_account_is(&account_email)
+                {
+                    return Update::default();
+                }
+                self.pending_draft_load = None;
+                if self.saved_draft.is_none() {
+                    self.saved_draft = drafts.into_iter().last();
+                }
+                Update::default()
+            }
+            WorkerEvent::DraftSaved {
+                operation_id,
+                account_email,
+                draft_id,
+                revision,
+                ..
+            } => {
+                if !self.current_account_is(&account_email) {
+                    return Update::default();
+                }
+                if let Some(draft) = self.saved_draft.as_mut().filter(|d| d.id == draft_id) {
+                    draft.dirty_revision = draft.dirty_revision.max(revision);
+                }
+                if self.latest_draft_save == Some(operation_id) {
+                    self.latest_draft_save = None;
+                    self.draft_save_state = DraftSaveState::Saved;
+                }
+                if self
+                    .pending_composer_close
+                    .is_some_and(|(pending, _)| pending == operation_id)
+                {
+                    let (_, close_app) = self.pending_composer_close.take().expect("checked");
+                    self.composer = ComposerState::Closed;
+                    return Update {
+                        feedback: Some("Draft saved on this device"),
+                        effects: close_app
+                            .then_some(Effect::CloseApplicationWindow)
+                            .into_iter()
+                            .collect(),
+                    };
+                }
+                Update::default()
+            }
+            WorkerEvent::DraftDeleted {
+                account_email,
+                draft_id,
+                ..
+            } => {
+                if !self.current_account_is(&account_email) {
+                    return Update::default();
+                }
+                if self.saved_draft.as_ref().is_some_and(|d| d.id == draft_id) {
+                    self.saved_draft = None;
+                }
+                Update::default()
+            }
+            WorkerEvent::AttachmentStaged {
+                operation_id,
+                draft_id,
+                account_email,
+                attachment,
+                inline,
+                ..
+            } => {
+                self.pending_attachment_staging.remove(&operation_id);
+                let staged_file = attachment.staged_file.clone();
+                if !self.current_account_is(&account_email) {
+                    let operation_id = self.allocate_draft_operation();
+                    return Update {
+                        effects: vec![Effect::SendWorker(WorkerCommand::RemoveStaged {
+                            operation_id,
+                            account_email,
+                            draft_id,
+                            staged_file,
+                        })],
+                        ..Default::default()
+                    };
+                }
+                let mut changed = None;
+                if let ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } =
+                    &mut self.composer
+                    && draft.compose.id == draft_id
+                {
+                    if inline {
+                        let content_id = format!("whitford-{}@local", attachment.id);
+                        let marker = format!(
+                            "<div><img src=\"cid:{}\" alt=\"{}\"></div>",
+                            content_id,
+                            escape_html(&attachment.display_name)
+                        );
+                        draft.compose.html =
+                            composer::sanitize_html(&format!("{}{}", marker, draft.compose.html));
+                        draft
+                            .compose
+                            .inline_images
+                            .push(crate::composer::DraftInlineImage {
+                                attachment,
+                                content_id,
+                            });
+                    } else {
+                        draft.compose.attachments.push(attachment);
+                    }
+                    draft.compose.dirty_revision = draft.compose.dirty_revision.wrapping_add(1);
+                    self.saved_draft = Some(draft.compose.clone());
+                    changed = Some(draft.compose.clone());
+                }
+                if let Some(draft) = changed {
+                    let mut update = self.queue_draft_save(draft, None);
+                    update.feedback = Some("Attachment added");
+                    update
+                } else {
+                    let operation_id = self.allocate_draft_operation();
+                    Update {
+                        effects: vec![Effect::SendWorker(WorkerCommand::RemoveStaged {
+                            operation_id,
+                            account_email,
+                            draft_id,
+                            staged_file,
+                        })],
+                        ..Default::default()
+                    }
+                }
+            }
+            WorkerEvent::SignatureLoaded {
+                operation_id,
+                account_email,
+                preference,
+            } => {
+                if self.pending_signature_load != Some(operation_id)
+                    || !self.current_account_is(&account_email)
+                {
+                    return Update::default();
+                }
+                self.pending_signature_load = None;
+                self.signature = crate::drafts::SignaturePreference {
+                    html: composer::sanitize_html(&preference.html),
+                    enabled: preference.enabled,
+                };
+                Update::default()
+            }
+            WorkerEvent::SignatureSaved { account_email, .. } => {
+                if !self.current_account_is(&account_email) {
+                    return Update::default();
+                }
+                Update::default()
+            }
+            WorkerEvent::StagedRemoved { account_email, .. } => {
+                if !self.current_account_is(&account_email) {
+                    return Update::default();
+                }
+                Update::default()
+            }
+            WorkerEvent::DraftOperationFailed {
+                operation_id,
+                account_email,
+            } => {
+                if !self.current_account_is(&account_email) {
+                    return Update::default();
+                }
+                if self.pending_attachment_staging.remove(&operation_id) {
+                    return Update {
+                        feedback: Some("Could not add the selected attachment"),
+                        ..Default::default()
+                    };
+                }
+                if self.latest_draft_save == Some(operation_id) {
+                    self.latest_draft_save = None;
+                    self.draft_save_state = DraftSaveState::Failed;
+                }
+                if self
+                    .pending_composer_close
+                    .is_some_and(|(pending, _)| pending == operation_id)
+                {
+                    self.pending_composer_close = None;
+                }
+                Update {
+                    feedback: Some("Could not save the local draft"),
+                    ..Default::default()
+                }
+            }
             other => self.account_worker_event(other),
         }
     }
@@ -594,7 +906,15 @@ impl AppState {
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
             | WorkerEvent::ReplySent { .. }
-            | WorkerEvent::ReplyFailed { .. } => unreachable!(),
+            | WorkerEvent::ReplyFailed { .. }
+            | WorkerEvent::DraftsLoaded { .. }
+            | WorkerEvent::DraftSaved { .. }
+            | WorkerEvent::DraftDeleted { .. }
+            | WorkerEvent::AttachmentStaged { .. }
+            | WorkerEvent::StagedRemoved { .. }
+            | WorkerEvent::SignatureLoaded { .. }
+            | WorkerEvent::SignatureSaved { .. }
+            | WorkerEvent::DraftOperationFailed { .. } => unreachable!(),
         };
         if self.active_operation != Some(id) {
             return Update::default();
@@ -622,6 +942,11 @@ impl AppState {
             }
             WorkerEvent::AccountPersisted { account, .. } => {
                 if self.account_changed(&account) {
+                    self.signature = crate::drafts::SignaturePreference {
+                        html: String::new(),
+                        enabled: true,
+                    };
+                    self.saved_draft = None;
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
                     self.mailbox = None;
@@ -642,6 +967,11 @@ impl AppState {
                 account, snapshot, ..
             } => {
                 if self.account_changed(&account) {
+                    self.signature = crate::drafts::SignaturePreference {
+                        html: String::new(),
+                        enabled: true,
+                    };
+                    self.saved_draft = None;
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
                 }
@@ -675,6 +1005,11 @@ impl AppState {
                 account, snapshot, ..
             } => {
                 if self.account_changed(&account) {
+                    self.signature = crate::drafts::SignaturePreference {
+                        html: String::new(),
+                        enabled: true,
+                    };
+                    self.saved_draft = None;
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
                     self.selected_message_id = None;
@@ -682,6 +1017,7 @@ impl AppState {
                     self.cache_usage = CacheUsage::default();
                     self.bump_reader();
                 }
+                let draft_account = account.email.clone();
                 self.account = Some(account);
                 self.mailbox = Some(snapshot);
                 self.session = SessionState::Ready;
@@ -689,8 +1025,22 @@ impl AppState {
                 self.recovery = None;
                 self.normalize();
                 self.bump_list();
+                let operation_id = self.allocate_draft_operation();
+                let signature_operation_id = self.allocate_draft_operation();
+                self.pending_draft_load = Some(operation_id);
+                self.pending_signature_load = Some(signature_operation_id);
                 Update {
-                    effects: vec![Effect::ClearAuthorization { id }],
+                    effects: vec![
+                        Effect::ClearAuthorization { id },
+                        Effect::SendWorker(WorkerCommand::LoadDrafts {
+                            operation_id,
+                            account_email: draft_account.clone(),
+                        }),
+                        Effect::SendWorker(WorkerCommand::LoadSignature {
+                            operation_id: signature_operation_id,
+                            account_email: draft_account,
+                        }),
+                    ],
                     ..Default::default()
                 }
             }
@@ -704,6 +1054,11 @@ impl AppState {
                 self.reader = ReaderState::Closed;
                 self.send_generation = self.send_generation.wrapping_add(1);
                 self.composer = ComposerState::Closed;
+                self.saved_draft = None;
+                self.signature = crate::drafts::SignaturePreference {
+                    html: String::new(),
+                    enabled: true,
+                };
                 self.cache_usage = CacheUsage::default();
                 self.bump_list();
                 self.bump_reader();
@@ -751,7 +1106,15 @@ impl AppState {
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
             | WorkerEvent::ReplySent { .. }
-            | WorkerEvent::ReplyFailed { .. } => unreachable!(),
+            | WorkerEvent::ReplyFailed { .. }
+            | WorkerEvent::DraftsLoaded { .. }
+            | WorkerEvent::DraftSaved { .. }
+            | WorkerEvent::DraftDeleted { .. }
+            | WorkerEvent::AttachmentStaged { .. }
+            | WorkerEvent::StagedRemoved { .. }
+            | WorkerEvent::SignatureLoaded { .. }
+            | WorkerEvent::SignatureSaved { .. }
+            | WorkerEvent::DraftOperationFailed { .. } => unreachable!(),
         }
     }
     pub fn snapshot(&self) -> ViewSnapshot {
@@ -849,6 +1212,15 @@ impl AppState {
             cache_limit: self.cache_limit,
             reader: self.reader.clone(),
             composer: self.composer.clone(),
+            saved_draft: self.saved_draft.as_ref().map(|draft| SavedDraftSummary {
+                id: draft.id.clone(),
+                kind: draft.kind.clone(),
+                subject: draft.subject.clone(),
+            }),
+            signature: self.signature.clone(),
+            pending_attachment_staging: self.pending_attachment_staging.len(),
+            draft_save_state: self.draft_save_state,
+            composer_close_pending: self.pending_composer_close.is_some(),
             cache_usage: self.cache_usage,
             list_revision: self.list_revision,
             reader_revision: self.reader_revision,
@@ -1027,28 +1399,31 @@ impl AppState {
         }
     }
     fn begin_reply(&mut self) -> Update {
+        self.begin_compose(ComposeStart::Reply)
+    }
+    fn begin_compose(&mut self, start: ComposeStart) -> Update {
         if !matches!(self.composer, ComposerState::Closed) {
             return Update::default();
         }
-        let (id, context) = match &self.reader {
-            ReaderState::Loaded { id, body } => (id.clone(), body.reply_context.clone()),
+        if self.saved_draft.is_some() {
+            let mut update = self.resume_draft();
+            update.feedback = Some("Resumed the draft already saved on this device");
+            return update;
+        }
+        let (id, context, original_html) = match &self.reader {
+            ReaderState::Loaded { id, body } => (
+                id.clone(),
+                body.reply_context.clone(),
+                body.html
+                    .clone()
+                    .unwrap_or_else(|| format!("<div>{}</div>", escape_html(&body.text))),
+            ),
             _ => {
                 return Update {
                     feedback: Some("Load the message before replying"),
                     ..Default::default()
                 };
             }
-        };
-        let primary = if context.reply_to.is_empty() {
-            &context.from
-        } else {
-            &context.reply_to
-        };
-        let Some(target) = primary.first() else {
-            return Update {
-                feedback: Some("This message has no reply address"),
-                ..Default::default()
-            };
         };
         let Some(message) = self
             .mailbox
@@ -1057,33 +1432,336 @@ impl AppState {
         else {
             return Update::default();
         };
-        let recipient = target
-            .name
-            .as_ref()
-            .filter(|name| !name.trim().is_empty())
-            .map_or_else(
-                || target.email.clone(),
-                |name| format!("{name} <{}>", target.email),
-            );
+        let Some(account_email) = self.account.as_ref().map(|a| a.email.clone()) else {
+            return Update::default();
+        };
+        let mut random = [0_u8; 16];
+        if getrandom::fill(&mut random).is_err() {
+            return Update {
+                feedback: Some("Could not create a private draft identifier"),
+                ..Default::default()
+            };
+        }
+        let draft_id = format!(
+            "draft-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let signature = if self.signature.enabled {
+            self.signature.html.as_str()
+        } else {
+            ""
+        };
+        let built = match start {
+            ComposeStart::Reply => composer::new_reply(
+                draft_id,
+                &account_email,
+                id.clone(),
+                &message.subject,
+                &context,
+                &original_html,
+                signature,
+            ),
+            ComposeStart::ReplyAll => composer::new_reply_all(
+                draft_id,
+                &account_email,
+                id.clone(),
+                &message.subject,
+                &context,
+                &original_html,
+                signature,
+            ),
+            ComposeStart::Forward => composer::new_forward(
+                draft_id,
+                &account_email,
+                id.clone(),
+                &message.subject,
+                &context,
+                &original_html,
+                signature,
+            ),
+        };
+        let Ok(compose) = built else {
+            return Update {
+                feedback: Some("This message has no usable recipients"),
+                ..Default::default()
+            };
+        };
+        let recipient = compose
+            .to
+            .iter()
+            .map(display_recipient)
+            .collect::<Vec<_>>()
+            .join(", ");
         self.composer = ComposerState::Editing {
             draft: ReplyDraft {
                 message_id: id,
                 recipient,
-                subject: message.subject.clone(),
+                subject: compose.subject.clone(),
                 body: String::new(),
                 context,
+                compose: compose.clone(),
             },
         };
-        Update::default()
+        self.saved_draft = Some(compose.clone());
+        self.queue_draft_save(compose, None)
     }
     fn update_reply_body(&mut self, body: String) -> Update {
         match &mut self.composer {
             ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
-                draft.body = body
+                draft.body = body.clone();
+                draft.compose.html = format!("<div>{}</div>", escape_html(&body));
+                draft.compose.text = body;
+                draft.compose.dirty_revision = draft.compose.dirty_revision.wrapping_add(1);
             }
             ComposerState::Closed | ComposerState::Sending { .. } => {}
         }
         Update::default()
+    }
+    fn update_recipients(
+        &mut self,
+        mut to: Vec<Recipient>,
+        mut cc: Vec<Recipient>,
+        mut bcc: Vec<Recipient>,
+    ) -> Update {
+        let mut seen = std::collections::HashSet::new();
+        for values in [&mut to, &mut cc, &mut bcc] {
+            values.retain(|recipient| {
+                let key = recipient.email.trim().to_ascii_lowercase();
+                !key.is_empty() && seen.insert(key)
+            });
+        }
+        self.mutate_compose(|draft| {
+            draft.to = to;
+            draft.cc = cc;
+            draft.bcc = bcc;
+        })
+    }
+    fn update_subject(&mut self, subject: String) -> Update {
+        self.mutate_compose(|draft| {
+            draft.subject = subject.chars().take(composer::MAX_SUBJECT_CHARS).collect()
+        })
+    }
+    fn update_html(&mut self, html: String, text: String) -> Update {
+        if html.len() > composer::MAX_HTML_BYTES || text.len() > composer::MAX_HTML_BYTES {
+            return Update {
+                feedback: Some("Message body is too large"),
+                ..Default::default()
+            };
+        }
+        self.mutate_compose(|draft| {
+            // Keep GTK responsive: bounded editor output is sanitized by the
+            // draft and SMTP workers before it crosses a trust boundary.
+            draft.html = html;
+            draft.text = text;
+        })
+    }
+    fn mutate_compose(&mut self, change: impl FnOnce(&mut ComposeDraft)) -> Update {
+        let compose = match &mut self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                change(&mut draft.compose);
+                draft.compose.dirty_revision = draft.compose.dirty_revision.wrapping_add(1);
+                draft.subject = draft.compose.subject.clone();
+                draft.recipient = draft
+                    .compose
+                    .to
+                    .iter()
+                    .map(display_recipient)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                draft.body = draft.compose.text.clone();
+                draft.compose.clone()
+            }
+            _ => return Update::default(),
+        };
+        self.saved_draft = Some(compose.clone());
+        self.queue_draft_save(compose, None)
+    }
+    fn hide_composer(&mut self) -> Update {
+        if !self.pending_attachment_staging.is_empty() {
+            return Update {
+                feedback: Some("Wait for attachments to finish loading"),
+                ..Default::default()
+            };
+        }
+        let compose = match &self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                Some(draft.compose.clone())
+            }
+            _ => None,
+        };
+        let Some(compose) = compose else {
+            return Update::default();
+        };
+        self.saved_draft = Some(compose.clone());
+        self.queue_draft_save(compose, Some(false))
+    }
+    fn hide_composer_and_close_app(&mut self) -> Update {
+        if !self.pending_attachment_staging.is_empty() {
+            return Update {
+                feedback: Some("Wait for attachments to finish loading"),
+                ..Default::default()
+            };
+        }
+        let compose = match &self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                Some(draft.compose.clone())
+            }
+            _ => None,
+        };
+        let Some(compose) = compose else {
+            return Update {
+                effects: vec![Effect::CloseApplicationWindow],
+                ..Default::default()
+            };
+        };
+        self.saved_draft = Some(compose.clone());
+        self.queue_draft_save(compose, Some(true))
+    }
+    fn queue_draft_save(&mut self, compose: ComposeDraft, close_app: Option<bool>) -> Update {
+        let operation_id = self.allocate_draft_operation();
+        self.latest_draft_save = Some(operation_id);
+        self.draft_save_state = DraftSaveState::Saving;
+        if let Some(close_app) = close_app {
+            self.pending_composer_close = Some((operation_id, close_app));
+        }
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::SaveDraft {
+                operation_id,
+                draft: Box::new(compose),
+            })],
+            ..Default::default()
+        }
+    }
+    fn resume_draft(&mut self) -> Update {
+        if !matches!(self.composer, ComposerState::Closed) {
+            return Update::default();
+        }
+        let Some(compose) = self.saved_draft.clone() else {
+            return Update::default();
+        };
+        self.composer = ComposerState::Editing {
+            draft: compatibility_draft(compose),
+        };
+        Update::default()
+    }
+    fn discard_draft(&mut self) -> Update {
+        let compose = match &self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                Some(draft.compose.clone())
+            }
+            _ => self.saved_draft.clone(),
+        };
+        let Some(compose) = compose else {
+            return Update::default();
+        };
+        self.composer = ComposerState::Closed;
+        self.saved_draft = None;
+        let operation_id = self.allocate_draft_operation();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::DeleteDraft {
+                operation_id,
+                account_email: compose.account_email,
+                draft_id: compose.id,
+            })],
+            ..Default::default()
+        }
+    }
+    fn stage_attachment(
+        &mut self,
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+    ) -> Update {
+        self.stage_file(source, display_name, media_type, false)
+    }
+    fn stage_file(
+        &mut self,
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+        inline: bool,
+    ) -> Update {
+        let (account_email, draft_id) = match &self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => (
+                draft.compose.account_email.clone(),
+                draft.compose.id.clone(),
+            ),
+            _ => return Update::default(),
+        };
+        let operation_id = self.allocate_draft_operation();
+        self.pending_attachment_staging.insert(operation_id);
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::StageAttachment {
+                operation_id,
+                account_email,
+                draft_id,
+                source,
+                display_name,
+                media_type,
+                inline,
+            })],
+            ..Default::default()
+        }
+    }
+    fn update_signature(&mut self, html: String, enabled: bool) -> Update {
+        let Some(account_email) = self.account.as_ref().map(|a| a.email.clone()) else {
+            return Update::default();
+        };
+        self.signature = crate::drafts::SignaturePreference {
+            html: composer::sanitize_html(&html),
+            enabled,
+        };
+        let operation_id = self.allocate_draft_operation();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::SaveSignature {
+                operation_id,
+                account_email,
+                preference: self.signature.clone(),
+            })],
+            ..Default::default()
+        }
+    }
+    fn remove_attachment(&mut self, id: &str) -> Update {
+        let removed = match &self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft
+                .compose
+                .attachments
+                .iter()
+                .chain(draft.compose.inline_images.iter().map(|v| &v.attachment))
+                .find(|a| a.id == id)
+                .map(|a| {
+                    (
+                        draft.compose.account_email.clone(),
+                        draft.compose.id.clone(),
+                        a.staged_file.clone(),
+                    )
+                }),
+            _ => None,
+        };
+        let mut update = self.mutate_compose(|d| {
+            d.attachments.retain(|a| a.id != id);
+            d.inline_images.retain(|a| a.attachment.id != id);
+        });
+        if let Some((account_email, draft_id, staged_file)) = removed {
+            let operation_id = self.allocate_draft_operation();
+            update
+                .effects
+                .push(Effect::SendWorker(WorkerCommand::RemoveStaged {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                    staged_file,
+                }));
+        }
+        update
+    }
+    fn allocate_draft_operation(&mut self) -> DraftOperationId {
+        let id = DraftOperationId(self.next_draft_operation);
+        self.next_draft_operation = self.next_draft_operation.wrapping_add(1).max(1);
+        id
     }
     fn request_disconnect(&self) -> Update {
         if matches!(self.composer, ComposerState::Sending { .. }) {
@@ -1100,6 +1778,15 @@ impl AppState {
     }
 
     fn send_reply(&mut self, confirmed_uncertain_resend: bool) -> Update {
+        if !self.pending_attachment_staging.is_empty() {
+            return Update {
+                feedback: Some("Wait for attachments to finish loading"),
+                ..Default::default()
+            };
+        }
+        if self.pending_composer_close.is_some() {
+            return Update::default();
+        }
         let draft = match &self.composer {
             ComposerState::Failed {
                 failure: SendFailure::DeliveryUncertain,
@@ -1119,12 +1806,37 @@ impl AppState {
                 ..Default::default()
             };
         };
-        if let Err(error) = smtp::validate_reply(
-            &account_email,
-            &draft.context,
-            smtp::ReplyKind::Reply,
-            &draft.body,
-        ) {
+        if draft.body.trim().is_empty()
+            && draft.compose.attachments.is_empty()
+            && draft.compose.inline_images.is_empty()
+        {
+            let draft = match std::mem::replace(&mut self.composer, ComposerState::Closed) {
+                ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
+                other => {
+                    self.composer = other;
+                    return Update::default();
+                }
+            };
+            self.composer = ComposerState::Failed {
+                draft,
+                failure: SendFailure::Empty,
+            };
+            return Update {
+                feedback: Some(send_failure_feedback(SendFailure::Empty)),
+                ..Default::default()
+            };
+        }
+        if let Err(error) = smtp::build_message(&smtp::MailSubmission {
+            account_email: account_email.clone(),
+            to: draft.compose.to.clone(),
+            cc: draft.compose.cc.clone(),
+            bcc: draft.compose.bcc.clone(),
+            subject: draft.compose.subject.clone(),
+            html: draft.compose.html.clone(),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+            thread: draft.compose.thread.clone(),
+        }) {
             let failure = map_send_failure(error);
             let draft = match std::mem::replace(&mut self.composer, ComposerState::Closed) {
                 ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
@@ -1149,11 +1861,8 @@ impl AppState {
                 return Update::default();
             }
         };
-        let submission = ReplySubmission {
-            account_email,
-            subject: draft.subject.clone(),
-            context: draft.context.clone(),
-            body: draft.body.clone(),
+        let submission = crate::worker::ComposeSubmission {
+            draft: draft.compose.clone(),
         };
         self.composer = ComposerState::Sending {
             draft,
@@ -1161,7 +1870,7 @@ impl AppState {
             generation,
         };
         Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::SendReply {
+            effects: vec![Effect::SendWorker(WorkerCommand::SendMessage {
                 request_id,
                 generation,
                 submission: Box::new(submission),
@@ -1195,6 +1904,49 @@ impl AppState {
         self.account
             .as_ref()
             .is_some_and(|current| !current.email.eq_ignore_ascii_case(&account.email))
+    }
+
+    fn current_account_is(&self, email: &str) -> bool {
+        self.account
+            .as_ref()
+            .is_some_and(|account| account.email.eq_ignore_ascii_case(email))
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+fn display_recipient(value: &Recipient) -> String {
+    value
+        .name
+        .as_ref()
+        .filter(|n| !n.trim().is_empty())
+        .map_or_else(
+            || value.email.clone(),
+            |name| format!("{name} <{}>", value.email),
+        )
+}
+fn compatibility_draft(compose: ComposeDraft) -> ReplyDraft {
+    let message_id = match &compose.kind {
+        composer::ComposeKind::Reply { original }
+        | composer::ComposeKind::ReplyAll { original }
+        | composer::ComposeKind::Forward { original } => original.clone(),
+    };
+    ReplyDraft {
+        message_id,
+        recipient: compose
+            .to
+            .iter()
+            .map(display_recipient)
+            .collect::<Vec<_>>()
+            .join(", "),
+        subject: compose.subject.clone(),
+        body: compose.text.clone(),
+        context: Default::default(),
+        compose,
     }
 }
 

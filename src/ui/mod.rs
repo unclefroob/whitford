@@ -1,5 +1,6 @@
 mod actions;
 mod build;
+mod composer_editor;
 mod email_view;
 mod render;
 mod time;
@@ -13,7 +14,6 @@ use std::{
 use adw::prelude::*;
 
 use crate::{
-    model::MessageId,
     oauth::AuthorizationUrl,
     state::{Action, AppState, ComposerState, Effect, MessageFilter},
     worker::{OperationId, WorkerCommand, WorkerEvent},
@@ -37,15 +37,28 @@ pub struct Ui {
     pub(crate) cache_limit: gtk::DropDown,
     pub(crate) cache_usage: gtk::Label,
     pub(crate) composer_window: adw::Window,
-    pub(crate) composer_to: gtk::Label,
-    pub(crate) composer_subject: gtk::Label,
-    pub(crate) composer_body: gtk::TextView,
+    pub(crate) composer_to: gtk::Entry,
+    pub(crate) composer_cc: gtk::Entry,
+    pub(crate) composer_bcc: gtk::Entry,
+    pub(crate) composer_cc_bcc: gtk::Box,
+    pub(crate) composer_subject: gtk::Entry,
+    pub(crate) composer_editor: composer_editor::ComposerEditor,
+    pub(crate) composer_attachments: gtk::Box,
+    pub(crate) composer_attachment_total: gtk::Label,
+    pub(crate) composer_attach: gtk::Button,
+    pub(crate) composer_inline: gtk::Button,
+    pub(crate) composer_expand: gtk::Button,
+    pub(crate) composer_signature: gtk::Button,
     pub(crate) composer_send: gtk::Button,
-    pub(crate) composer_cancel: gtk::Button,
+    pub(crate) composer_hide: gtk::Button,
+    pub(crate) composer_discard: gtk::Button,
     pub(crate) composer_refresh: gtk::Button,
     pub(crate) composer_progress: gtk::Spinner,
+    pub(crate) composer_draft_status: gtk::Label,
     pub(crate) composer_error: gtk::Label,
-    pub(crate) composer_message_id: Rc<RefCell<Option<MessageId>>>,
+    pub(crate) composer_message_id: Rc<RefCell<Option<String>>>,
+    pub(crate) composer_inline_ids: Rc<RefCell<Vec<String>>>,
+    pub(crate) composer_attachment_fingerprint: Rc<Cell<u64>>,
     pub(crate) last_list_revision: Rc<Cell<u64>>,
     pub(crate) last_reader_revision: Rc<Cell<u64>>,
     pub(crate) filter_buttons: Vec<(MessageFilter, gtk::Button)>,
@@ -71,15 +84,28 @@ pub(crate) struct WeakUi {
     cache_limit: gtk::glib::WeakRef<gtk::DropDown>,
     cache_usage: gtk::glib::WeakRef<gtk::Label>,
     composer_window: gtk::glib::WeakRef<adw::Window>,
-    composer_to: gtk::glib::WeakRef<gtk::Label>,
-    composer_subject: gtk::glib::WeakRef<gtk::Label>,
-    composer_body: gtk::glib::WeakRef<gtk::TextView>,
+    composer_to: gtk::glib::WeakRef<gtk::Entry>,
+    composer_cc: gtk::glib::WeakRef<gtk::Entry>,
+    composer_bcc: gtk::glib::WeakRef<gtk::Entry>,
+    composer_cc_bcc: gtk::glib::WeakRef<gtk::Box>,
+    composer_subject: gtk::glib::WeakRef<gtk::Entry>,
+    composer_editor: composer_editor::ComposerEditor,
+    composer_attachments: gtk::glib::WeakRef<gtk::Box>,
+    composer_attachment_total: gtk::glib::WeakRef<gtk::Label>,
+    composer_attach: gtk::glib::WeakRef<gtk::Button>,
+    composer_inline: gtk::glib::WeakRef<gtk::Button>,
+    composer_expand: gtk::glib::WeakRef<gtk::Button>,
+    composer_signature: gtk::glib::WeakRef<gtk::Button>,
     composer_send: gtk::glib::WeakRef<gtk::Button>,
-    composer_cancel: gtk::glib::WeakRef<gtk::Button>,
+    composer_hide: gtk::glib::WeakRef<gtk::Button>,
+    composer_discard: gtk::glib::WeakRef<gtk::Button>,
     composer_refresh: gtk::glib::WeakRef<gtk::Button>,
     composer_progress: gtk::glib::WeakRef<gtk::Spinner>,
+    composer_draft_status: gtk::glib::WeakRef<gtk::Label>,
     composer_error: gtk::glib::WeakRef<gtk::Label>,
-    composer_message_id: Weak<RefCell<Option<MessageId>>>,
+    composer_message_id: Weak<RefCell<Option<String>>>,
+    composer_inline_ids: Weak<RefCell<Vec<String>>>,
+    composer_attachment_fingerprint: Weak<Cell<u64>>,
     last_list_revision: Weak<Cell<u64>>,
     last_reader_revision: Weak<Cell<u64>>,
     filter_buttons: Vec<(MessageFilter, gtk::glib::WeakRef<gtk::Button>)>,
@@ -135,14 +161,27 @@ impl Ui {
             cache_usage: self.cache_usage.downgrade(),
             composer_window: self.composer_window.downgrade(),
             composer_to: self.composer_to.downgrade(),
+            composer_cc: self.composer_cc.downgrade(),
+            composer_bcc: self.composer_bcc.downgrade(),
+            composer_cc_bcc: self.composer_cc_bcc.downgrade(),
             composer_subject: self.composer_subject.downgrade(),
-            composer_body: self.composer_body.downgrade(),
+            composer_editor: self.composer_editor.clone(),
+            composer_attachments: self.composer_attachments.downgrade(),
+            composer_attachment_total: self.composer_attachment_total.downgrade(),
+            composer_attach: self.composer_attach.downgrade(),
+            composer_inline: self.composer_inline.downgrade(),
+            composer_expand: self.composer_expand.downgrade(),
+            composer_signature: self.composer_signature.downgrade(),
             composer_send: self.composer_send.downgrade(),
-            composer_cancel: self.composer_cancel.downgrade(),
+            composer_hide: self.composer_hide.downgrade(),
+            composer_discard: self.composer_discard.downgrade(),
             composer_refresh: self.composer_refresh.downgrade(),
             composer_progress: self.composer_progress.downgrade(),
+            composer_draft_status: self.composer_draft_status.downgrade(),
             composer_error: self.composer_error.downgrade(),
             composer_message_id: Rc::downgrade(&self.composer_message_id),
+            composer_inline_ids: Rc::downgrade(&self.composer_inline_ids),
+            composer_attachment_fingerprint: Rc::downgrade(&self.composer_attachment_fingerprint),
             last_list_revision: Rc::downgrade(&self.last_list_revision),
             last_reader_revision: Rc::downgrade(&self.last_reader_revision),
             filter_buttons: self
@@ -177,44 +216,62 @@ impl Ui {
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
     pub(crate) fn send_reply(&self) {
-        let buffer = self.composer_body.buffer();
-        let body = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-        self.dispatch(Action::UpdateReplyBody(body.to_string()));
-        self.dispatch(Action::SendReply);
+        self.flush_recipients();
+        let weak = self.downgrade();
+        self.composer_editor.snapshot(move |html, text| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dispatch(Action::UpdateHtml { html, text });
+                ui.dispatch(Action::SendReply);
+            }
+        });
     }
     pub(crate) fn request_close_composer(&self) {
         let composer = self.state.borrow().snapshot().composer;
         match &composer {
             ComposerState::Closed => self.composer_window.set_visible(false),
             ComposerState::Sending { .. } => self.toast("Wait for the reply to finish sending"),
-            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
-                let buffer = self.composer_body.buffer();
-                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-                if draft.body.trim().is_empty() && text.trim().is_empty() {
-                    self.dispatch(Action::CancelReply);
-                    return;
-                }
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Discard this reply?")
-                    .body("Your unsent reply will be lost.")
-                    .build();
-                dialog.add_response("keep", "Keep Editing");
-                dialog.add_response("discard", "Discard");
-                dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            ComposerState::Editing { .. } | ComposerState::Failed { .. } => {
+                self.flush_recipients();
                 let weak = self.downgrade();
-                dialog.choose(
-                    Some(&self.composer_window),
-                    None::<&gtk::gio::Cancellable>,
-                    move |response| {
-                        if response == "discard"
-                            && let Some(ui) = weak.upgrade()
-                        {
-                            ui.dispatch(Action::CancelReply);
-                        }
-                    },
-                );
+                self.composer_editor.snapshot(move |html, text| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.dispatch(Action::UpdateHtml { html, text });
+                        ui.dispatch(Action::HideComposer);
+                    }
+                });
             }
         }
+    }
+
+    pub(crate) fn save_composer_then_close_app(&self) {
+        let composer = self.state.borrow().snapshot().composer;
+        if matches!(composer, ComposerState::Sending { .. }) {
+            self.toast("Wait for the reply to finish sending");
+            return;
+        }
+        if matches!(composer, ComposerState::Closed) {
+            self.window.close();
+            return;
+        }
+        self.flush_recipients();
+        let weak = self.downgrade();
+        self.composer_editor.snapshot(move |html, text| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dispatch(Action::UpdateHtml { html, text });
+                ui.dispatch(Action::HideComposerAndCloseApp);
+            }
+        });
+    }
+
+    pub(crate) fn flush_recipients(&self) {
+        self.dispatch(Action::UpdateRecipients {
+            to: parse_recipients(&self.composer_to.text()),
+            cc: parse_recipients(&self.composer_cc.text()),
+            bcc: parse_recipients(&self.composer_bcc.text()),
+        });
+        self.dispatch(Action::UpdateSubject(
+            self.composer_subject.text().to_string(),
+        ));
     }
     fn handle_worker_event(&self, event: WorkerEvent) {
         let event = match event {
@@ -333,6 +390,7 @@ impl Ui {
                     },
                 );
             }
+            Effect::CloseApplicationWindow => self.window.close(),
         }
     }
 }
@@ -357,14 +415,27 @@ impl WeakUi {
             cache_usage: self.cache_usage.upgrade()?,
             composer_window: self.composer_window.upgrade()?,
             composer_to: self.composer_to.upgrade()?,
+            composer_cc: self.composer_cc.upgrade()?,
+            composer_bcc: self.composer_bcc.upgrade()?,
+            composer_cc_bcc: self.composer_cc_bcc.upgrade()?,
             composer_subject: self.composer_subject.upgrade()?,
-            composer_body: self.composer_body.upgrade()?,
+            composer_editor: self.composer_editor.clone(),
+            composer_attachments: self.composer_attachments.upgrade()?,
+            composer_attachment_total: self.composer_attachment_total.upgrade()?,
+            composer_attach: self.composer_attach.upgrade()?,
+            composer_inline: self.composer_inline.upgrade()?,
+            composer_expand: self.composer_expand.upgrade()?,
+            composer_signature: self.composer_signature.upgrade()?,
             composer_send: self.composer_send.upgrade()?,
-            composer_cancel: self.composer_cancel.upgrade()?,
+            composer_hide: self.composer_hide.upgrade()?,
+            composer_discard: self.composer_discard.upgrade()?,
             composer_refresh: self.composer_refresh.upgrade()?,
             composer_progress: self.composer_progress.upgrade()?,
+            composer_draft_status: self.composer_draft_status.upgrade()?,
             composer_error: self.composer_error.upgrade()?,
             composer_message_id: self.composer_message_id.upgrade()?,
+            composer_inline_ids: self.composer_inline_ids.upgrade()?,
+            composer_attachment_fingerprint: self.composer_attachment_fingerprint.upgrade()?,
             last_list_revision: self.last_list_revision.upgrade()?,
             last_reader_revision: self.last_reader_revision.upgrade()?,
             filter_buttons: self
@@ -376,4 +447,27 @@ impl WeakUi {
             authorization: self.authorization.upgrade()?,
         })
     }
+}
+
+fn parse_recipients(value: &str) -> Vec<crate::composer::Recipient> {
+    value
+        .split([',', ';'])
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (name, email) = part
+                .rsplit_once('<')
+                .and_then(|(name, email)| email.strip_suffix('>').map(|email| (name, email)))
+                .map_or((None, part), |(name, email)| {
+                    let name = name.trim().trim_matches('"');
+                    ((!name.is_empty()).then(|| name.to_owned()), email.trim())
+                });
+            Some(crate::composer::Recipient {
+                name,
+                email: email.to_owned(),
+            })
+        })
+        .collect()
 }

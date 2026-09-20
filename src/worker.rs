@@ -1,5 +1,7 @@
 use crate::{
-    cache, config, gmail, message,
+    cache,
+    composer::{ComposeDraft, DraftAttachment},
+    config, drafts, gmail, message,
     model::{
         AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, ReplyContext,
         SyncMetadata,
@@ -42,6 +44,8 @@ pub struct BodyRequestId(pub u64);
 pub struct CacheOperationId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SendRequestId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DraftOperationId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncKind {
     Restore,
@@ -112,6 +116,12 @@ pub struct ReplySubmission {
     pub subject: String,
     pub context: ReplyContext,
     pub body: String,
+}
+
+/// A generic composer submission. It intentionally carries only private staged
+/// file references; attachment bytes are loaded on the blocking worker lane.
+pub struct ComposeSubmission {
+    pub draft: ComposeDraft,
 }
 impl FailureKind {
     pub fn is_configuration(self) -> bool {
@@ -184,6 +194,48 @@ pub enum WorkerCommand {
         generation: u64,
         submission: Box<ReplySubmission>,
     },
+    SendMessage {
+        request_id: SendRequestId,
+        generation: u64,
+        submission: Box<ComposeSubmission>,
+    },
+    LoadDrafts {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    SaveDraft {
+        operation_id: DraftOperationId,
+        draft: Box<ComposeDraft>,
+    },
+    DeleteDraft {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+    },
+    StageAttachment {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+        inline: bool,
+    },
+    RemoveStaged {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        staged_file: String,
+    },
+    LoadSignature {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    SaveSignature {
+        operation_id: DraftOperationId,
+        account_email: String,
+        preference: drafts::SignaturePreference,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -229,6 +281,41 @@ impl fmt::Debug for WorkerCommand {
                 .field("generation", generation)
                 .field("content", &"[REDACTED]")
                 .finish(),
+            Self::SendMessage {
+                request_id,
+                generation,
+                ..
+            } => f
+                .debug_struct("SendMessage")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("content", &"[REDACTED]")
+                .finish(),
+            Self::LoadDrafts { operation_id, .. } => f
+                .debug_struct("LoadDrafts")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::SaveDraft { operation_id, .. } => f
+                .debug_struct("SaveDraft")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::DeleteDraft { operation_id, .. } => f
+                .debug_struct("DeleteDraft")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::StageAttachment { operation_id, .. } => f
+                .debug_struct("StageAttachment")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::RemoveStaged { operation_id, .. } => {
+                f.debug_tuple("RemoveStaged").field(operation_id).finish()
+            }
+            Self::LoadSignature { operation_id, .. } => {
+                f.debug_tuple("LoadSignature").field(operation_id).finish()
+            }
+            Self::SaveSignature { operation_id, .. } => {
+                f.debug_tuple("SaveSignature").field(operation_id).finish()
+            }
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -306,6 +393,46 @@ pub enum WorkerEvent {
         request_id: SendRequestId,
         generation: u64,
         failure: SendFailure,
+    },
+    DraftsLoaded {
+        operation_id: DraftOperationId,
+        account_email: String,
+        drafts: Vec<ComposeDraft>,
+    },
+    DraftSaved {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        revision: u64,
+    },
+    DraftDeleted {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+    },
+    AttachmentStaged {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        attachment: DraftAttachment,
+        inline: bool,
+    },
+    StagedRemoved {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    SignatureLoaded {
+        operation_id: DraftOperationId,
+        account_email: String,
+        preference: drafts::SignaturePreference,
+    },
+    SignatureSaved {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    DraftOperationFailed {
+        operation_id: DraftOperationId,
+        account_email: String,
     },
 }
 impl fmt::Debug for WorkerEvent {
@@ -407,6 +534,51 @@ impl fmt::Debug for WorkerEvent {
                 .field("generation", generation)
                 .field("failure", failure)
                 .finish(),
+            Self::DraftsLoaded {
+                operation_id,
+                drafts,
+                ..
+            } => f
+                .debug_struct("DraftsLoaded")
+                .field("operation_id", operation_id)
+                .field("count", &drafts.len())
+                .finish(),
+            Self::DraftSaved {
+                operation_id,
+                revision,
+                ..
+            } => f
+                .debug_struct("DraftSaved")
+                .field("operation_id", operation_id)
+                .field("revision", revision)
+                .finish(),
+            Self::DraftDeleted { operation_id, .. } => f
+                .debug_struct("DraftDeleted")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::AttachmentStaged {
+                operation_id,
+                attachment,
+                ..
+            } => f
+                .debug_struct("AttachmentStaged")
+                .field("operation_id", operation_id)
+                .field("bytes", &attachment.bytes)
+                .finish(),
+            Self::StagedRemoved { operation_id, .. } => {
+                f.debug_tuple("StagedRemoved").field(operation_id).finish()
+            }
+            Self::SignatureLoaded { operation_id, .. } => f
+                .debug_tuple("SignatureLoaded")
+                .field(operation_id)
+                .finish(),
+            Self::SignatureSaved { operation_id, .. } => {
+                f.debug_tuple("SignatureSaved").field(operation_id).finish()
+            }
+            Self::DraftOperationFailed { operation_id, .. } => f
+                .debug_struct("DraftOperationFailed")
+                .field("operation_id", operation_id)
+                .finish(),
         }
     }
 }
@@ -462,6 +634,9 @@ async fn controller(
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
+    let (draft_tx, draft_rx) = mpsc::unbounded_channel();
+    let draft_events = events.clone();
+    let draft_task = tokio::spawn(draft_io_actor(draft_rx, draft_events));
     loop {
         let command = if let Some(current) = active.as_mut() {
             tokio::select! {
@@ -518,6 +693,179 @@ async fn controller(
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
+            continue;
+        }
+        if matches!(
+            command,
+            WorkerCommand::LoadDrafts { .. }
+                | WorkerCommand::SaveDraft { .. }
+                | WorkerCommand::DeleteDraft { .. }
+                | WorkerCommand::StageAttachment { .. }
+                | WorkerCommand::RemoveStaged { .. }
+                | WorkerCommand::LoadSignature { .. }
+                | WorkerCommand::SaveSignature { .. }
+        ) {
+            let operation = match command {
+                WorkerCommand::LoadDrafts {
+                    operation_id,
+                    account_email,
+                } => DraftIo::Load {
+                    operation_id,
+                    account_email,
+                },
+                WorkerCommand::SaveDraft {
+                    operation_id,
+                    draft,
+                } => DraftIo::Save {
+                    operation_id,
+                    draft,
+                },
+                WorkerCommand::DeleteDraft {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                } => DraftIo::Delete {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                },
+                WorkerCommand::StageAttachment {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                    source,
+                    display_name,
+                    media_type,
+                    inline,
+                } => DraftIo::Stage {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                    source,
+                    display_name,
+                    media_type,
+                    inline,
+                },
+                WorkerCommand::RemoveStaged {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                    staged_file,
+                } => DraftIo::RemoveStaged {
+                    operation_id,
+                    account_email,
+                    draft_id,
+                    staged_file,
+                },
+                WorkerCommand::LoadSignature {
+                    operation_id,
+                    account_email,
+                } => DraftIo::LoadSignature {
+                    operation_id,
+                    account_email,
+                },
+                WorkerCommand::SaveSignature {
+                    operation_id,
+                    account_email,
+                    preference,
+                } => DraftIo::SaveSignature {
+                    operation_id,
+                    account_email,
+                    preference,
+                },
+                _ => unreachable!(),
+            };
+            if let Err(error) = draft_tx.send(operation) {
+                let account_email = match &error.0 {
+                    DraftIo::Load { account_email, .. }
+                    | DraftIo::Delete { account_email, .. }
+                    | DraftIo::Stage { account_email, .. }
+                    | DraftIo::RemoveStaged { account_email, .. }
+                    | DraftIo::LoadSignature { account_email, .. }
+                    | DraftIo::SaveSignature { account_email, .. } => account_email.clone(),
+                    DraftIo::Save { draft, .. } => draft.account_email.clone(),
+                };
+                let operation_id = match error.0 {
+                    DraftIo::Load { operation_id, .. }
+                    | DraftIo::Save { operation_id, .. }
+                    | DraftIo::Delete { operation_id, .. }
+                    | DraftIo::Stage { operation_id, .. }
+                    | DraftIo::RemoveStaged { operation_id, .. }
+                    | DraftIo::LoadSignature { operation_id, .. }
+                    | DraftIo::SaveSignature { operation_id, .. } => operation_id,
+                };
+                let _ = events.send(WorkerEvent::DraftOperationFailed {
+                    operation_id,
+                    account_email,
+                });
+            }
+            continue;
+        }
+        if matches!(&command, WorkerCommand::SendMessage { .. }) {
+            let WorkerCommand::SendMessage {
+                request_id,
+                generation,
+                submission,
+            } = command
+            else {
+                unreachable!()
+            };
+            if let Some(task) = send_task.take() {
+                if !task.is_finished() {
+                    send_task = Some(task);
+                    let _ = events.send(WorkerEvent::ReplyFailed {
+                        request_id,
+                        generation,
+                        failure: SendFailure::Protocol,
+                    });
+                    continue;
+                }
+                let _ = task.await;
+            }
+            send_generation.store(generation, Ordering::Release);
+            let draft = submission.draft;
+            let credentials = auth
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .filter(|value| value.email.eq_ignore_ascii_case(&draft.account_email))
+                .map(|value| {
+                    (
+                        value.email.clone(),
+                        Zeroizing::new(value.access_token.as_str().to_owned()),
+                    )
+                });
+            let tx = events.clone();
+            let gate = send_generation.clone();
+            send_task = Some(tokio::spawn(async move {
+                let result = guard_smtp_send(async move {
+                    let Some((email, token)) = credentials else {
+                        return Err(smtp::SmtpError::Authentication);
+                    };
+                    let submission =
+                        tokio::task::spawn_blocking(move || materialize_submission(draft))
+                            .await
+                            .map_err(|_| smtp::SmtpError::Build)??;
+                    let message = smtp::build_message(&submission)?;
+                    smtp::send_reply(&email, token.as_str(), message).await
+                })
+                .await;
+                if gate.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let event = match result {
+                    Ok(()) => WorkerEvent::ReplySent {
+                        request_id,
+                        generation,
+                    },
+                    Err(error) => WorkerEvent::ReplyFailed {
+                        request_id,
+                        generation,
+                        failure: map_send_failure(error),
+                    },
+                };
+                let _ = tx.send(event);
+            }));
             continue;
         }
         if matches!(&command, WorkerCommand::SendReply { .. }) {
@@ -807,10 +1155,297 @@ async fn controller(
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::ClearBodyCache { .. }
             | WorkerCommand::SendReply { .. }
+            | WorkerCommand::SendMessage { .. }
+            | WorkerCommand::LoadDrafts { .. }
+            | WorkerCommand::SaveDraft { .. }
+            | WorkerCommand::DeleteDraft { .. }
+            | WorkerCommand::StageAttachment { .. }
+            | WorkerCommand::RemoveStaged { .. }
+            | WorkerCommand::LoadSignature { .. }
+            | WorkerCommand::SaveSignature { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
     }
+    draft_task.abort();
+}
+
+enum DraftIo {
+    Load {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    Save {
+        operation_id: DraftOperationId,
+        draft: Box<ComposeDraft>,
+    },
+    Delete {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+    },
+    Stage {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        source: std::path::PathBuf,
+        display_name: String,
+        media_type: String,
+        inline: bool,
+    },
+    RemoveStaged {
+        operation_id: DraftOperationId,
+        account_email: String,
+        draft_id: String,
+        staged_file: String,
+    },
+    LoadSignature {
+        operation_id: DraftOperationId,
+        account_email: String,
+    },
+    SaveSignature {
+        operation_id: DraftOperationId,
+        account_email: String,
+        preference: drafts::SignaturePreference,
+    },
+}
+
+async fn draft_io_actor(
+    mut rx: mpsc::UnboundedReceiver<DraftIo>,
+    events: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while let Ok(operation) = rx.try_recv() {
+            batch.push(operation);
+        }
+        for index in 0..batch.len() {
+            let obsolete = match &batch[index] {
+                DraftIo::Save { draft, .. } => batch[index + 1..].iter().any(|later| {
+                    matches!(later, DraftIo::Save { draft: candidate, .. }
+                        if candidate.id == draft.id && candidate.dirty_revision >= draft.dirty_revision)
+                }),
+                _ => false,
+            };
+            if obsolete {
+                continue;
+            }
+            // Replacing with a harmless sentinel lets us move the operation
+            // without cloning multi-megabyte rich text.
+            let operation = std::mem::replace(
+                &mut batch[index],
+                DraftIo::Load {
+                    operation_id: DraftOperationId(0),
+                    account_email: String::new(),
+                },
+            );
+            handle_draft_io(operation, &events).await;
+        }
+    }
+}
+
+async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<WorkerEvent>) {
+    let operation_id = match &operation {
+        DraftIo::Load { operation_id, .. }
+        | DraftIo::Save { operation_id, .. }
+        | DraftIo::Delete { operation_id, .. }
+        | DraftIo::Stage { operation_id, .. }
+        | DraftIo::RemoveStaged { operation_id, .. }
+        | DraftIo::LoadSignature { operation_id, .. }
+        | DraftIo::SaveSignature { operation_id, .. } => *operation_id,
+    };
+    let account_email = match &operation {
+        DraftIo::Load { account_email, .. }
+        | DraftIo::Delete { account_email, .. }
+        | DraftIo::Stage { account_email, .. }
+        | DraftIo::RemoveStaged { account_email, .. }
+        | DraftIo::LoadSignature { account_email, .. }
+        | DraftIo::SaveSignature { account_email, .. } => account_email.clone(),
+        DraftIo::Save { draft, .. } => draft.account_email.clone(),
+    };
+    let failure_account = account_email.clone();
+    let result = tokio::task::spawn_blocking(move || match operation {
+        DraftIo::Load {
+            operation_id,
+            account_email,
+        } => drafts::load_all(&account_email).map(|mut drafts| {
+            for draft in &mut drafts {
+                draft.html = crate::composer::sanitize_html(&draft.html);
+                draft.text = crate::composer::html_to_plain(&draft.html);
+            }
+            WorkerEvent::DraftsLoaded {
+                operation_id,
+                account_email,
+                drafts,
+            }
+        }),
+        DraftIo::Save {
+            operation_id,
+            mut draft,
+        } => {
+            draft.html = crate::composer::sanitize_html(&draft.html);
+            draft.text = crate::composer::html_to_plain(&draft.html);
+            drafts::save(&draft.account_email, &draft)?;
+            Ok(WorkerEvent::DraftSaved {
+                operation_id,
+                account_email: draft.account_email.clone(),
+                draft_id: draft.id.clone(),
+                revision: draft.dirty_revision,
+            })
+        }
+        DraftIo::Delete {
+            operation_id,
+            account_email,
+            draft_id,
+        } => {
+            drafts::delete(&account_email, &draft_id)?;
+            Ok(WorkerEvent::DraftDeleted {
+                operation_id,
+                account_email,
+                draft_id,
+            })
+        }
+        DraftIo::Stage {
+            operation_id,
+            account_email,
+            draft_id,
+            source,
+            display_name,
+            media_type,
+            inline,
+        } => {
+            let attachment = drafts::stage_file(
+                &account_email,
+                &draft_id,
+                &source,
+                &display_name,
+                &media_type,
+            )?;
+            Ok(WorkerEvent::AttachmentStaged {
+                operation_id,
+                account_email,
+                draft_id,
+                attachment,
+                inline,
+            })
+        }
+        DraftIo::RemoveStaged {
+            operation_id,
+            account_email,
+            draft_id,
+            staged_file,
+        } => {
+            drafts::remove_staged(&account_email, &draft_id, &staged_file)?;
+            Ok(WorkerEvent::StagedRemoved {
+                operation_id,
+                account_email,
+            })
+        }
+        DraftIo::LoadSignature {
+            operation_id,
+            account_email,
+        } => {
+            drafts::load_signature(&account_email).map(|preference| WorkerEvent::SignatureLoaded {
+                operation_id,
+                account_email,
+                preference,
+            })
+        }
+        DraftIo::SaveSignature {
+            operation_id,
+            account_email,
+            preference,
+        } => {
+            drafts::save_signature(&account_email, &preference)?;
+            Ok(WorkerEvent::SignatureSaved {
+                operation_id,
+                account_email,
+            })
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(event)) => {
+            let _ = events.send(event);
+        }
+        _ => {
+            let _ = events.send(WorkerEvent::DraftOperationFailed {
+                operation_id,
+                account_email: failure_account,
+            });
+        }
+    }
+}
+
+fn materialize_submission(draft: ComposeDraft) -> Result<smtp::MailSubmission, smtp::SmtpError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    fn load(
+        account: &str,
+        id: &str,
+        attachment: &DraftAttachment,
+    ) -> Result<smtp::SubmissionPart, smtp::SmtpError> {
+        let path = drafts::staged_path(account, id, &attachment.staged_file)
+            .map_err(|_| smtp::SmtpError::Build)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| smtp::SmtpError::Build)?;
+        let metadata = file.metadata().map_err(|_| smtp::SmtpError::Build)?;
+        if !metadata.is_file() || metadata.len() != attachment.bytes {
+            return Err(smtp::SmtpError::Build);
+        }
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(attachment.bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| smtp::SmtpError::Build)?;
+        if bytes.len() as u64 != attachment.bytes {
+            return Err(smtp::SmtpError::Build);
+        }
+        Ok(smtp::SubmissionPart {
+            display_name: attachment.display_name.clone(),
+            media_type: attachment.media_type.clone(),
+            bytes,
+        })
+    }
+    let all_parts = draft
+        .attachments
+        .iter()
+        .chain(draft.inline_images.iter().map(|inline| &inline.attachment));
+    let (count, total) = all_parts.fold((0_usize, 0_u64), |(count, total), part| {
+        (count.saturating_add(1), total.saturating_add(part.bytes))
+    });
+    if count > drafts::MAX_STAGED_FILES || total > drafts::MAX_STAGED_TOTAL_BYTES {
+        return Err(smtp::SmtpError::BodyTooLarge);
+    }
+    let attachments = draft
+        .attachments
+        .iter()
+        .map(|part| load(&draft.account_email, &draft.id, part))
+        .collect::<Result<Vec<_>, _>>()?;
+    let inline_images = draft
+        .inline_images
+        .iter()
+        .map(|inline| {
+            Ok(smtp::InlineSubmissionPart {
+                part: load(&draft.account_email, &draft.id, &inline.attachment)?,
+                content_id: inline.content_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, smtp::SmtpError>>()?;
+    Ok(smtp::MailSubmission {
+        account_email: draft.account_email,
+        to: draft.to,
+        cc: draft.cc,
+        bcc: draft.bcc,
+        subject: draft.subject,
+        html: draft.html,
+        attachments,
+        inline_images,
+        thread: draft.thread,
+    })
 }
 
 struct RuntimeAuth {
@@ -917,6 +1552,14 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::ClearBodyCache { .. }
         | WorkerCommand::SendReply { .. }
+        | WorkerCommand::SendMessage { .. }
+        | WorkerCommand::LoadDrafts { .. }
+        | WorkerCommand::SaveDraft { .. }
+        | WorkerCommand::DeleteDraft { .. }
+        | WorkerCommand::StageAttachment { .. }
+        | WorkerCommand::RemoveStaged { .. }
+        | WorkerCommand::LoadSignature { .. }
+        | WorkerCommand::SaveSignature { .. }
         | WorkerCommand::Shutdown => None,
     }
 }

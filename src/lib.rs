@@ -1,5 +1,7 @@
 pub mod cache;
+pub mod composer;
 pub mod config;
+pub mod drafts;
 pub mod gmail;
 pub mod message;
 pub mod model;

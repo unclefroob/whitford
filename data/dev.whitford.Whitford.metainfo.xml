@@ -7,7 +7,7 @@
   <project_license>GPL-3.0-or-later</project_license>
   <description>
     <p>Whitford is a keyboard-friendly, adaptive Gmail reader built with GTK and libadwaita.</p>
-    <p>This developer preview reads Gmail efficiently and sends explicit plain-text replies.</p>
+    <p>This developer preview reads Gmail efficiently and includes rich Reply, Reply All, and Forward composition with local draft recovery and attachments.</p>
     <p>Connection requires a local Google OAuth Desktop client configuration; setup instructions are included in the project README.</p>
   </description>
   <launchable type="desktop-id">dev.whitford.Whitford.desktop</launchable>

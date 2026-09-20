@@ -102,16 +102,29 @@ pub(super) fn build(
         sync_detail,
         cache_limit,
         cache_usage,
-        composer_window: composer.0,
-        composer_to: composer.1,
-        composer_subject: composer.2,
-        composer_body: composer.3,
-        composer_send: composer.4,
-        composer_cancel: composer.5,
-        composer_refresh: composer.6,
-        composer_progress: composer.7,
-        composer_error: composer.8,
+        composer_window: composer.window,
+        composer_to: composer.to,
+        composer_cc: composer.cc,
+        composer_bcc: composer.bcc,
+        composer_cc_bcc: composer.cc_bcc,
+        composer_subject: composer.subject,
+        composer_editor: composer.editor,
+        composer_attachments: composer.attachments,
+        composer_attachment_total: composer.attachment_total,
+        composer_attach: composer.attach,
+        composer_inline: composer.inline,
+        composer_expand: composer.expand,
+        composer_signature: composer.signature,
+        composer_send: composer.send,
+        composer_hide: composer.hide,
+        composer_discard: composer.discard,
+        composer_refresh: composer.refresh,
+        composer_progress: composer.progress,
+        composer_draft_status: composer.draft_status,
+        composer_error: composer.error,
         composer_message_id: Rc::new(RefCell::new(None)),
+        composer_inline_ids: Rc::new(RefCell::new(Vec::new())),
+        composer_attachment_fingerprint: Rc::new(Cell::new(u64::MAX)),
         last_list_revision: Rc::new(Cell::new(u64::MAX)),
         last_reader_revision: Rc::new(Cell::new(u64::MAX)),
         filter_buttons,
@@ -120,44 +133,128 @@ pub(super) fn build(
     }
 }
 
-#[allow(clippy::type_complexity)]
-fn build_composer(
-    window: &adw::ApplicationWindow,
-) -> (
-    adw::Window,
-    gtk::Label,
-    gtk::Label,
-    gtk::TextView,
-    gtk::Button,
-    gtk::Button,
-    gtk::Button,
-    gtk::Spinner,
-    gtk::Label,
-) {
-    let to = gtk::Label::builder()
+struct ComposerWidgets {
+    window: adw::Window,
+    to: gtk::Entry,
+    cc: gtk::Entry,
+    bcc: gtk::Entry,
+    cc_bcc: gtk::Box,
+    subject: gtk::Entry,
+    editor: super::composer_editor::ComposerEditor,
+    attachments: gtk::Box,
+    attachment_total: gtk::Label,
+    attach: gtk::Button,
+    inline: gtk::Button,
+    expand: gtk::Button,
+    signature: gtk::Button,
+    send: gtk::Button,
+    hide: gtk::Button,
+    discard: gtk::Button,
+    refresh: gtk::Button,
+    progress: gtk::Spinner,
+    draft_status: gtk::Label,
+    error: gtk::Label,
+}
+
+fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
+    let to = recipient_entry("To", "Recipients, separated by commas");
+    let cc = recipient_entry("Cc", "Carbon copy recipients");
+    let bcc = recipient_entry("Bcc", "Blind carbon copy recipients");
+    let subject = gtk::Entry::builder().placeholder_text("Subject").build();
+    subject.update_property(&[gtk::accessible::Property::Label("Subject")]);
+    let editor = super::composer_editor::ComposerEditor::new();
+    let toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .css_classes(["whitford-composer-toolbar"])
+        .build();
+    for (icon, label, command) in [
+        ("edit-undo-symbolic", "Undo", "undo"),
+        ("edit-redo-symbolic", "Redo", "redo"),
+        ("format-text-bold-symbolic", "Bold", "bold"),
+        ("format-text-italic-symbolic", "Italic", "italic"),
+        ("format-text-underline-symbolic", "Underline", "underline"),
+        (
+            "view-list-bullet-symbolic",
+            "Bulleted list",
+            "insertUnorderedList",
+        ),
+        (
+            "view-list-ordered-symbolic",
+            "Numbered list",
+            "insertOrderedList",
+        ),
+        ("format-indent-more-symbolic", "Quote", "formatBlock"),
+        (
+            "edit-clear-all-symbolic",
+            "Remove formatting",
+            "removeFormat",
+        ),
+    ] {
+        let button = gtk::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(label)
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
+        let editor_copy = editor.clone();
+        button.connect_clicked(move |_| {
+            editor_copy.command(command, (command == "formatBlock").then_some("blockquote"))
+        });
+        toolbar.append(&button);
+    }
+    let link = gtk::Button::builder()
+        .icon_name("insert-link-symbolic")
+        .tooltip_text("Insert link")
+        .build();
+    link.update_property(&[gtk::accessible::Property::Label("Insert link")]);
+    let editor_copy = editor.clone();
+    link.connect_clicked(move |_| editor_copy.command("promptLink", None));
+    toolbar.append(&link);
+    for (text, label, command) in [
+        ("Quote", "Show or hide quoted message", "toggleQuote"),
+        ("Remove quote", "Remove quoted message", "removeQuote"),
+    ] {
+        let button = gtk::Button::with_label(text);
+        button.set_tooltip_text(Some(label));
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
+        let editor_copy = editor.clone();
+        button.connect_clicked(move |_| editor_copy.command(command, None));
+        toolbar.append(&button);
+    }
+    let signature = gtk::Button::with_label("Signature");
+    signature.set_tooltip_text(Some("Configure account signature"));
+    signature.update_property(&[gtk::accessible::Property::Label(
+        "Configure account signature",
+    )]);
+    toolbar.append(&signature);
+    let attach = gtk::Button::builder()
+        .icon_name("mail-attachment-symbolic")
+        .tooltip_text("Attach files")
+        .build();
+    attach.update_property(&[gtk::accessible::Property::Label("Attach files")]);
+    toolbar.append(&attach);
+    let inline = gtk::Button::builder()
+        .icon_name("insert-image-symbolic")
+        .tooltip_text("Insert inline image")
+        .build();
+    inline.update_property(&[gtk::accessible::Property::Label("Insert inline image")]);
+    toolbar.append(&inline);
+    let toolbar_scroll = gtk::ScrolledWindow::builder()
+        .child(&toolbar)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .build();
+    let attachments = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    let attachment_total = gtk::Label::builder()
         .xalign(0.0)
-        .selectable(true)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .css_classes(["caption", "dim-label"])
         .build();
-    let subject = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["title-3"])
-        .build();
-    let body = gtk::TextView::builder()
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(12)
-        .right_margin(12)
-        .vexpand(true)
-        .accepts_tab(false)
-        .css_classes(["whitford-composer-body"])
-        .build();
-    body.update_property(&[gtk::accessible::Property::Label("Reply body")]);
     let scroll = gtk::ScrolledWindow::builder()
-        .child(&body)
+        .child(&editor.view)
         .vexpand(true)
         .min_content_height(260)
         .build();
@@ -165,10 +262,25 @@ fn build_composer(
         .label("Send")
         .css_classes(["suggested-action"])
         .build();
-    let cancel = gtk::Button::with_label("Cancel");
+    let hide = gtk::Button::with_label("Save & Close");
+    let discard = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Discard draft")
+        .build();
+    discard.update_property(&[gtk::accessible::Property::Label("Discard draft")]);
+    let expand = gtk::Button::builder()
+        .icon_name("view-fullscreen-symbolic")
+        .tooltip_text("Expand composer")
+        .build();
+    expand.update_property(&[gtk::accessible::Property::Label("Expand composer")]);
     let refresh = gtk::Button::with_label("Refresh Gmail");
     let progress = gtk::Spinner::builder().visible(false).build();
     progress.update_property(&[gtk::accessible::Property::Label("Sending reply")]);
+    let draft_status = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
     let error = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
@@ -181,8 +293,11 @@ fn build_composer(
         .halign(gtk::Align::End)
         .build();
     actions.append(&progress);
+    actions.append(&draft_status);
+    actions.append(&discard);
+    actions.append(&expand);
     actions.append(&refresh);
-    actions.append(&cancel);
+    actions.append(&hide);
     actions.append(&send);
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -194,30 +309,101 @@ fn build_composer(
         .build();
     content.append(
         &gtk::Label::builder()
-            .label("Reply")
+            .label("Compose message")
             .xalign(0.0)
             .css_classes(["title-1"])
             .build(),
     );
-    content.append(&to);
+    let recipients = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    to.set_hexpand(true);
+    recipients.append(&to);
+    let disclose = gtk::Button::with_label("Cc/Bcc");
+    disclose.set_tooltip_text(Some("Show or hide Cc and Bcc"));
+    recipients.append(&disclose);
+    let cc_bcc = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .visible(false)
+        .build();
+    cc_bcc.append(&cc);
+    cc_bcc.append(&bcc);
+    let cc_bcc_copy = cc_bcc.clone();
+    disclose.connect_clicked(move |_| cc_bcc_copy.set_visible(!cc_bcc_copy.is_visible()));
+    content.append(&recipients);
+    content.append(&cc_bcc);
     content.append(&subject);
+    content.append(&toolbar_scroll);
     content.append(&scroll);
+    content.append(&attachments);
+    content.append(&attachment_total);
     content.append(&error);
     content.append(&actions);
+    let content_scroll = gtk::ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
+        .build();
     let composer = adw::Window::builder()
         .title("Reply — Whitford")
         .default_width(560)
         .default_height(520)
-        .modal(true)
+        .modal(false)
         .transient_for(window)
-        .content(&content)
+        .content(&content_scroll)
         .build();
-    (
-        composer, to, subject, body, send, cancel, refresh, progress, error,
-    )
+    ComposerWidgets {
+        window: composer,
+        to,
+        cc,
+        bcc,
+        cc_bcc,
+        subject,
+        editor,
+        attachments,
+        attachment_total,
+        attach,
+        inline,
+        expand,
+        signature,
+        send,
+        hide,
+        discard,
+        refresh,
+        progress,
+        draft_status,
+        error,
+    }
+}
+
+fn recipient_entry(placeholder: &str, label: &str) -> gtk::Entry {
+    let entry = gtk::Entry::builder().placeholder_text(placeholder).build();
+    entry.update_property(&[gtk::accessible::Property::Label(label)]);
+    entry
 }
 
 pub(super) fn connect_signals(ui: &Ui) {
+    for entry in [&ui.composer_to, &ui.composer_cc, &ui.composer_bcc] {
+        entry.connect_changed({
+            let weak_ui = ui.downgrade();
+            move |_| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    ui.flush_recipients();
+                }
+            }
+        });
+    }
+    ui.composer_subject.connect_changed({
+        let weak_ui = ui.downgrade();
+        move |entry| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::UpdateSubject(entry.text().to_string()));
+            }
+        }
+    });
     ui.composer_send.connect_clicked({
         let weak_ui = ui.downgrade();
         move |_| {
@@ -226,7 +412,7 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         }
     });
-    ui.composer_cancel.connect_clicked({
+    ui.composer_hide.connect_clicked({
         let weak_ui = ui.downgrade();
         move |_| {
             if let Some(ui) = weak_ui.upgrade() {
@@ -234,6 +420,210 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         }
     });
+    ui.composer_discard.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            let Some(ui) = weak_ui.upgrade() else { return };
+            let dialog = adw::AlertDialog::builder()
+                .heading("Discard this draft?")
+                .body("The message and staged attachments will be removed from this device.")
+                .build();
+            dialog.add_response("keep", "Keep Draft");
+            dialog.add_response("discard", "Discard");
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            let weak = ui.downgrade();
+            dialog.choose(
+                Some(&ui.composer_window),
+                None::<&gtk::gio::Cancellable>,
+                move |response| {
+                    if response == "discard"
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.dispatch(Action::DiscardDraft);
+                    }
+                },
+            );
+        }
+    });
+    ui.composer_expand.connect_clicked({
+        let window = ui.composer_window.clone();
+        move |_| {
+            if window.width() < 800 {
+                window.set_default_size(900, 760)
+            } else {
+                window.set_default_size(620, 600)
+            }
+        }
+    });
+    ui.composer_signature.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            let Some(ui) = weak_ui.upgrade() else { return };
+            let current = ui.state.borrow().snapshot().signature;
+            let enabled = gtk::CheckButton::with_label("Add signature to new replies and forwards");
+            enabled.set_active(current.enabled);
+            let value = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .height_request(120)
+                .build();
+            value
+                .buffer()
+                .set_text(&crate::composer::html_to_plain(&current.html));
+            value.update_property(&[gtk::accessible::Property::Label("Signature text")]);
+            let fields = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .build();
+            fields.append(&enabled);
+            fields.append(
+                &gtk::ScrolledWindow::builder()
+                    .child(&value)
+                    .min_content_height(120)
+                    .build(),
+            );
+            let dialog = adw::AlertDialog::builder()
+                .heading("Account signature")
+                .body("Stored privately on this device and added to new drafts.")
+                .extra_child(&fields)
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("save", "Save");
+            dialog.set_default_response(Some("save"));
+            let weak = ui.downgrade();
+            dialog.choose(
+                Some(&ui.composer_window),
+                None::<&gtk::gio::Cancellable>,
+                move |response| {
+                    if response == "save"
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.dispatch(Action::UpdateSignature {
+                            html: crate::composer::plain_to_html(&value.buffer().text(
+                                &value.buffer().start_iter(),
+                                &value.buffer().end_iter(),
+                                false,
+                            )),
+                            enabled: enabled.is_active(),
+                        });
+                    }
+                },
+            );
+        }
+    });
+    ui.composer_attach.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            let Some(ui) = weak_ui.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder().title("Attach files").build();
+            let weak = ui.downgrade();
+            dialog.open_multiple(
+                Some(&ui.composer_window),
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    let Ok(files) = result else { return };
+                    let Some(ui) = weak.upgrade() else { return };
+                    for index in 0..files.n_items() {
+                        let Some(file) = files.item(index).and_downcast::<gtk::gio::File>() else {
+                            continue;
+                        };
+                        let Some(path) = file.path() else { continue };
+                        let display_name = path
+                            .file_name()
+                            .map(|v| v.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "attachment".into());
+                        let media_type = media_type_for_path(&path).to_owned();
+                        ui.dispatch(Action::StageAttachment {
+                            source: path,
+                            display_name,
+                            media_type,
+                        });
+                    }
+                },
+            );
+        }
+    });
+    ui.composer_inline.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            let Some(ui) = weak_ui.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder()
+                .title("Insert inline image")
+                .build();
+            let weak = ui.downgrade();
+            dialog.open(
+                Some(&ui.composer_window),
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else { return };
+                    let Some(path) = file.path() else { return };
+                    let Some(ui) = weak.upgrade() else { return };
+                    let display_name = path
+                        .file_name()
+                        .map(|v| v.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "image".into());
+                    let media_type = media_type_for_path(&path).to_owned();
+                    if !media_type.starts_with("image/") {
+                        ui.toast("Choose a PNG, JPEG, GIF, or WebP image");
+                        return;
+                    }
+                    ui.dispatch(Action::StageInlineImage {
+                        source: path,
+                        display_name,
+                        media_type,
+                    });
+                },
+            );
+        }
+    });
+    let file_drop = gtk::DropTarget::new(gtk::gio::File::static_type(), gtk::gdk::DragAction::COPY);
+    file_drop.connect_drop({
+        let weak_ui = ui.downgrade();
+        move |_, value, _, _| {
+            let Ok(file) = value.get::<gtk::gio::File>() else {
+                return false;
+            };
+            let Some(path) = file.path() else {
+                return false;
+            };
+            let Some(ui) = weak_ui.upgrade() else {
+                return false;
+            };
+            let display_name = path
+                .file_name()
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".into());
+            let media_type = media_type_for_path(&path).to_owned();
+            ui.dispatch(Action::StageAttachment {
+                source: path,
+                display_name,
+                media_type,
+            });
+            true
+        }
+    });
+    ui.composer_editor.view.add_controller(file_drop);
+    ui.composer_editor
+        .manager
+        .connect_script_message_received(Some("changed"), {
+            let weak_ui = ui.downgrade();
+            move |_, value| {
+                let Some(ui) = weak_ui.upgrade() else { return };
+                let raw = value.to_str();
+                if raw.len() > crate::composer::MAX_HTML_BYTES.saturating_mul(4) {
+                    ui.toast("Message body is too large");
+                    return;
+                }
+                if let Ok((html, text)) = serde_json::from_str::<(String, String)>(&raw) {
+                    if html.len() > crate::composer::MAX_HTML_BYTES
+                        || text.len() > crate::composer::MAX_HTML_BYTES
+                    {
+                        ui.toast("Message body is too large");
+                        return;
+                    }
+                    ui.dispatch(Action::UpdateHtml { html, text });
+                }
+            }
+        });
     ui.composer_refresh.connect_clicked({
         let weak_ui = ui.downgrade();
         move |_| {
@@ -276,8 +666,7 @@ pub(super) fn connect_signals(ui: &Ui) {
             ) {
                 gtk::glib::Propagation::Proceed
             } else {
-                ui.composer_window.present();
-                ui.request_close_composer();
+                ui.save_composer_then_close_app();
                 gtk::glib::Propagation::Stop
             }
         }
@@ -319,6 +708,24 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         }
     });
+}
+
+fn media_type_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("html" | "htm") => "text/html",
+        _ => "application/octet-stream",
+    }
 }
 
 fn build_folder_pane(
