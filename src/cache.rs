@@ -24,6 +24,7 @@ const MAX_CACHE_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAILBOX_VERSION: u8 = 3;
 const BODY_VERSION: u8 = 5;
 const MANIFEST_VERSION: u8 = 3;
+const ACCOUNT_CLEANUP_VERSION: u8 = 1;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize, Serialize)]
@@ -78,6 +79,21 @@ struct ManifestEntry {
 struct BodyManifest {
     version: u8,
     entries: Vec<ManifestEntry>,
+}
+
+#[derive(Serialize)]
+struct PendingAccountCleanup<'a> {
+    version: u8,
+    previous_account_email: &'a str,
+    next_account_email: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountCleanupStage {
+    MailboxIndexes,
+    BodyCaches,
+    AttachmentCache,
+    Marker,
 }
 
 pub fn is_valid_limit(limit: usize) -> bool {
@@ -476,6 +492,9 @@ fn load_latest_from(
     limit: usize,
 ) -> io::Result<Option<(AccountIdentity, MailboxSnapshot)>> {
     validate_limit(limit)?;
+    if account_cleanup_pending(cache)? {
+        return Ok(None);
+    }
     let stored = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
@@ -514,6 +533,9 @@ fn load_folder_from(
 ) -> io::Result<Option<MailboxSnapshot>> {
     validate_limit(limit)?;
     validate_account_email(account_email)?;
+    if account_cleanup_pending(cache)? {
+        return Ok(None);
+    }
     let mut stored = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
         Ok(Some(value)) if valid_stored_mailbox(&value) => value,
         Ok(_) => return Ok(None),
@@ -560,6 +582,7 @@ fn replace_folder_and_save_at(
     if account.email.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty account"));
     }
+    resume_pending_account_cleanup_at(cache)?;
     let previous = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
         Ok(Some(value)) if valid_stored_mailbox(&value) => Some(value),
         Ok(_) => None,
@@ -569,6 +592,10 @@ fn replace_folder_and_save_at(
     let account_changed = previous
         .as_ref()
         .is_some_and(|value| !value.account_email.eq_ignore_ascii_case(&account.email));
+    let previous_account = previous
+        .as_ref()
+        .filter(|_| account_changed)
+        .map(|stored| stored.account_email.clone());
     sort_summaries(&mut fresh.messages);
     fresh
         .messages
@@ -620,12 +647,8 @@ fn replace_folder_and_save_at(
             "invalid folder cache snapshot",
         ));
     }
-    // Remove the previous account's identifying index before touching reusable data. A crash can
-    // lose cache data, but can never leave the previous account renderable after a switch.
-    if account_changed {
-        remove_file_if_exists(&mailbox_path(cache))?;
-        remove_dir_if_exists(&bodies_path(cache))?;
-        remove_dir_if_exists(&attachments_path(cache))?;
+    if let Some(previous_account) = previous_account {
+        begin_account_cleanup_at(cache, &previous_account, &account.email)?;
     }
     write_private_json(&mailbox_path(cache), &stored)?;
     // Older locator-derived summaries and bodies cannot be safely promoted to
@@ -639,23 +662,78 @@ fn replace_folder_and_save_at(
 
 fn prepare_verified_account_at(cache: &Path, account_email: &str) -> io::Result<()> {
     validate_account_email(account_email)?;
+    resume_pending_account_cleanup_at(cache)?;
     let previous = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
         Ok(Some(value)) if valid_stored_mailbox(&value) => Some(value),
         Ok(_) => None,
         Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
         Err(error) => return Err(error),
     };
-    if previous
+    if let Some(previous) = previous
         .as_ref()
-        .is_some_and(|stored| !stored.account_email.eq_ignore_ascii_case(account_email))
+        .filter(|stored| !stored.account_email.eq_ignore_ascii_case(account_email))
     {
-        // Delete the identifying index first. Cleanup can be retried safely,
-        // while the previous account can no longer be rendered after this point.
-        remove_file_if_exists(&mailbox_path(cache))?;
-        remove_dir_if_exists(&bodies_path(cache))?;
-        remove_dir_if_exists(&attachments_path(cache))?;
+        begin_account_cleanup_at(cache, &previous.account_email, account_email)?;
     }
     Ok(())
+}
+
+fn begin_account_cleanup_at(
+    cache: &Path,
+    previous_account_email: &str,
+    next_account_email: &str,
+) -> io::Result<()> {
+    write_private_json(
+        &account_cleanup_marker_path(cache),
+        &PendingAccountCleanup {
+            version: ACCOUNT_CLEANUP_VERSION,
+            previous_account_email,
+            next_account_email,
+        },
+    )?;
+    sync_mail_cache_dir(cache)?;
+    resume_pending_account_cleanup_at(cache)
+}
+
+fn resume_pending_account_cleanup_at(cache: &Path) -> io::Result<()> {
+    resume_pending_account_cleanup_with(cache, |_| Ok(()))
+}
+
+fn resume_pending_account_cleanup_with(
+    cache: &Path,
+    mut before_stage: impl FnMut(AccountCleanupStage) -> io::Result<()>,
+) -> io::Result<()> {
+    let marker = account_cleanup_marker_path(cache);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+
+    // The durable marker is deliberately independent of the mailbox index. Every stage is
+    // idempotent, and the marker is removed only after all account-bound artifacts are gone.
+    before_stage(AccountCleanupStage::MailboxIndexes)?;
+    for path in [
+        mailbox_path(cache),
+        v2_mailbox_path(cache),
+        legacy_mailbox_path(cache),
+    ] {
+        remove_file_if_exists(&path)?;
+    }
+    sync_mail_cache_dir(cache)?;
+
+    before_stage(AccountCleanupStage::BodyCaches)?;
+    remove_dir_if_exists(&bodies_path(cache))?;
+    remove_dir_if_exists(&legacy_bodies_path(cache))?;
+    sync_mail_cache_dir(cache)?;
+
+    before_stage(AccountCleanupStage::AttachmentCache)?;
+    remove_dir_if_exists(&attachments_path(cache))?;
+    sync_mail_cache_dir(cache)?;
+
+    before_stage(AccountCleanupStage::Marker)?;
+    remove_file_if_exists(&marker)?;
+    sync_mail_cache_dir(cache)
 }
 
 fn load_body_at(
@@ -665,6 +743,9 @@ fn load_body_at(
     accessed_at: u64,
 ) -> io::Result<Option<MessageBody>> {
     validate_account_email(account_email)?;
+    if account_cleanup_pending(cache)? {
+        return Ok(None);
+    }
     let expected_name = body_file_name(id)?;
     let mut manifest = read_manifest(cache)?;
     reconcile_manifest_entries(cache, &mut manifest, account_email, None)?;
@@ -775,7 +856,11 @@ fn clear_all_mail_at(cache: &Path) -> io::Result<()> {
     if let Err(error) = remove_dir_if_exists(&attachments_path(cache)) {
         first_error.get_or_insert(error);
     }
-    first_error.map_or(Ok(()), Err)
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    remove_file_if_exists(&account_cleanup_marker_path(cache))?;
+    sync_mail_cache_dir(cache)
 }
 
 fn usage_at(cache: &Path) -> io::Result<CacheUsage> {
@@ -1046,6 +1131,18 @@ fn attachments_path(cache: &Path) -> PathBuf {
     cache.join("whitford/attachments-v1")
 }
 
+fn account_cleanup_marker_path(cache: &Path) -> PathBuf {
+    cache.join("whitford/account-cleanup-v1.json")
+}
+
+fn account_cleanup_pending(cache: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(account_cleanup_marker_path(cache)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn manifest_path(cache: &Path) -> PathBuf {
     bodies_path(cache).join("manifest.json")
 }
@@ -1092,6 +1189,14 @@ fn ensure_private_dir(path: &Path) -> io::Result<()> {
 fn ensure_bodies_dir(cache: &Path) -> io::Result<()> {
     ensure_private_dir(&cache.join("whitford"))?;
     ensure_private_dir(&bodies_path(cache))
+}
+
+fn sync_mail_cache_dir(cache: &Path) -> io::Result<()> {
+    match fs::File::open(cache.join("whitford")) {
+        Ok(directory) => directory.sync_all(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -1604,6 +1709,111 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_account_cleanup_retries_after_the_mailbox_index_is_gone() {
+        let root = TestRoot::new();
+        replace_and_save_at(&root.0, &account(), snapshot(&[1]), 50).unwrap();
+        save_body_at(
+            &root.0,
+            EMAIL,
+            &MessageId::gmail(1),
+            &body("account a private"),
+            1,
+            u64::MAX,
+        )
+        .unwrap();
+        ensure_private_dir(&attachments_path(&root.0)).unwrap();
+        fs::write(attachments_path(&root.0).join("old-account"), b"private").unwrap();
+        write_private_json(
+            &legacy_mailbox_path(&root.0),
+            &serde_json::json!({"old": true}),
+        )
+        .unwrap();
+        write_private_json(
+            &account_cleanup_marker_path(&root.0),
+            &PendingAccountCleanup {
+                version: ACCOUNT_CLEANUP_VERSION,
+                previous_account_email: EMAIL,
+                next_account_email: "other@example.com",
+            },
+        )
+        .unwrap();
+
+        // A crash immediately after the durable marker is published must not expose the old
+        // mailbox while the next startup is preparing to resume cleanup.
+        assert!(load_latest_from(&root.0, 50).unwrap().is_none());
+        assert!(
+            load_body_at(&root.0, EMAIL, &MessageId::gmail(1), 2)
+                .unwrap()
+                .is_none()
+        );
+
+        let error = resume_pending_account_cleanup_with(&root.0, |stage| {
+            if stage == AccountCleanupStage::BodyCaches {
+                Err(io::Error::other("simulated process interruption"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "simulated process interruption");
+        assert!(!mailbox_path(&root.0).exists());
+        assert!(!legacy_mailbox_path(&root.0).exists());
+        assert!(bodies_path(&root.0).exists());
+        assert!(attachments_path(&root.0).exists());
+        assert!(account_cleanup_marker_path(&root.0).exists());
+
+        prepare_verified_account_at(&root.0, "other@example.com").unwrap();
+        assert!(!mailbox_path(&root.0).exists());
+        assert!(!bodies_path(&root.0).exists());
+        assert!(!legacy_bodies_path(&root.0).exists());
+        assert!(!attachments_path(&root.0).exists());
+        assert!(!account_cleanup_marker_path(&root.0).exists());
+    }
+
+    #[test]
+    fn new_account_save_finishes_a_crashed_cleanup_before_publishing() {
+        let root = TestRoot::new();
+        replace_and_save_at(&root.0, &account(), snapshot(&[1]), 50).unwrap();
+        ensure_private_dir(&attachments_path(&root.0)).unwrap();
+        let old_attachment = attachments_path(&root.0).join("old-account");
+        fs::write(&old_attachment, b"private").unwrap();
+        write_private_json(
+            &account_cleanup_marker_path(&root.0),
+            &PendingAccountCleanup {
+                version: ACCOUNT_CLEANUP_VERSION,
+                previous_account_email: EMAIL,
+                next_account_email: "other@example.com",
+            },
+        )
+        .unwrap();
+
+        let error = resume_pending_account_cleanup_with(&root.0, |stage| {
+            if stage == AccountCleanupStage::Marker {
+                Err(io::Error::other("simulated crash before commit"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "simulated crash before commit");
+        assert!(account_cleanup_marker_path(&root.0).exists());
+        assert!(!old_attachment.exists());
+
+        let other = AccountIdentity {
+            provider: MailProvider::Gmail,
+            email: "other@example.com".into(),
+        };
+        replace_and_save_at(&root.0, &other, snapshot(&[1]), 50).unwrap();
+
+        assert!(!account_cleanup_marker_path(&root.0).exists());
+        assert!(!attachments_path(&root.0).exists());
+        let stored = read_json::<StoredMailbox>(&mailbox_path(&root.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.account_email, other.email);
+    }
+
+    #[test]
     fn account_tag_rejects_colliding_body_after_interrupted_account_switch() {
         let root = TestRoot::new();
         let id = MessageId::gmail(1);
@@ -1709,12 +1919,25 @@ mod tests {
             u64::MAX,
         )
         .unwrap();
+        ensure_private_dir(&attachments_path(&root.0)).unwrap();
+        fs::write(attachments_path(&root.0).join("old"), b"old").unwrap();
+        write_private_json(
+            &account_cleanup_marker_path(&root.0),
+            &PendingAccountCleanup {
+                version: ACCOUNT_CLEANUP_VERSION,
+                previous_account_email: EMAIL,
+                next_account_email: "other@example.com",
+            },
+        )
+        .unwrap();
         clear_all_mail_at(&root.0).unwrap();
         assert!(!legacy_mailbox_path(&root.0).exists());
         assert!(!v2_mailbox_path(&root.0).exists());
         assert!(!mailbox_path(&root.0).exists());
         assert!(!bodies_path(&root.0).exists());
         assert!(!legacy_bodies_path(&root.0).exists());
+        assert!(!attachments_path(&root.0).exists());
+        assert!(!account_cleanup_marker_path(&root.0).exists());
     }
 
     #[test]
