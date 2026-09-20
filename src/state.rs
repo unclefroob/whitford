@@ -9,8 +9,8 @@ use crate::{
     worker::{
         AttachmentDestination, AttachmentFailure, AttachmentJobId, BodyFailure, BodyRequestId,
         CacheOperationId, DraftOperationId, FailureKind, FolderRequestId, MutationRequestId,
-        OperationId, SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand,
-        WorkerEvent, WorkerPhase,
+        OperationId, SearchRequestId, SendFailure, SendRequestId, ServiceFailure, SyncKind,
+        WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
 use std::{
@@ -33,6 +33,9 @@ pub struct AppState {
     active_folder_request: Option<FolderRequestId>,
     folder_loading: bool,
     search_query: String,
+    next_search_request: u64,
+    search_generation: u64,
+    server_search: ServerSearchState,
     message_filter: MessageFilter,
     recovery: Option<RecoveryAction>,
     cache_limit: usize,
@@ -173,6 +176,36 @@ pub enum ViewStatus {
     NoSearchResults,
     Error,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ServerSearchState {
+    Idle,
+    Loading {
+        request_id: SearchRequestId,
+        generation: u64,
+        query: String,
+    },
+    Loaded {
+        messages: Vec<MessageSummary>,
+        truncated: bool,
+        skipped_count: usize,
+    },
+    Failed {
+        query: String,
+        failure: BodyFailure,
+    },
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ServerSearchView {
+    #[default]
+    Idle,
+    Loading,
+    Results {
+        count: usize,
+        truncated: bool,
+        skipped_count: usize,
+    },
+    Failed(BodyFailure),
+}
 #[derive(Debug)]
 pub enum Action {
     Startup,
@@ -186,6 +219,9 @@ pub enum Action {
     SelectFolder(FolderId),
     SelectMessage(MessageId),
     SetSearch(String),
+    SubmitServerSearch,
+    CancelServerSearch,
+    RetryServerSearch,
     SetFilter(MessageFilter),
     ToggleRead,
     ToggleStar,
@@ -269,6 +305,7 @@ pub struct ViewSnapshot {
     pub selected_message: Option<MessageSummary>,
     pub selected_folder_id: FolderId,
     pub search_query: String,
+    pub server_search: ServerSearchView,
     pub message_filter: MessageFilter,
     pub status: ViewStatus,
     pub folder_counts: Vec<(FolderId, usize)>,
@@ -372,6 +409,9 @@ impl AppState {
             active_folder_request: None,
             folder_loading: false,
             search_query: String::new(),
+            next_search_request: 1,
+            search_generation: 1,
+            server_search: ServerSearchState::Idle,
             message_filter: MessageFilter::All,
             recovery: None,
             cache_limit: cache::load_limit(),
@@ -479,6 +519,7 @@ impl AppState {
             Action::WorkerUnavailable => {
                 self.active_operation = None;
                 self.recovery = None;
+                let _ = self.invalidate_server_search();
                 self.pending_mutations.clear();
                 self.attachment_jobs.clear();
                 if let ReaderState::Loading { id, .. } = &self.reader {
@@ -527,11 +568,21 @@ impl AppState {
             Action::SelectFolder(id) => self.load_folder(id),
             Action::SelectMessage(id) => self.select_message(id),
             Action::SetSearch(query) => {
-                self.search_query = query.trim().to_owned();
+                if self.search_query == query {
+                    return Update::default();
+                }
+                let effects = self.invalidate_server_search();
+                self.search_query = query;
                 self.normalize();
                 self.bump_list();
-                Update::default()
+                Update {
+                    effects,
+                    ..Default::default()
+                }
             }
+            Action::SubmitServerSearch => self.submit_server_search(),
+            Action::CancelServerSearch => self.cancel_server_search(),
+            Action::RetryServerSearch => self.retry_server_search(),
             Action::SetFilter(filter) => {
                 self.message_filter = filter;
                 self.normalize();
@@ -620,6 +671,7 @@ impl AppState {
                 ..Default::default()
             };
         };
+        let mut effects = self.invalidate_server_search();
         self.session = SessionState::Syncing {
             kind,
             phase: if kind == SyncKind::Restore {
@@ -634,8 +686,9 @@ impl AppState {
             SyncKind::Connect => WorkerCommand::Connect { id },
             SyncKind::Refresh => WorkerCommand::Refresh { id },
         };
+        effects.push(Effect::SendWorker(command));
         Update {
-            effects: vec![Effect::SendWorker(command)],
+            effects,
             ..Default::default()
         }
     }
@@ -662,6 +715,7 @@ impl AppState {
         let Some(id) = self.allocate() else {
             return Update::default();
         };
+        let mut effects = self.invalidate_server_search();
         self.cache_generation = self.cache_generation.wrapping_add(1);
         self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
         self.active_folder_request = None;
@@ -679,13 +733,14 @@ impl AppState {
         self.bump_reader();
         self.session = SessionState::Disconnecting;
         self.recovery = Some(RecoveryAction::Disconnect);
+        effects.push(Effect::SendWorker(WorkerCommand::Disconnect {
+            id,
+            generation: self.cache_generation,
+            draft_generation: self.draft_generation,
+            account_email,
+        }));
         Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::Disconnect {
-                id,
-                generation: self.cache_generation,
-                draft_generation: self.draft_generation,
-                account_email,
-            })],
+            effects,
             ..Default::default()
         }
     }
@@ -756,6 +811,19 @@ impl AppState {
                 }
                 Update::default()
             }
+            WorkerEvent::SearchLoaded {
+                request_id,
+                generation,
+                messages,
+                truncated,
+                skipped_count,
+            } => self.search_loaded(request_id, generation, messages, truncated, skipped_count),
+            WorkerEvent::SearchFailed {
+                request_id,
+                generation,
+                failure,
+            } => self.search_failed(request_id, generation, failure),
+            WorkerEvent::SearchCancelled { .. } => Update::default(),
             WorkerEvent::FolderCacheLoaded {
                 request_id,
                 generation,
@@ -1190,6 +1258,9 @@ impl AppState {
             | WorkerEvent::FolderCacheLoaded { .. }
             | WorkerEvent::FolderLoaded { .. }
             | WorkerEvent::FolderFailed { .. }
+            | WorkerEvent::SearchLoaded { .. }
+            | WorkerEvent::SearchFailed { .. }
+            | WorkerEvent::SearchCancelled { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
@@ -1238,6 +1309,8 @@ impl AppState {
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
                     self.pending_mutations.clear();
+                    self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                    self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
@@ -1271,6 +1344,8 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                    self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
@@ -1314,6 +1389,8 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                    self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
@@ -1343,6 +1420,8 @@ impl AppState {
             }
             WorkerEvent::Disconnected { .. } => {
                 self.pending_mutations.clear();
+                self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                self.server_search = ServerSearchState::Idle;
                 self.attachment_jobs.clear();
                 self.account = None;
                 self.selected_folder_id = FolderId::Inbox;
@@ -1412,6 +1491,9 @@ impl AppState {
             | WorkerEvent::FolderCacheLoaded { .. }
             | WorkerEvent::FolderLoaded { .. }
             | WorkerEvent::FolderFailed { .. }
+            | WorkerEvent::SearchLoaded { .. }
+            | WorkerEvent::SearchFailed { .. }
+            | WorkerEvent::SearchCancelled { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
@@ -1485,6 +1567,7 @@ impl AppState {
         ViewSnapshot {
             can_mutate: matches!(self.session, SessionState::Ready)
                 && self.selected_folder_id == FolderId::Inbox
+                && !matches!(self.server_search, ServerSearchState::Loaded { .. })
                 && self.selected_message().is_some(),
             label_options: self
                 .mailbox
@@ -1538,6 +1621,21 @@ impl AppState {
             selected_message: self.selected_message().cloned(),
             selected_folder_id: self.selected_folder_id.clone(),
             search_query: self.search_query.clone(),
+            server_search: match &self.server_search {
+                ServerSearchState::Idle => ServerSearchView::Idle,
+                ServerSearchState::Loading { .. } => ServerSearchView::Loading,
+                ServerSearchState::Loaded {
+                    messages,
+                    truncated,
+                    skipped_count,
+                    ..
+                } => ServerSearchView::Results {
+                    count: messages.len(),
+                    truncated: *truncated,
+                    skipped_count: *skipped_count,
+                },
+                ServerSearchState::Failed { failure, .. } => ServerSearchView::Failed(*failure),
+            },
             message_filter: self.message_filter,
             status,
             folder_counts: vec![(
@@ -1604,6 +1702,11 @@ impl AppState {
     }
     pub fn selected_message(&self) -> Option<&MessageSummary> {
         let id = self.selected_message_id.as_ref()?;
+        if let ServerSearchState::Loaded { messages, .. } = &self.server_search
+            && let Some(message) = messages.iter().find(|message| &message.id == id)
+        {
+            return Some(message);
+        }
         self.mailbox
             .as_ref()?
             .messages
@@ -1622,6 +1725,12 @@ impl AppState {
             .map_or(0, |m| m.messages.iter().filter(|m| m.unread).count())
     }
     fn visible_messages(&self) -> Vec<&MessageSummary> {
+        if let ServerSearchState::Loaded { messages, .. } = &self.server_search {
+            return messages
+                .iter()
+                .filter(|message| self.matches_filter(message))
+                .collect();
+        }
         let query = self.search_query.to_lowercase();
         self.mailbox
             .as_ref()
@@ -1633,30 +1742,189 @@ impl AppState {
                         (query.is_empty()
                             || m.sender.to_lowercase().contains(&query)
                             || m.subject.to_lowercase().contains(&query))
-                            && match self.message_filter {
-                                MessageFilter::All => true,
-                                MessageFilter::Unread => m.unread,
-                                MessageFilter::Attachments => m.attachment_state.has_attachments(),
-                            }
+                            && self.matches_filter(m)
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
     fn has_visible_messages(&self) -> bool {
+        if let ServerSearchState::Loaded { messages, .. } = &self.server_search {
+            return messages.iter().any(|message| self.matches_filter(message));
+        }
         let query = self.search_query.to_lowercase();
         self.mailbox.as_ref().is_some_and(|mailbox| {
             mailbox.messages.iter().any(|message| {
                 (query.is_empty()
                     || message.sender.to_lowercase().contains(&query)
                     || message.subject.to_lowercase().contains(&query))
-                    && match self.message_filter {
-                        MessageFilter::All => true,
-                        MessageFilter::Unread => message.unread,
-                        MessageFilter::Attachments => message.attachment_state.has_attachments(),
-                    }
+                    && self.matches_filter(message)
             })
         })
+    }
+    fn matches_filter(&self, message: &MessageSummary) -> bool {
+        match self.message_filter {
+            MessageFilter::All => true,
+            MessageFilter::Unread => message.unread,
+            MessageFilter::Attachments => message.attachment_state.has_attachments(),
+        }
+    }
+    fn invalidate_server_search(&mut self) -> Vec<Effect> {
+        let (active, clears_ephemeral_selection) = match self.server_search {
+            ServerSearchState::Loading { request_id, .. } => (Some(request_id), false),
+            ServerSearchState::Idle => return Vec::new(),
+            ServerSearchState::Loaded { .. } => (None, true),
+            ServerSearchState::Failed { .. } => (None, false),
+        };
+        self.search_generation = self.search_generation.wrapping_add(1).max(1);
+        self.server_search = ServerSearchState::Idle;
+        if clears_ephemeral_selection {
+            self.selected_message_id = None;
+            self.reader = ReaderState::Closed;
+            self.bump_reader();
+        }
+        active
+            .map(|request_id| {
+                Effect::SendWorker(WorkerCommand::CancelSearch {
+                    request_id,
+                    generation: self.search_generation,
+                })
+            })
+            .into_iter()
+            .collect()
+    }
+    fn submit_server_search(&mut self) -> Update {
+        let Some(query) =
+            crate::gmail::validate_search_query(&self.search_query).map(str::to_owned)
+        else {
+            return Update {
+                feedback: Some("Enter a Gmail search up to 2 KiB"),
+                ..Default::default()
+            };
+        };
+        if !matches!(self.session, SessionState::Ready) {
+            return Update {
+                feedback: Some("Connect Gmail before searching all mail"),
+                ..Default::default()
+            };
+        }
+        let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
+            return Update::default();
+        };
+        let Some(folder) = self
+            .mailbox
+            .as_ref()
+            .and_then(|mailbox| mailbox.folder_catalog.find(&FolderId::AllMail))
+            .cloned()
+        else {
+            return Update {
+                feedback: Some("Gmail All Mail is unavailable for this account"),
+                ..Default::default()
+            };
+        };
+        let mut effects = self.invalidate_server_search();
+        self.search_generation = self.search_generation.wrapping_add(1).max(1);
+        let request_id = SearchRequestId(self.next_search_request);
+        self.next_search_request = self.next_search_request.wrapping_add(1).max(1);
+        self.server_search = ServerSearchState::Loading {
+            request_id,
+            generation: self.search_generation,
+            query: query.clone(),
+        };
+        self.bump_list();
+        effects.push(Effect::SendWorker(WorkerCommand::SearchGmail {
+            request_id,
+            generation: self.search_generation,
+            account_email,
+            folder,
+            query,
+        }));
+        Update {
+            effects,
+            ..Default::default()
+        }
+    }
+    fn cancel_server_search(&mut self) -> Update {
+        if !matches!(self.server_search, ServerSearchState::Loading { .. }) {
+            return Update::default();
+        }
+        let effects = self.invalidate_server_search();
+        self.normalize();
+        self.bump_list();
+        Update {
+            feedback: Some("Gmail search cancelled"),
+            effects,
+        }
+    }
+    fn retry_server_search(&mut self) -> Update {
+        let ServerSearchState::Failed { query, .. } = &self.server_search else {
+            return Update::default();
+        };
+        self.search_query = query.clone();
+        self.submit_server_search()
+    }
+    fn search_loaded(
+        &mut self,
+        request_id: SearchRequestId,
+        generation: u64,
+        messages: Vec<MessageSummary>,
+        truncated: bool,
+        skipped_count: usize,
+    ) -> Update {
+        let ServerSearchState::Loading {
+            request_id: current,
+            generation: current_generation,
+            ..
+        } = &self.server_search
+        else {
+            return Update::default();
+        };
+        if *current != request_id || *current_generation != generation {
+            return Update::default();
+        }
+        self.server_search = ServerSearchState::Loaded {
+            messages,
+            truncated,
+            skipped_count,
+        };
+        self.selected_message_id = None;
+        self.reader = ReaderState::Closed;
+        self.normalize();
+        self.bump_reader();
+        self.bump_list();
+        Update::default()
+    }
+    fn search_failed(
+        &mut self,
+        request_id: SearchRequestId,
+        generation: u64,
+        failure: BodyFailure,
+    ) -> Update {
+        let ServerSearchState::Loading {
+            request_id: current,
+            generation: current_generation,
+            query,
+        } = &self.server_search
+        else {
+            return Update::default();
+        };
+        if *current != request_id || *current_generation != generation {
+            return Update::default();
+        }
+        let query = query.clone();
+        self.server_search = ServerSearchState::Failed { query, failure };
+        self.normalize();
+        Update {
+            feedback: Some(match failure {
+                BodyFailure::Offline => "Gmail search is offline",
+                BodyFailure::TimedOut => "Gmail search took too long",
+                BodyFailure::AuthorizationRequired => "Reconnect Gmail to search all mail",
+                BodyFailure::MailboxChanged | BodyFailure::Missing | BodyFailure::Protocol => {
+                    "Gmail search failed"
+                }
+            }),
+            ..Default::default()
+        }
     }
     fn load_folder(&mut self, id: FolderId) -> Update {
         let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
@@ -1678,6 +1946,7 @@ impl AppState {
                 ..Default::default()
             };
         };
+        let mut effects = self.invalidate_server_search();
         let switching = self.selected_folder_id != id;
         self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
         let request_id = FolderRequestId(self.next_folder_request);
@@ -1696,14 +1965,15 @@ impl AppState {
         }
         self.normalize();
         self.bump_list();
+        effects.push(Effect::SendWorker(WorkerCommand::FetchFolder {
+            request_id,
+            generation: self.folder_generation,
+            account_email,
+            folder,
+            catalog,
+        }));
         Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::FetchFolder {
-                request_id,
-                generation: self.folder_generation,
-                account_email,
-                folder,
-                catalog,
-            })],
+            effects,
             ..Default::default()
         }
     }

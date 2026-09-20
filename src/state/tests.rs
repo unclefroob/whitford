@@ -1837,3 +1837,164 @@ fn signature_is_sanitized_saved_and_only_applied_to_new_drafts() {
     assert!(!draft.compose.html.contains("script"));
     assert_eq!(snapshot.signature.html, "<b>Ryan</b>");
 }
+
+fn ready_for_search() -> AppState {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.mailbox.as_mut().unwrap().folder_catalog = browsing_catalog();
+    state
+}
+
+#[test]
+fn typing_filters_locally_without_starting_a_gmail_search() {
+    let mut state = ready_for_search();
+    let update = state.dispatch(Action::SetSearch("alice".into()));
+    assert!(update.effects.is_empty());
+    assert_eq!(state.snapshot().server_search, ServerSearchView::Idle);
+}
+
+#[test]
+fn submitted_search_uses_discovered_all_mail_and_results_stay_ephemeral() {
+    let mut state = ready_for_search();
+    let authoritative = state.mailbox.as_ref().unwrap().messages.clone();
+    state.dispatch(Action::SetSearch("from:alice has:attachment".into()));
+    let update = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = match &update.effects[0] {
+        Effect::SendWorker(WorkerCommand::SearchGmail {
+            request_id,
+            generation,
+            folder,
+            query,
+            ..
+        }) => {
+            assert_eq!(folder.id, FolderId::AllMail);
+            assert_eq!(folder.mailbox, "[Gmail]/All Mail");
+            assert_eq!(query, "from:alice has:attachment");
+            (*request_id, *generation)
+        }
+        effect => panic!("unexpected effect: {effect:?}"),
+    };
+    assert_eq!(state.snapshot().server_search, ServerSearchView::Loading);
+
+    let result = folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Search hit")
+        .messages
+        .remove(0);
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: vec![result.clone()],
+        truncated: true,
+        skipped_count: 2,
+    }));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.visible_messages, vec![result]);
+    assert_eq!(
+        snapshot.server_search,
+        ServerSearchView::Results {
+            count: 1,
+            truncated: true,
+            skipped_count: 2
+        }
+    );
+    assert_eq!(state.mailbox.as_ref().unwrap().messages, authoritative);
+}
+
+#[test]
+fn editing_search_cancels_loading_and_generation_gates_stale_results() {
+    let mut state = ready_for_search();
+    state.dispatch(Action::SetSearch("first".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    let edit = state.dispatch(Action::SetSearch("second".into()));
+    assert!(edit.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::CancelSearch { request_id: id, .. }) if *id == request_id
+    )));
+    assert_eq!(state.snapshot().server_search, ServerSearchView::Idle);
+
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Stale").messages,
+        truncated: false,
+        skipped_count: 0,
+    }));
+    assert_eq!(state.snapshot().server_search, ServerSearchView::Idle);
+}
+
+#[test]
+fn failed_search_can_retry_without_exposing_query_in_status() {
+    let mut state = ready_for_search();
+    state.dispatch(Action::SetSearch("secret project".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    state.dispatch(Action::Worker(WorkerEvent::SearchFailed {
+        request_id,
+        generation,
+        failure: BodyFailure::TimedOut,
+    }));
+    assert_eq!(
+        state.snapshot().server_search,
+        ServerSearchView::Failed(BodyFailure::TimedOut)
+    );
+    let retry = state.dispatch(Action::RetryServerSearch);
+    assert!(retry.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::SearchGmail { query, .. }) if query == "secret project"
+    )));
+}
+
+#[test]
+fn folder_navigation_invalidates_ephemeral_search_results() {
+    let mut state = ready_for_search();
+    state.dispatch(Action::SetSearch("in:anywhere".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Anywhere").messages,
+        truncated: false,
+        skipped_count: 0,
+    }));
+
+    let navigation = state.dispatch(Action::SelectFolder(FolderId::Sent));
+    assert_eq!(state.snapshot().server_search, ServerSearchView::Idle);
+    assert!(navigation.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::FetchFolder { folder, .. }) if folder.id == FolderId::Sent
+    )));
+}

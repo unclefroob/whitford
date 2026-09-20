@@ -690,6 +690,14 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         }
     });
+    ui.search.connect_activate({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::SubmitServerSearch);
+            }
+        }
+    });
     for (filter, button) in &ui.filter_buttons {
         let filter = *filter;
         let weak_ui = ui.downgrade();
@@ -939,7 +947,20 @@ fn build_message_page(
         .margin_top(8)
         .margin_bottom(8)
         .build();
-    search_box.append(search);
+    let search_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    search.set_hexpand(true);
+    search_row.append(search);
+    search_row.append(
+        &gtk::Button::builder()
+            .label("Search Gmail")
+            .action_name("win.search-gmail")
+            .tooltip_text("Search all Gmail mail (Enter)")
+            .build(),
+    );
+    search_box.append(&search_row);
     let filters = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(22)

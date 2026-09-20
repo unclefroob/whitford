@@ -12,8 +12,8 @@ use crate::{
     config,
     model::Attachment,
     state::{
-        Action, ComposerState, DraftCatalogState, MessageFilter, ReaderState, SessionState,
-        ViewSnapshot, ViewStatus,
+        Action, ComposerState, DraftCatalogState, MessageFilter, ReaderState, ServerSearchView,
+        SessionState, ViewSnapshot, ViewStatus,
     },
     worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
@@ -43,6 +43,23 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
     set_action_enabled(ui, "compose", snapshot.can_compose);
+    set_action_enabled(
+        ui,
+        "search-gmail",
+        matches!(snapshot.session, SessionState::Ready)
+            && crate::gmail::validate_search_query(&snapshot.search_query).is_some()
+            && !matches!(snapshot.server_search, ServerSearchView::Loading),
+    );
+    set_action_enabled(
+        ui,
+        "cancel-search",
+        matches!(snapshot.server_search, ServerSearchView::Loading),
+    );
+    set_action_enabled(
+        ui,
+        "retry-search",
+        matches!(snapshot.server_search, ServerSearchView::Failed(_)),
+    );
     for action in ["archive", "mark-read", "delete", "star", "toggle-label"] {
         set_action_enabled(ui, action, snapshot.can_mutate);
     }
@@ -889,6 +906,49 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
                 "Retry restoring local drafts and signature",
             )),
         ));
+    }
+    match snapshot.server_search {
+        ServerSearchView::Loading => banners.push((
+            "Searching Gmail".to_owned(),
+            "Searching All Mail. Your current local results remain available while Gmail responds."
+                .to_owned(),
+            Some(("Cancel", "win.cancel-search", "Cancel this Gmail search")),
+        )),
+        ServerSearchView::Results {
+            count,
+            truncated,
+            skipped_count,
+        } => {
+            let mut detail = format!(
+                "Showing {count} result{} from All Mail.",
+                if count == 1 { "" } else { "s" }
+            );
+            if truncated {
+                detail.push_str(" Results are capped at the newest 500 messages.");
+            }
+            if skipped_count > 0 {
+                detail.push_str(" Some malformed Gmail results were skipped.");
+            }
+            banners.push(("Gmail search results".to_owned(), detail, None));
+        }
+        ServerSearchView::Failed(failure) => banners.push((
+            "Gmail search failed".to_owned(),
+            match failure {
+                BodyFailure::Offline => {
+                    "Whitford could not reach Gmail. Local filtering still works."
+                }
+                BodyFailure::TimedOut => {
+                    "Gmail did not respond within 30 seconds. Local filtering still works."
+                }
+                BodyFailure::AuthorizationRequired => "Reconnect Gmail, then retry this search.",
+                BodyFailure::MailboxChanged | BodyFailure::Missing | BodyFailure::Protocol => {
+                    "Gmail could not complete this search. Local filtering still works."
+                }
+            }
+            .to_owned(),
+            Some(("Retry", "win.retry-search", "Retry this Gmail search")),
+        )),
+        ServerSearchView::Idle => {}
     }
     if let Some(detail) = partial_sync_detail(snapshot) {
         banners.push((

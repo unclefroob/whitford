@@ -54,6 +54,8 @@ pub struct MutationRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FolderRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SearchRequestId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AttachmentJobId(pub u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +222,17 @@ pub enum WorkerCommand {
         folder: FolderDescriptor,
         catalog: FolderCatalog,
     },
+    SearchGmail {
+        request_id: SearchRequestId,
+        generation: u64,
+        account_email: String,
+        folder: FolderDescriptor,
+        query: String,
+    },
+    CancelSearch {
+        request_id: SearchRequestId,
+        generation: u64,
+    },
     FetchBody {
         request_id: BodyRequestId,
         generation: u64,
@@ -329,6 +342,25 @@ impl fmt::Debug for WorkerCommand {
                 .field("request_id", request_id)
                 .field("generation", generation)
                 .field("folder_kind", &folder_debug_kind(&folder.id))
+                .finish(),
+            Self::SearchGmail {
+                request_id,
+                generation,
+                query,
+                ..
+            } => f
+                .debug_struct("SearchGmail")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("query_bytes", &query.len())
+                .finish(),
+            Self::CancelSearch {
+                request_id,
+                generation,
+            } => f
+                .debug_struct("CancelSearch")
+                .field("request_id", request_id)
+                .field("generation", generation)
                 .finish(),
             Self::FetchBody {
                 request_id,
@@ -473,6 +505,22 @@ pub enum WorkerEvent {
         generation: u64,
         folder_id: FolderId,
         failure: BodyFailure,
+    },
+    SearchLoaded {
+        request_id: SearchRequestId,
+        generation: u64,
+        messages: Vec<crate::model::MessageSummary>,
+        truncated: bool,
+        skipped_count: usize,
+    },
+    SearchFailed {
+        request_id: SearchRequestId,
+        generation: u64,
+        failure: BodyFailure,
+    },
+    SearchCancelled {
+        request_id: SearchRequestId,
+        generation: u64,
     },
     Disconnected {
         id: OperationId,
@@ -662,6 +710,38 @@ impl fmt::Debug for WorkerEvent {
                 .field("request_id", request_id)
                 .field("folder_kind", &folder_debug_kind(folder_id))
                 .field("failure", failure)
+                .finish(),
+            Self::SearchLoaded {
+                request_id,
+                generation,
+                messages,
+                truncated,
+                skipped_count,
+            } => f
+                .debug_struct("SearchLoaded")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("loaded", &messages.len())
+                .field("truncated", truncated)
+                .field("skipped_count", skipped_count)
+                .finish(),
+            Self::SearchFailed {
+                request_id,
+                generation,
+                failure,
+            } => f
+                .debug_struct("SearchFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("failure", failure)
+                .finish(),
+            Self::SearchCancelled {
+                request_id,
+                generation,
+            } => f
+                .debug_struct("SearchCancelled")
+                .field("request_id", request_id)
+                .field("generation", generation)
                 .finish(),
             Self::Disconnected { id } => f.debug_struct("Disconnected").field("id", id).finish(),
             Self::Cancelled { id } => f.debug_struct("Cancelled").field("id", id).finish(),
@@ -891,11 +971,13 @@ async fn controller(
     let metadata_lane = Arc::new(tokio::sync::Mutex::new(()));
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let folder_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let search_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let content_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTENT_JOBS));
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
     let mut folder_task: Option<JoinHandle<()>> = None;
+    let mut search_task: Option<(SearchRequestId, JoinHandle<()>)> = None;
     let mut attachment_tasks = HashMap::<AttachmentJobId, JoinHandle<()>>::new();
     let (draft_tx, draft_rx) = mpsc::unbounded_channel();
     let draft_events = events.clone();
@@ -955,6 +1037,10 @@ async fn controller(
                 let _ = task.await;
             }
             if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = search_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1075,6 +1161,55 @@ async fn controller(
                 folder_generation.clone(),
                 metadata_lane.clone(),
             )));
+            continue;
+        }
+        if let WorkerCommand::CancelSearch {
+            request_id,
+            generation,
+        } = &command
+        {
+            search_generation.store(*generation, Ordering::Release);
+            if let Some((active_id, task)) = search_task.take() {
+                if active_id == *request_id {
+                    task.abort();
+                    let _ = task.await;
+                } else {
+                    search_task = Some((active_id, task));
+                }
+            }
+            let _ = events.send(WorkerEvent::SearchCancelled {
+                request_id: *request_id,
+                generation: *generation,
+            });
+            continue;
+        }
+        if let WorkerCommand::SearchGmail {
+            request_id,
+            generation,
+            account_email,
+            folder,
+            query,
+        } = &command
+        {
+            search_generation.store(*generation, Ordering::Release);
+            if let Some((_, task)) = search_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let request_id = *request_id;
+            search_task = Some((
+                request_id,
+                tokio::spawn(search_gmail(
+                    request_id,
+                    *generation,
+                    account_email.clone(),
+                    folder.clone(),
+                    query.clone(),
+                    events.clone(),
+                    auth.clone(),
+                    search_generation.clone(),
+                )),
+            ));
             continue;
         }
         if matches!(&command, WorkerCommand::MutateMessage { .. }) {
@@ -1409,11 +1544,16 @@ async fn controller(
             cache_generation.store(*generation, Ordering::Release);
             send_generation.store(*generation, Ordering::Release);
             folder_generation.fetch_add(1, Ordering::AcqRel);
+            search_generation.fetch_add(1, Ordering::AcqRel);
             if let Some(task) = body_task.take() {
                 task.abort();
                 let _ = task.await;
             }
             if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = search_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1429,11 +1569,16 @@ async fn controller(
             cache_generation.fetch_add(1, Ordering::AcqRel);
             send_generation.fetch_add(1, Ordering::AcqRel);
             folder_generation.fetch_add(1, Ordering::AcqRel);
+            search_generation.fetch_add(1, Ordering::AcqRel);
             if let Some(task) = body_task.take() {
                 task.abort();
                 let _ = task.await;
             }
             if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = search_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1585,6 +1730,8 @@ async fn controller(
             WorkerCommand::Cancel { .. }
             | WorkerCommand::SetCacheLimit { .. }
             | WorkerCommand::FetchFolder { .. }
+            | WorkerCommand::SearchGmail { .. }
+            | WorkerCommand::CancelSearch { .. }
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::DownloadAttachment { .. }
             | WorkerCommand::CancelAttachment { .. }
@@ -1604,6 +1751,57 @@ async fn controller(
     }
     draft_task.abort();
     mutation_task.abort();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_gmail(
+    request_id: SearchRequestId,
+    generation: u64,
+    account_email: String,
+    folder: FolderDescriptor,
+    query: String,
+    events: mpsc::UnboundedSender<WorkerEvent>,
+    auth: Arc<Mutex<Option<RuntimeAuth>>>,
+    generation_gate: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let credentials = auth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|value| value.email.eq_ignore_ascii_case(&account_email))
+        .map(|value| Zeroizing::new(value.access_token.as_str().to_owned()));
+    let Some(access_token) = credentials else {
+        let _ = events.send(WorkerEvent::SearchFailed {
+            request_id,
+            generation,
+            failure: BodyFailure::AuthorizationRequired,
+        });
+        return;
+    };
+    let fetched =
+        gmail::search_all_mail(&account_email, access_token.as_str(), folder, &query).await;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    match fetched {
+        Ok(fetched) => {
+            let (messages, fallback_count) = message::map_summaries(fetched.records);
+            let _ = events.send(WorkerEvent::SearchLoaded {
+                request_id,
+                generation,
+                messages,
+                truncated: fetched.truncated,
+                skipped_count: fetched.skipped_count.saturating_add(fallback_count),
+            });
+        }
+        Err(error) => {
+            let _ = events.send(WorkerEvent::SearchFailed {
+                request_id,
+                generation,
+                failure: map_body_failure(error),
+            });
+        }
+    }
 }
 
 struct MutationIo {
@@ -2194,6 +2392,8 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::Cancel { id } => Some(*id),
         WorkerCommand::SetCacheLimit { .. }
         | WorkerCommand::FetchFolder { .. }
+        | WorkerCommand::SearchGmail { .. }
+        | WorkerCommand::CancelSearch { .. }
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::DownloadAttachment { .. }
         | WorkerCommand::CancelAttachment { .. }
@@ -3097,6 +3297,23 @@ mod tests {
         assert_eq!(command_id(&folder_command), None);
         assert!(!folder_debug.contains("folder-canary@example.com"));
         assert!(!folder_debug.contains("Secret label"));
+        let search_command = WorkerCommand::SearchGmail {
+            request_id: SearchRequestId(11),
+            generation: 4,
+            account_email: "search-canary@example.com".into(),
+            folder: FolderDescriptor {
+                id: FolderId::AllMail,
+                mailbox: "[Gmail]/All Mail".into(),
+                display_name: "All Mail".into(),
+                kind: crate::model::FolderKind::AllMail,
+            },
+            query: "from:top-secret@example.com".into(),
+        };
+        let search_debug = format!("{search_command:?}");
+        assert_eq!(command_id(&search_command), None);
+        assert!(search_debug.contains("query_bytes"));
+        assert!(!search_debug.contains("top-secret"));
+        assert!(!search_debug.contains("search-canary"));
         let attachment_command = WorkerCommand::DownloadAttachment {
             job_id: AttachmentJobId(2),
             generation: 1,

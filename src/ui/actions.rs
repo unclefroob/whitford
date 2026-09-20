@@ -34,6 +34,15 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "focus-search", |ui| {
         ui.search.grab_focus();
     });
+    add(ui, "search-gmail", |ui| {
+        ui.dispatch(Action::SubmitServerSearch)
+    });
+    add(ui, "cancel-search", |ui| {
+        ui.dispatch(Action::CancelServerSearch)
+    });
+    add(ui, "retry-search", |ui| {
+        ui.dispatch(Action::RetryServerSearch)
+    });
     add(ui, "folder-next", |ui| move_folder(ui, 1));
     add(ui, "folder-previous", |ui| move_folder(ui, -1));
     add(ui, "message-next", |ui| ui.dispatch(Action::SelectNext));

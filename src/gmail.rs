@@ -29,6 +29,9 @@ const MAX_ATTACHMENTS: usize = 20;
 pub const ATTACHMENT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ATTACHMENT_ENCODED_BYTES: u64 = 150 * 1024 * 1024;
+pub const MAX_SEARCH_QUERY_BYTES: usize = 2 * 1024;
+pub const MAX_SEARCH_RESULTS: usize = 500;
+pub const SEARCH_SUMMARY_BATCH: usize = 100;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MessageFlags {
@@ -74,6 +77,13 @@ pub struct InboxFetch {
     pub records: Vec<RawMessageSummary>,
     pub skipped_count: usize,
     pub folder_catalog: FolderCatalog,
+}
+
+#[derive(Debug)]
+pub struct SearchFetch {
+    pub records: Vec<RawMessageSummary>,
+    pub skipped_count: usize,
+    pub truncated: bool,
 }
 
 struct SummaryCandidate {
@@ -201,6 +211,33 @@ pub fn uid_sequence_set(uids: &[u32]) -> Option<String> {
             .collect::<Vec<_>>()
             .join(",")
     })
+}
+
+pub fn validate_search_query(query: &str) -> Option<&str> {
+    let query = query.trim();
+    (!query.is_empty()
+        && query.len() <= MAX_SEARCH_QUERY_BYTES
+        && !query.chars().any(char::is_control))
+    .then_some(query)
+}
+
+fn quote_search_query(query: &str) -> Option<String> {
+    validate_search_query(query)
+        .map(|query| format!("\"{}\"", query.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+pub fn newest_search_uids<I: IntoIterator<Item = u32>>(uids: I) -> (Vec<u32>, bool) {
+    let sorted = uids
+        .into_iter()
+        .filter(|uid| *uid != 0)
+        .collect::<BTreeSet<_>>();
+    let truncated = sorted.len() > MAX_SEARCH_RESULTS;
+    let skip = sorted.len().saturating_sub(MAX_SEARCH_RESULTS);
+    (sorted.into_iter().skip(skip).collect(), truncated)
+}
+
+pub fn search_uid_batches(uids: &[u32]) -> impl Iterator<Item = &[u32]> {
+    uids.chunks(SEARCH_SUMMARY_BATCH)
 }
 
 pub fn newest_sequence_set(message_count: u32, limit: usize) -> Option<String> {
@@ -608,6 +645,92 @@ pub async fn fetch_folder(
     )
     .await
     .map_err(|_| GmailError::TimedOut)?
+}
+
+pub async fn search_all_mail(
+    email: &str,
+    access_token: &str,
+    folder: FolderDescriptor,
+    query: &str,
+) -> Result<SearchFetch, GmailError> {
+    if folder.id != FolderId::AllMail
+        || !folder.is_valid()
+        || validate_search_query(query).is_none()
+    {
+        return Err(GmailError::Protocol);
+    }
+    timeout(
+        Duration::from_secs(30),
+        search_all_mail_inner(email, access_token, folder, query),
+    )
+    .await
+    .map_err(|_| GmailError::TimedOut)?
+}
+
+async fn search_all_mail_inner(
+    email: &str,
+    access_token: &str,
+    folder: FolderDescriptor,
+    query: &str,
+) -> Result<SearchFetch, GmailError> {
+    let mut session = authenticated_session(email, access_token).await?;
+    let mailbox = session
+        .examine(&folder.mailbox)
+        .await
+        .map_err(|_| GmailError::InboxUnavailable)?;
+    let uid_validity = mailbox.uid_validity.ok_or(GmailError::Protocol)?;
+    let quoted = quote_search_query(query).ok_or(GmailError::Protocol)?;
+    let found = session
+        .uid_search(format!("X-GM-RAW {quoted}"))
+        .await
+        .map_err(|_| GmailError::Protocol)?;
+    let (uids, truncated) = newest_search_uids(found);
+    let requested = uids.iter().copied().collect::<BTreeSet<_>>();
+    let mut candidates = Vec::with_capacity(uids.len());
+    for batch in search_uid_batches(&uids) {
+        let sequence = uid_sequence_set(batch).ok_or(GmailError::Protocol)?;
+        let fetches: Vec<_> = session
+            .uid_fetch(sequence, SUMMARY_FETCH_QUERY)
+            .await
+            .map_err(|_| GmailError::Protocol)?
+            .try_collect()
+            .await
+            .map_err(|_| GmailError::Protocol)?;
+        candidates.extend(fetches.into_iter().map(|fetch| {
+            SummaryCandidate {
+                uid: fetch.uid,
+                x_gm_msgid: fetch.gmail_msg_id().copied(),
+                flags: MessageFlags {
+                    seen: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                    flagged: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                },
+                internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
+                size: fetch.size,
+                header: fetch
+                    .header()
+                    .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
+                attachment_state: attachment_state(fetch.bodystructure()),
+                labels: user_labels(
+                    fetch
+                        .gmail_labels()
+                        .into_iter()
+                        .flatten()
+                        .map(|label| label.as_ref()),
+                ),
+            }
+        }));
+    }
+    let _ = session.logout().await;
+    let result = classify_summaries(folder, uid_validity, &requested, candidates);
+    Ok(SearchFetch {
+        records: result.records,
+        skipped_count: result.skipped_count,
+        truncated,
+    })
 }
 
 async fn fetch_folder_inner(
@@ -1460,6 +1583,34 @@ mod tests {
         assert_eq!(skipped, 2);
         assert_eq!(uid_sequence_set(&[8, 9]).as_deref(), Some("8,9"));
         assert_eq!(uid_sequence_set(&[0]), None);
+    }
+    #[test]
+    fn gmail_search_queries_are_bounded_and_safely_quoted() {
+        assert_eq!(validate_search_query("  from:alice  "), Some("from:alice"));
+        assert_eq!(
+            quote_search_query("from:\"Alice\" \\ team").as_deref(),
+            Some("\"from:\\\"Alice\\\" \\\\ team\"")
+        );
+        assert!(validate_search_query("").is_none());
+        assert!(validate_search_query("line\nbreak").is_none());
+        assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_BYTES)).is_some());
+        assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_BYTES + 1)).is_none());
+    }
+    #[test]
+    fn gmail_search_keeps_newest_five_hundred_in_bounded_batches() {
+        let (uids, truncated) = newest_search_uids((1..=620).chain([620, 0]));
+        assert!(truncated);
+        assert_eq!(uids.len(), MAX_SEARCH_RESULTS);
+        assert_eq!(uids.first(), Some(&121));
+        assert_eq!(uids.last(), Some(&620));
+        let batches = search_uid_batches(&uids)
+            .map(<[u32]>::len)
+            .collect::<Vec<_>>();
+        assert_eq!(batches, vec![100, 100, 100, 100, 100]);
+
+        let (short, truncated) = newest_search_uids([9, 4, 9, 0]);
+        assert_eq!(short, vec![4, 9]);
+        assert!(!truncated);
     }
     #[test]
     fn special_use_discovery_is_bounded_stable_and_skips_non_mail_views() {
