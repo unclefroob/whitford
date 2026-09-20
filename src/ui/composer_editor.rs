@@ -17,6 +17,7 @@ impl ComposerEditor {
             .network_session(&session)
             .user_content_manager(&manager)
             .build();
+        view.set_can_focus(true);
         view.set_vexpand(true);
         view.set_height_request(260);
         view.update_property(&[gtk::accessible::Property::Label("Message body")]);
@@ -43,10 +44,39 @@ impl ComposerEditor {
                 webkit6::PolicyDecisionType::NavigationAction
                     | webkit6::PolicyDecisionType::NewWindowAction
             ) {
+                let navigation = decision
+                    .clone()
+                    .downcast::<webkit6::NavigationPolicyDecision>()
+                    .ok()
+                    .and_then(|decision| decision.navigation_action());
+                let uri = navigation
+                    .as_ref()
+                    .and_then(|navigation| navigation.request())
+                    .and_then(|request| request.uri());
+                let user_gesture = navigation
+                    .as_ref()
+                    .is_some_and(|navigation| navigation.is_user_gesture());
+
+                // `load_html` uses an internal about:blank navigation. Blocking it
+                // prevents the contenteditable document from ever being created.
+                if uri.as_deref() == Some("about:blank") && !user_gesture {
+                    return false;
+                }
                 decision.ignore();
                 true
             } else {
                 false
+            }
+        });
+        view.connect_load_changed(|view, event| {
+            if event == webkit6::LoadEvent::Finished {
+                view.evaluate_javascript(
+                    "document.getElementById('editor')?.focus()",
+                    None,
+                    None,
+                    None::<&gtk::gio::Cancellable>,
+                    |_| {},
+                );
             }
         });
         Self { view, manager }
