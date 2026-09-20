@@ -13,8 +13,9 @@ use std::{
 use adw::prelude::*;
 
 use crate::{
+    model::MessageId,
     oauth::AuthorizationUrl,
-    state::{Action, AppState, Effect, MessageFilter},
+    state::{Action, AppState, ComposerState, Effect, MessageFilter},
     worker::{OperationId, WorkerCommand, WorkerEvent},
 };
 
@@ -35,6 +36,16 @@ pub struct Ui {
     pub(crate) sync_detail: gtk::Label,
     pub(crate) cache_limit: gtk::DropDown,
     pub(crate) cache_usage: gtk::Label,
+    pub(crate) composer_window: adw::Window,
+    pub(crate) composer_to: gtk::Label,
+    pub(crate) composer_subject: gtk::Label,
+    pub(crate) composer_body: gtk::TextView,
+    pub(crate) composer_send: gtk::Button,
+    pub(crate) composer_cancel: gtk::Button,
+    pub(crate) composer_refresh: gtk::Button,
+    pub(crate) composer_progress: gtk::Spinner,
+    pub(crate) composer_error: gtk::Label,
+    pub(crate) composer_message_id: Rc<RefCell<Option<MessageId>>>,
     pub(crate) last_list_revision: Rc<Cell<u64>>,
     pub(crate) last_reader_revision: Rc<Cell<u64>>,
     pub(crate) filter_buttons: Vec<(MessageFilter, gtk::Button)>,
@@ -59,6 +70,16 @@ pub(crate) struct WeakUi {
     sync_detail: gtk::glib::WeakRef<gtk::Label>,
     cache_limit: gtk::glib::WeakRef<gtk::DropDown>,
     cache_usage: gtk::glib::WeakRef<gtk::Label>,
+    composer_window: gtk::glib::WeakRef<adw::Window>,
+    composer_to: gtk::glib::WeakRef<gtk::Label>,
+    composer_subject: gtk::glib::WeakRef<gtk::Label>,
+    composer_body: gtk::glib::WeakRef<gtk::TextView>,
+    composer_send: gtk::glib::WeakRef<gtk::Button>,
+    composer_cancel: gtk::glib::WeakRef<gtk::Button>,
+    composer_refresh: gtk::glib::WeakRef<gtk::Button>,
+    composer_progress: gtk::glib::WeakRef<gtk::Spinner>,
+    composer_error: gtk::glib::WeakRef<gtk::Label>,
+    composer_message_id: Weak<RefCell<Option<MessageId>>>,
     last_list_revision: Weak<Cell<u64>>,
     last_reader_revision: Weak<Cell<u64>>,
     filter_buttons: Vec<(MessageFilter, gtk::glib::WeakRef<gtk::Button>)>,
@@ -112,6 +133,16 @@ impl Ui {
             sync_detail: self.sync_detail.downgrade(),
             cache_limit: self.cache_limit.downgrade(),
             cache_usage: self.cache_usage.downgrade(),
+            composer_window: self.composer_window.downgrade(),
+            composer_to: self.composer_to.downgrade(),
+            composer_subject: self.composer_subject.downgrade(),
+            composer_body: self.composer_body.downgrade(),
+            composer_send: self.composer_send.downgrade(),
+            composer_cancel: self.composer_cancel.downgrade(),
+            composer_refresh: self.composer_refresh.downgrade(),
+            composer_progress: self.composer_progress.downgrade(),
+            composer_error: self.composer_error.downgrade(),
+            composer_message_id: Rc::downgrade(&self.composer_message_id),
             last_list_revision: Rc::downgrade(&self.last_list_revision),
             last_reader_revision: Rc::downgrade(&self.last_reader_revision),
             filter_buttons: self
@@ -144,6 +175,46 @@ impl Ui {
 
     pub(crate) fn toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+    pub(crate) fn send_reply(&self) {
+        let buffer = self.composer_body.buffer();
+        let body = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        self.dispatch(Action::UpdateReplyBody(body.to_string()));
+        self.dispatch(Action::SendReply);
+    }
+    pub(crate) fn request_close_composer(&self) {
+        let composer = self.state.borrow().snapshot().composer;
+        match &composer {
+            ComposerState::Closed => self.composer_window.set_visible(false),
+            ComposerState::Sending { .. } => self.toast("Wait for the reply to finish sending"),
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                let buffer = self.composer_body.buffer();
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+                if draft.body.trim().is_empty() && text.trim().is_empty() {
+                    self.dispatch(Action::CancelReply);
+                    return;
+                }
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Discard this reply?")
+                    .body("Your unsent reply will be lost.")
+                    .build();
+                dialog.add_response("keep", "Keep Editing");
+                dialog.add_response("discard", "Discard");
+                dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+                let weak = self.downgrade();
+                dialog.choose(
+                    Some(&self.composer_window),
+                    None::<&gtk::gio::Cancellable>,
+                    move |response| {
+                        if response == "discard"
+                            && let Some(ui) = weak.upgrade()
+                        {
+                            ui.dispatch(Action::CancelReply);
+                        }
+                    },
+                );
+            }
+        }
     }
     fn handle_worker_event(&self, event: WorkerEvent) {
         let event = match event {
@@ -241,6 +312,27 @@ impl Ui {
                     },
                 );
             }
+            Effect::PresentUncertainResendConfirmation => {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Send this reply again?")
+                    .body("Gmail may already have accepted the previous attempt. Check Sent first; sending again can create a duplicate.")
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("resend", "Send Again");
+                dialog.set_response_appearance("resend", adw::ResponseAppearance::Destructive);
+                let weak = self.downgrade();
+                dialog.choose(
+                    Some(&self.composer_window),
+                    None::<&gtk::gio::Cancellable>,
+                    move |response| {
+                        if response == "resend"
+                            && let Some(ui) = weak.upgrade()
+                        {
+                            ui.dispatch(Action::ConfirmResend);
+                        }
+                    },
+                );
+            }
         }
     }
 }
@@ -263,6 +355,16 @@ impl WeakUi {
             sync_detail: self.sync_detail.upgrade()?,
             cache_limit: self.cache_limit.upgrade()?,
             cache_usage: self.cache_usage.upgrade()?,
+            composer_window: self.composer_window.upgrade()?,
+            composer_to: self.composer_to.upgrade()?,
+            composer_subject: self.composer_subject.upgrade()?,
+            composer_body: self.composer_body.upgrade()?,
+            composer_send: self.composer_send.upgrade()?,
+            composer_cancel: self.composer_cancel.upgrade()?,
+            composer_refresh: self.composer_refresh.upgrade()?,
+            composer_progress: self.composer_progress.upgrade()?,
+            composer_error: self.composer_error.upgrade()?,
+            composer_message_id: self.composer_message_id.upgrade()?,
             last_list_revision: self.last_list_revision.upgrade()?,
             last_reader_revision: self.last_reader_revision.upgrade()?,
             filter_buttons: self

@@ -4,9 +4,11 @@ use crate::{
         AccountIdentity, CacheUsage, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, MessageBody,
         MessageId, MessageSummary,
     },
+    smtp,
     worker::{
-        BodyFailure, BodyRequestId, CacheOperationId, FailureKind, OperationId, ServiceFailure,
-        SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+        BodyFailure, BodyRequestId, CacheOperationId, FailureKind, OperationId, ReplySubmission,
+        SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent,
+        WorkerPhase,
     },
 };
 use std::{sync::Arc, time::SystemTime};
@@ -24,10 +26,13 @@ pub struct AppState {
     recovery: Option<RecoveryAction>,
     cache_limit: usize,
     next_body_request: u64,
+    next_send_request: u64,
+    send_generation: u64,
     cache_generation: u64,
     pending_cache_clear: Option<CacheOperationId>,
     reader: ReaderState,
     cache_usage: CacheUsage,
+    composer: ComposerState,
     list_revision: u64,
     reader_revision: u64,
 }
@@ -72,6 +77,30 @@ pub enum ReaderState {
         failure: BodyFailure,
     },
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyDraft {
+    pub message_id: MessageId,
+    pub recipient: String,
+    pub subject: String,
+    pub body: String,
+    pub context: crate::model::ReplyContext,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComposerState {
+    Closed,
+    Editing {
+        draft: ReplyDraft,
+    },
+    Sending {
+        draft: ReplyDraft,
+        request_id: SendRequestId,
+        generation: u64,
+    },
+    Failed {
+        draft: ReplyDraft,
+        failure: SendFailure,
+    },
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewStatus {
     Disconnected,
@@ -99,6 +128,11 @@ pub enum Action {
     SetFilter(MessageFilter),
     SetCacheLimit(usize),
     RetryBody,
+    BeginReply,
+    UpdateReplyBody(String),
+    CancelReply,
+    SendReply,
+    ConfirmResend,
     RequestClearCache,
     ConfirmClearCache,
     SelectNext,
@@ -114,6 +148,7 @@ pub enum Effect {
     ClearAuthorization { id: OperationId },
     PresentDisconnectConfirmation,
     PresentClearCacheConfirmation,
+    PresentUncertainResendConfirmation,
 }
 #[derive(Default, Debug)]
 pub struct Update {
@@ -141,6 +176,7 @@ pub struct ViewSnapshot {
     pub can_retry: bool,
     pub cache_limit: usize,
     pub reader: ReaderState,
+    pub composer: ComposerState,
     pub cache_usage: CacheUsage,
     pub list_revision: u64,
     pub reader_revision: u64,
@@ -189,10 +225,13 @@ impl AppState {
             recovery: None,
             cache_limit: cache::load_limit(),
             next_body_request: 1,
+            next_send_request: 1,
+            send_generation: 0,
             cache_generation: 0,
             pending_cache_clear: None,
             reader: ReaderState::Closed,
             cache_usage: CacheUsage::default(),
+            composer: ComposerState::Closed,
             list_revision: 1,
             reader_revision: 1,
         }
@@ -219,11 +258,17 @@ impl AppState {
                         ..Default::default()
                     })
             }
-            Action::RequestDisconnect => Update {
-                effects: vec![Effect::PresentDisconnectConfirmation],
-                ..Default::default()
-            },
-            Action::ConfirmDisconnect => self.disconnect(),
+            Action::RequestDisconnect => self.request_disconnect(),
+            Action::ConfirmDisconnect => {
+                if matches!(self.composer, ComposerState::Sending { .. }) {
+                    Update {
+                        feedback: Some("Wait for the reply to finish before disconnecting"),
+                        ..Default::default()
+                    }
+                } else {
+                    self.disconnect()
+                }
+            }
             Action::Retry => match self.recovery {
                 Some(RecoveryAction::Sync(kind)) => self.start(kind),
                 Some(RecoveryAction::Disconnect) => self.disconnect(),
@@ -268,6 +313,12 @@ impl AppState {
                     };
                     self.bump_reader();
                 }
+                if let ComposerState::Sending { draft, .. } = &self.composer {
+                    self.composer = ComposerState::Failed {
+                        draft: draft.clone(),
+                        failure: SendFailure::DeliveryUncertain,
+                    };
+                }
                 let failure = ServiceFailure {
                     kind: FailureKind::WorkerUnavailable,
                     retryable: false,
@@ -302,6 +353,16 @@ impl AppState {
             }
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::RetryBody => self.retry_body(),
+            Action::BeginReply => self.begin_reply(),
+            Action::UpdateReplyBody(body) => self.update_reply_body(body),
+            Action::CancelReply => {
+                if !matches!(self.composer, ComposerState::Sending { .. }) {
+                    self.composer = ComposerState::Closed;
+                }
+                Update::default()
+            }
+            Action::SendReply => self.send_reply(false),
+            Action::ConfirmResend => self.send_reply(true),
             Action::RequestClearCache => Update {
                 effects: vec![Effect::PresentClearCacheConfirmation],
                 ..Default::default()
@@ -356,6 +417,8 @@ impl AppState {
             return Update::default();
         };
         self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.send_generation = self.send_generation.wrapping_add(1);
+        self.composer = ComposerState::Closed;
         self.reader = ReaderState::Closed;
         self.bump_reader();
         self.session = SessionState::Disconnecting;
@@ -471,6 +534,45 @@ impl AppState {
                 self.cache_usage = usage;
                 Update::default()
             }
+            WorkerEvent::ReplySent {
+                request_id,
+                generation,
+            } => {
+                let matches = matches!(&self.composer,
+                    ComposerState::Sending { request_id: current, generation: current_generation, .. }
+                    if *current == request_id && *current_generation == generation);
+                if !matches || generation != self.send_generation {
+                    return Update::default();
+                }
+                self.composer = ComposerState::Closed;
+                let mut update = self.start(SyncKind::Refresh);
+                update.feedback = Some("Reply sent");
+                update
+            }
+            WorkerEvent::ReplyFailed {
+                request_id,
+                generation,
+                failure,
+            } => {
+                let draft = match &self.composer {
+                    ComposerState::Sending {
+                        draft,
+                        request_id: current,
+                        generation: current_generation,
+                    } if *current == request_id
+                        && *current_generation == generation
+                        && generation == self.send_generation =>
+                    {
+                        draft.clone()
+                    }
+                    _ => return Update::default(),
+                };
+                self.composer = ComposerState::Failed { draft, failure };
+                Update {
+                    feedback: Some(send_failure_feedback(failure)),
+                    ..Default::default()
+                }
+            }
             other => self.account_worker_event(other),
         }
     }
@@ -490,7 +592,9 @@ impl AppState {
             | WorkerEvent::BodyFailed { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
-            | WorkerEvent::CacheUsageChanged { .. } => unreachable!(),
+            | WorkerEvent::CacheUsageChanged { .. }
+            | WorkerEvent::ReplySent { .. }
+            | WorkerEvent::ReplyFailed { .. } => unreachable!(),
         };
         if self.active_operation != Some(id) {
             return Update::default();
@@ -518,6 +622,8 @@ impl AppState {
             }
             WorkerEvent::AccountPersisted { account, .. } => {
                 if self.account_changed(&account) {
+                    self.send_generation = self.send_generation.wrapping_add(1);
+                    self.composer = ComposerState::Closed;
                     self.mailbox = None;
                     self.selected_message_id = None;
                     self.reader = ReaderState::Closed;
@@ -535,6 +641,10 @@ impl AppState {
             WorkerEvent::CacheLoaded {
                 account, snapshot, ..
             } => {
+                if self.account_changed(&account) {
+                    self.send_generation = self.send_generation.wrapping_add(1);
+                    self.composer = ComposerState::Closed;
+                }
                 self.account = Some(account);
                 self.mailbox = Some(snapshot);
                 self.normalize();
@@ -565,6 +675,8 @@ impl AppState {
                 account, snapshot, ..
             } => {
                 if self.account_changed(&account) {
+                    self.send_generation = self.send_generation.wrapping_add(1);
+                    self.composer = ComposerState::Closed;
                     self.selected_message_id = None;
                     self.reader = ReaderState::Closed;
                     self.cache_usage = CacheUsage::default();
@@ -590,6 +702,8 @@ impl AppState {
                 self.active_operation = None;
                 self.recovery = None;
                 self.reader = ReaderState::Closed;
+                self.send_generation = self.send_generation.wrapping_add(1);
+                self.composer = ComposerState::Closed;
                 self.cache_usage = CacheUsage::default();
                 self.bump_list();
                 self.bump_reader();
@@ -635,7 +749,9 @@ impl AppState {
             | WorkerEvent::BodyFailed { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
-            | WorkerEvent::CacheUsageChanged { .. } => unreachable!(),
+            | WorkerEvent::CacheUsageChanged { .. }
+            | WorkerEvent::ReplySent { .. }
+            | WorkerEvent::ReplyFailed { .. } => unreachable!(),
         }
     }
     pub fn snapshot(&self) -> ViewSnapshot {
@@ -719,7 +835,8 @@ impl AppState {
                     SessionState::Ready | SessionState::Offline { .. }
                 ),
             can_disconnect: self.account.is_some()
-                && !matches!(self.session, SessionState::Disconnecting),
+                && !matches!(self.session, SessionState::Disconnecting)
+                && !matches!(self.composer, ComposerState::Sending { .. }),
             can_reopen: matches!(self.session, SessionState::Authorizing { .. }),
             can_cancel: matches!(self.session, SessionState::Authorizing { .. }),
             can_retry: match &self.session {
@@ -731,6 +848,7 @@ impl AppState {
             },
             cache_limit: self.cache_limit,
             reader: self.reader.clone(),
+            composer: self.composer.clone(),
             cache_usage: self.cache_usage,
             list_revision: self.list_revision,
             reader_revision: self.reader_revision,
@@ -908,6 +1026,149 @@ impl AppState {
             Update::default()
         }
     }
+    fn begin_reply(&mut self) -> Update {
+        if !matches!(self.composer, ComposerState::Closed) {
+            return Update::default();
+        }
+        let (id, context) = match &self.reader {
+            ReaderState::Loaded { id, body } => (id.clone(), body.reply_context.clone()),
+            _ => {
+                return Update {
+                    feedback: Some("Load the message before replying"),
+                    ..Default::default()
+                };
+            }
+        };
+        let primary = if context.reply_to.is_empty() {
+            &context.from
+        } else {
+            &context.reply_to
+        };
+        let Some(target) = primary.first() else {
+            return Update {
+                feedback: Some("This message has no reply address"),
+                ..Default::default()
+            };
+        };
+        let Some(message) = self
+            .mailbox
+            .as_ref()
+            .and_then(|mailbox| mailbox.messages.iter().find(|message| message.id == id))
+        else {
+            return Update::default();
+        };
+        let recipient = target
+            .name
+            .as_ref()
+            .filter(|name| !name.trim().is_empty())
+            .map_or_else(
+                || target.email.clone(),
+                |name| format!("{name} <{}>", target.email),
+            );
+        self.composer = ComposerState::Editing {
+            draft: ReplyDraft {
+                message_id: id,
+                recipient,
+                subject: message.subject.clone(),
+                body: String::new(),
+                context,
+            },
+        };
+        Update::default()
+    }
+    fn update_reply_body(&mut self, body: String) -> Update {
+        match &mut self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
+                draft.body = body
+            }
+            ComposerState::Closed | ComposerState::Sending { .. } => {}
+        }
+        Update::default()
+    }
+    fn request_disconnect(&self) -> Update {
+        if matches!(self.composer, ComposerState::Sending { .. }) {
+            Update {
+                feedback: Some("Wait for the reply to finish before disconnecting"),
+                ..Default::default()
+            }
+        } else {
+            Update {
+                effects: vec![Effect::PresentDisconnectConfirmation],
+                ..Default::default()
+            }
+        }
+    }
+
+    fn send_reply(&mut self, confirmed_uncertain_resend: bool) -> Update {
+        let draft = match &self.composer {
+            ComposerState::Failed {
+                failure: SendFailure::DeliveryUncertain,
+                ..
+            } if !confirmed_uncertain_resend => {
+                return Update {
+                    effects: vec![Effect::PresentUncertainResendConfirmation],
+                    ..Default::default()
+                };
+            }
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
+            ComposerState::Closed | ComposerState::Sending { .. } => return Update::default(),
+        };
+        let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
+            return Update {
+                feedback: Some("Connect Gmail before sending"),
+                ..Default::default()
+            };
+        };
+        if let Err(error) = smtp::validate_reply(
+            &account_email,
+            &draft.context,
+            smtp::ReplyKind::Reply,
+            &draft.body,
+        ) {
+            let failure = map_send_failure(error);
+            let draft = match std::mem::replace(&mut self.composer, ComposerState::Closed) {
+                ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
+                other => {
+                    self.composer = other;
+                    return Update::default();
+                }
+            };
+            self.composer = ComposerState::Failed { draft, failure };
+            return Update {
+                feedback: Some(send_failure_feedback(failure)),
+                ..Default::default()
+            };
+        }
+        let request_id = SendRequestId(self.next_send_request);
+        self.next_send_request = self.next_send_request.wrapping_add(1).max(1);
+        let generation = self.send_generation;
+        let draft = match std::mem::replace(&mut self.composer, ComposerState::Closed) {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
+            other => {
+                self.composer = other;
+                return Update::default();
+            }
+        };
+        let submission = ReplySubmission {
+            account_email,
+            subject: draft.subject.clone(),
+            context: draft.context.clone(),
+            body: draft.body.clone(),
+        };
+        self.composer = ComposerState::Sending {
+            draft,
+            request_id,
+            generation,
+        };
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::SendReply {
+                request_id,
+                generation,
+                submission: Box::new(submission),
+            })],
+            ..Default::default()
+        }
+    }
     fn clear_body_cache(&mut self) -> Update {
         self.cache_generation = self.cache_generation.wrapping_add(1);
         let operation_id = CacheOperationId(self.next_body_request);
@@ -934,6 +1195,32 @@ impl AppState {
         self.account
             .as_ref()
             .is_some_and(|current| !current.email.eq_ignore_ascii_case(&account.email))
+    }
+}
+
+fn map_send_failure(error: smtp::SmtpError) -> SendFailure {
+    match error {
+        smtp::SmtpError::EmptyBody => SendFailure::Empty,
+        smtp::SmtpError::BodyTooLarge => SendFailure::TooLarge,
+        smtp::SmtpError::MissingRecipient
+        | smtp::SmtpError::InvalidAddress
+        | smtp::SmtpError::TooManyRecipients => SendFailure::InvalidRecipient,
+        smtp::SmtpError::Authentication => SendFailure::AuthorizationRequired,
+        smtp::SmtpError::Rejected => SendFailure::Rejected,
+        smtp::SmtpError::DeliveryUncertain => SendFailure::DeliveryUncertain,
+        smtp::SmtpError::Build => SendFailure::Protocol,
+    }
+}
+
+fn send_failure_feedback(failure: SendFailure) -> &'static str {
+    match failure {
+        SendFailure::Empty => "Write a reply before sending",
+        SendFailure::TooLarge => "Reply is too large to send",
+        SendFailure::InvalidRecipient => "This message has no valid reply address",
+        SendFailure::AuthorizationRequired => "Refresh Gmail authorization before sending",
+        SendFailure::Rejected => "Gmail rejected the reply",
+        SendFailure::DeliveryUncertain => "Delivery is uncertain; check Sent before retrying",
+        SendFailure::Protocol => "Could not construct or send the reply",
     }
 }
 

@@ -36,8 +36,40 @@ fn body() -> Arc<crate::model::MessageBody> {
         text: "Complete body".into(),
         html: None,
         attachments: Vec::new(),
+        reply_context: crate::model::ReplyContext::default(),
         used_fallback: false,
     })
+}
+
+fn reply_body() -> Arc<crate::model::MessageBody> {
+    let mut value = (*body()).clone();
+    value.reply_context.from.push(crate::model::ReplyAddress {
+        name: Some("Sender".into()),
+        email: "sender@example.com".into(),
+    });
+    Arc::new(value)
+}
+
+fn load_replyable(state: &mut AppState) {
+    ready(state);
+    let id = MessageId::gmail(1, 1);
+    let update = state.dispatch(Action::SelectMessage(id.clone()));
+    let (request_id, generation) = match update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id,
+        generation,
+        message_id: id,
+        body: reply_body(),
+        usage: Default::default(),
+        saved: true,
+    }));
 }
 
 #[test]
@@ -682,4 +714,154 @@ fn loaded_message_search_handles_unicode_and_rtl() {
     assert_eq!(state.visible_message_ids().len(), 1);
     state.dispatch(Action::SetSearch("ليلى".into()));
     assert_eq!(state.visible_message_ids().len(), 1);
+}
+
+#[test]
+fn reply_requires_loaded_context_and_prevents_duplicate_send() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    assert_eq!(
+        state.dispatch(Action::BeginReply).feedback,
+        Some("Load the message before replying")
+    );
+
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { .. }
+    ));
+    state.dispatch(Action::UpdateReplyBody("Thanks".into()));
+    let send = state.dispatch(Action::SendReply);
+    let (request_id, generation) = match send.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::SendReply {
+                request_id,
+                generation,
+                submission,
+                ..
+            }),
+        ] if submission.body == "Thanks" => (*request_id, *generation),
+        other => panic!("unexpected send effect: {other:?}"),
+    };
+    assert!(state.dispatch(Action::SendReply).effects.is_empty());
+    assert!(
+        matches!(state.snapshot().composer, ComposerState::Sending { request_id: current, .. } if current == request_id)
+    );
+
+    state.dispatch(Action::Worker(WorkerEvent::ReplyFailed {
+        request_id,
+        generation,
+        failure: SendFailure::Rejected,
+    }));
+    assert!(
+        matches!(state.snapshot().composer, ComposerState::Failed { ref draft, failure: SendFailure::Rejected } if draft.body == "Thanks")
+    );
+}
+
+#[test]
+fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    let empty = state.dispatch(Action::SendReply);
+    assert!(empty.effects.is_empty());
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Failed {
+            failure: SendFailure::Empty,
+            ..
+        }
+    ));
+
+    state.dispatch(Action::UpdateReplyBody("Hello".into()));
+    let send = state.dispatch(Action::SendReply);
+    let (request_id, generation) = match send.effects[0] {
+        Effect::SendWorker(WorkerCommand::SendReply {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::ReplySent {
+        request_id: SendRequestId(request_id.0 + 1),
+        generation,
+    }));
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Sending { .. }
+    ));
+
+    let complete = state.dispatch(Action::Worker(WorkerEvent::ReplySent {
+        request_id,
+        generation,
+    }));
+    assert_eq!(complete.feedback, Some("Reply sent"));
+    assert!(matches!(
+        complete.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::Refresh { .. })]
+    ));
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+}
+
+#[test]
+fn uncertain_reply_requires_explicit_resend_confirmation() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateReplyBody("Hello".into()));
+    let send = state.dispatch(Action::SendReply);
+    let (request_id, generation) = match send.effects[0] {
+        Effect::SendWorker(WorkerCommand::SendReply {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::ReplyFailed {
+        request_id,
+        generation,
+        failure: SendFailure::DeliveryUncertain,
+    }));
+
+    assert!(matches!(
+        state.dispatch(Action::SendReply).effects.as_slice(),
+        [Effect::PresentUncertainResendConfirmation]
+    ));
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Failed {
+            failure: SendFailure::DeliveryUncertain,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state.dispatch(Action::ConfirmResend).effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::SendReply { .. })]
+    ));
+}
+
+#[test]
+fn disconnect_is_blocked_without_discarding_an_in_flight_reply() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateReplyBody("Keep this draft".into()));
+    state.dispatch(Action::SendReply);
+
+    let request = state.dispatch(Action::RequestDisconnect);
+    assert_eq!(
+        request.feedback,
+        Some("Wait for the reply to finish before disconnecting")
+    );
+    assert!(request.effects.is_empty());
+    let confirm = state.dispatch(Action::ConfirmDisconnect);
+    assert!(confirm.effects.is_empty());
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Sending { ref draft, .. } if draft.body == "Keep this draft"
+    ));
+    assert!(!state.snapshot().can_disconnect);
 }

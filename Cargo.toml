@@ -3,7 +3,7 @@ name = "whitford"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-description = "A read-only native Gmail client for Wayland"
+description = "A lightweight native Gmail client for Wayland"
 license = "GPL-3.0-or-later"
 
 [dependencies]
@@ -12,6 +12,7 @@ gtk = { package = "gtk4", version = "0.11.4", features = ["v4_22"] }
 async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
 chrono = { version = "0.4.45", default-features = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1-rustls-tls"] }
 mail-parser = { version = "0.11.9", default-features = false, features = ["full_encoding"] }
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }

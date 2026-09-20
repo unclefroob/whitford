@@ -10,8 +10,10 @@ use super::{
 };
 use crate::{
     config,
-    state::{Action, MessageFilter, ReaderState, SessionState, ViewSnapshot, ViewStatus},
-    worker::{BodyFailure, FailureKind, ServiceFailure, WorkerPhase},
+    state::{
+        Action, ComposerState, MessageFilter, ReaderState, SessionState, ViewSnapshot, ViewStatus,
+    },
+    worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,11 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "reopen-authorization", snapshot.can_reopen);
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
+    let can_reply = matches!(snapshot.session, SessionState::Ready)
+        && matches!(&snapshot.reader, ReaderState::Loaded { body, .. } if !(if body.reply_context.reply_to.is_empty() { &body.reply_context.from } else { &body.reply_context.reply_to }).is_empty())
+        && matches!(snapshot.composer, ComposerState::Closed);
+    set_action_enabled(ui, "reply", can_reply);
+    render_composer(ui, snapshot);
     if ui.last_list_revision.get() != snapshot.list_revision {
         render_messages(ui, snapshot);
         ui.last_list_revision.set(snapshot.list_revision);
@@ -41,6 +48,75 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     if ui.last_reader_revision.get() != snapshot.reader_revision {
         render_reader(ui, snapshot);
         ui.last_reader_revision.set(snapshot.reader_revision);
+    }
+}
+
+fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
+    let (draft, sending, failure) = match &snapshot.composer {
+        ComposerState::Closed => {
+            ui.composer_window.set_visible(false);
+            *ui.composer_message_id.borrow_mut() = None;
+            return;
+        }
+        ComposerState::Editing { draft } => (draft, false, None),
+        ComposerState::Sending { draft, .. } => (draft, true, None),
+        ComposerState::Failed { draft, failure } => (draft, false, Some(*failure)),
+    };
+    if ui.composer_message_id.borrow().as_ref() != Some(&draft.message_id) {
+        ui.composer_to.set_text(&format!("To: {}", draft.recipient));
+        ui.composer_subject
+            .set_text(&reply_subject_label(&draft.subject));
+        ui.composer_body.buffer().set_text(&draft.body);
+        *ui.composer_message_id.borrow_mut() = Some(draft.message_id.clone());
+        ui.composer_window.present();
+        ui.composer_body.grab_focus();
+    }
+    ui.composer_body.set_editable(!sending);
+    ui.composer_send.set_sensitive(!sending);
+    ui.composer_cancel.set_sensitive(!sending);
+    let was_sending = ui.composer_progress.is_visible();
+    ui.composer_progress.set_spinning(sending);
+    ui.composer_progress.set_visible(sending);
+    if sending && !was_sending {
+        ui.composer_window
+            .announce("Sending reply", gtk::AccessibleAnnouncementPriority::Medium);
+    }
+    ui.composer_refresh
+        .set_visible(matches!(failure, Some(SendFailure::AuthorizationRequired)));
+    let error = failure.map(send_failure_text).unwrap_or("");
+    let error_changed = ui.composer_error.text().as_str() != error;
+    let error_was_visible = ui.composer_error.is_visible();
+    ui.composer_error.set_text(error);
+    ui.composer_error.set_visible(!error.is_empty());
+    if !error.is_empty() && (error_changed || !error_was_visible) {
+        ui.composer_window
+            .announce(error, gtk::AccessibleAnnouncementPriority::High);
+        ui.composer_error.grab_focus();
+    }
+}
+
+fn reply_subject_label(subject: &str) -> String {
+    let subject = subject.trim();
+    if subject.to_ascii_lowercase().starts_with("re:") {
+        subject.to_owned()
+    } else if subject.is_empty() {
+        "Re: (No subject)".into()
+    } else {
+        format!("Re: {subject}")
+    }
+}
+
+fn send_failure_text(failure: SendFailure) -> &'static str {
+    match failure {
+        SendFailure::Empty => "Write a reply before sending.",
+        SendFailure::TooLarge => "This reply is too large to send.",
+        SendFailure::InvalidRecipient => "The reply address is invalid.",
+        SendFailure::AuthorizationRequired => "Refresh Gmail authorization, then try again.",
+        SendFailure::Rejected => "Gmail rejected this reply. Your draft has been kept.",
+        SendFailure::DeliveryUncertain => {
+            "Delivery may have succeeded. Check Sent before trying again."
+        }
+        SendFailure::Protocol => "Whitford could not send this reply. Your draft has been kept.",
     }
 }
 
@@ -596,7 +672,7 @@ fn sync_detail(snapshot: &ViewSnapshot) -> String {
         .map(|account| account.email.as_str())
         .unwrap_or("No verified account");
     let detail = snapshot.sync_metadata.as_ref().map_or_else(
-        || format!("Newest {} messages · read-only", snapshot.cache_limit),
+        || format!("Newest {} messages · replies enabled", snapshot.cache_limit),
         |meta| {
             let synced = system_time_unix(meta.completed_at).map_or_else(
                 || "unknown time".into(),
@@ -871,5 +947,19 @@ mod tests {
         let detail = partial_sync_detail(&state.snapshot()).unwrap();
         assert!(detail.contains("2 messages were not listed"));
         assert!(!detail.contains("fallback"));
+    }
+
+    #[test]
+    fn reply_subject_label_adds_only_one_prefix() {
+        assert_eq!(reply_subject_label("Status"), "Re: Status");
+        assert_eq!(reply_subject_label("RE: Status"), "RE: Status");
+        assert_eq!(reply_subject_label("  "), "Re: (No subject)");
+    }
+
+    #[test]
+    fn uncertain_delivery_copy_prevents_blind_retry() {
+        let copy = send_failure_text(SendFailure::DeliveryUncertain);
+        assert!(copy.contains("may have succeeded"));
+        assert!(copy.contains("Check Sent"));
     }
 }

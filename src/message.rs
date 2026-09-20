@@ -1,8 +1,10 @@
 use crate::{
     gmail::{RawMessageBody, RawMessageSummary},
-    model::{Attachment, FolderId, MessageBody, MessageId, MessageSummary},
+    model::{
+        Attachment, FolderId, MessageBody, MessageId, MessageSummary, ReplyAddress, ReplyContext,
+    },
 };
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
@@ -68,7 +70,7 @@ pub fn map_summaries(mut records: Vec<RawMessageSummary>) -> (Vec<MessageSummary
 pub fn map_body(raw: RawMessageBody) -> MessageBody {
     let parsed = MessageParser::default().parse(&raw.raw);
     let mut used_fallback = parsed.is_none();
-    let (text, html, attachments) = if let Some(parsed) = parsed {
+    let (text, html, attachments, reply_context) = if let Some(parsed) = parsed {
         let html = parsed.html_part(0).and_then(|part| match &part.body {
             PartType::Html(value) if !value.trim().is_empty() => Some(value.clone().into_owned()),
             _ => None,
@@ -114,16 +116,95 @@ pub fn map_body(raw: RawMessageBody) -> MessageBody {
                 }
             })
             .collect();
-        (normalize(&text), html, attachments)
+        let reply_context = ReplyContext {
+            from: addresses(parsed.from()),
+            reply_to: addresses(parsed.reply_to()),
+            to: addresses(parsed.to()),
+            cc: addresses(parsed.cc()),
+            message_id: bounded_message_id(parsed.message_id()),
+            references: message_ids(parsed.references()),
+            sent_at_unix: parsed.date().map(|date| date.to_timestamp()),
+        };
+        (normalize(&text), html, attachments, reply_context)
     } else {
-        ("No readable message body.".into(), None, Vec::new())
+        (
+            "No readable message body.".into(),
+            None,
+            Vec::new(),
+            ReplyContext::default(),
+        )
     };
     MessageBody {
         text,
         html,
         attachments,
+        reply_context,
         used_fallback,
     }
+}
+
+const MAX_REPLY_ADDRESSES_PER_HEADER: usize = 100;
+const MAX_REFERENCE_IDS: usize = 50;
+
+fn addresses(value: Option<&Address<'_>>) -> Vec<ReplyAddress> {
+    value
+        .into_iter()
+        .flat_map(Address::iter)
+        .filter_map(|address| {
+            let email = address.address.as_deref()?.trim();
+            if email.is_empty()
+                || email.len() > 320
+                || !email.contains('@')
+                || email.chars().any(char::is_control)
+            {
+                return None;
+            }
+            let name = address
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| cap(name, 160, 640));
+            Some(ReplyAddress {
+                name,
+                email: email.to_owned(),
+            })
+        })
+        .take(MAX_REPLY_ADDRESSES_PER_HEADER)
+        .collect()
+}
+
+fn bounded_message_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .map(|value| {
+            value
+                .strip_prefix('<')
+                .and_then(|value| value.strip_suffix('>'))
+                .unwrap_or(value)
+        })
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 994
+                && value.contains('@')
+                && !value
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+                && !value.contains(['<', '>'])
+        })
+        .map(|value| format!("<{value}>"))
+}
+
+fn message_ids(value: &HeaderValue<'_>) -> Vec<String> {
+    let values: Box<dyn Iterator<Item = &str> + '_> = match value {
+        HeaderValue::Text(value) => Box::new(std::iter::once(value.as_ref())),
+        HeaderValue::TextList(values) => Box::new(values.iter().map(AsRef::as_ref)),
+        _ => Box::new(std::iter::empty()),
+    };
+    values
+        .filter_map(|value| bounded_message_id(Some(value)))
+        .take(MAX_REFERENCE_IDS)
+        .collect()
 }
 
 fn remove_dangerous_blocks(input: &str) -> String {
@@ -263,6 +344,31 @@ mod tests {
                 .as_deref()
                 .is_some_and(|html| html.contains(&suffix))
         );
+    }
+
+    #[test]
+    fn body_keeps_bounded_reply_and_thread_metadata() {
+        let message = map_body(body(
+            b"From: Sender <sender@example.com>\r\n\
+Reply-To: Team <reply@example.com>\r\n\
+To: Me <me@example.com>, Other <other@example.com>\r\n\
+Cc: Third <third@example.com>\r\n\
+Date: Tue, 1 Jan 2019 00:00:00 +0000\r\n\
+Message-ID: <parent@example.com>\r\n\
+References: <root@example.com> <middle@example.com>\r\n\
+Content-Type: text/plain\r\n\r\nHello",
+        ));
+        let context = message.reply_context;
+        assert_eq!(context.from[0].email, "sender@example.com");
+        assert_eq!(context.reply_to[0].email, "reply@example.com");
+        assert_eq!(context.to.len(), 2);
+        assert_eq!(context.cc[0].email, "third@example.com");
+        assert_eq!(context.message_id.as_deref(), Some("<parent@example.com>"));
+        assert_eq!(
+            context.references,
+            ["<root@example.com>", "<middle@example.com>"]
+        );
+        assert_eq!(context.sent_at_unix, Some(1_546_300_800));
     }
 
     #[test]

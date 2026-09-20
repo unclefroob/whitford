@@ -5,6 +5,7 @@ pub mod message;
 pub mod model;
 pub mod oauth;
 pub mod secrets;
+pub mod smtp;
 pub mod state;
 pub mod ui;
 pub mod worker;

@@ -72,6 +72,7 @@ pub(super) fn build(
         .content(&toast_overlay)
         .css_classes(["whitford-window"])
         .build();
+    let composer = build_composer(&window);
     window.set_size_request(600, 560);
     add_breakpoints(
         &window,
@@ -101,6 +102,16 @@ pub(super) fn build(
         sync_detail,
         cache_limit,
         cache_usage,
+        composer_window: composer.0,
+        composer_to: composer.1,
+        composer_subject: composer.2,
+        composer_body: composer.3,
+        composer_send: composer.4,
+        composer_cancel: composer.5,
+        composer_refresh: composer.6,
+        composer_progress: composer.7,
+        composer_error: composer.8,
+        composer_message_id: Rc::new(RefCell::new(None)),
         last_list_revision: Rc::new(Cell::new(u64::MAX)),
         last_reader_revision: Rc::new(Cell::new(u64::MAX)),
         filter_buttons,
@@ -109,7 +120,177 @@ pub(super) fn build(
     }
 }
 
+#[allow(clippy::type_complexity)]
+fn build_composer(
+    window: &adw::ApplicationWindow,
+) -> (
+    adw::Window,
+    gtk::Label,
+    gtk::Label,
+    gtk::TextView,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+    gtk::Spinner,
+    gtk::Label,
+) {
+    let to = gtk::Label::builder()
+        .xalign(0.0)
+        .selectable(true)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    let subject = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["title-3"])
+        .build();
+    let body = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .vexpand(true)
+        .accepts_tab(false)
+        .css_classes(["whitford-composer-body"])
+        .build();
+    body.update_property(&[gtk::accessible::Property::Label("Reply body")]);
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&body)
+        .vexpand(true)
+        .min_content_height(260)
+        .build();
+    let send = gtk::Button::builder()
+        .label("Send")
+        .css_classes(["suggested-action"])
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let refresh = gtk::Button::with_label("Refresh Gmail");
+    let progress = gtk::Spinner::builder().visible(false).build();
+    progress.update_property(&[gtk::accessible::Property::Label("Sending reply")]);
+    let error = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .focusable(true)
+        .css_classes(["error"])
+        .build();
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    actions.append(&progress);
+    actions.append(&refresh);
+    actions.append(&cancel);
+    actions.append(&send);
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(
+        &gtk::Label::builder()
+            .label("Reply")
+            .xalign(0.0)
+            .css_classes(["title-1"])
+            .build(),
+    );
+    content.append(&to);
+    content.append(&subject);
+    content.append(&scroll);
+    content.append(&error);
+    content.append(&actions);
+    let composer = adw::Window::builder()
+        .title("Reply — Whitford")
+        .default_width(560)
+        .default_height(520)
+        .modal(true)
+        .transient_for(window)
+        .content(&content)
+        .build();
+    (
+        composer, to, subject, body, send, cancel, refresh, progress, error,
+    )
+}
+
 pub(super) fn connect_signals(ui: &Ui) {
+    ui.composer_send.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.send_reply();
+            }
+        }
+    });
+    ui.composer_cancel.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.request_close_composer();
+            }
+        }
+    });
+    ui.composer_refresh.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::Refresh);
+            }
+        }
+    });
+    let composer_keys = gtk::EventControllerKey::new();
+    composer_keys.connect_key_pressed({
+        let weak_ui = ui.downgrade();
+        move |_, key, _, modifiers| {
+            let Some(ui) = weak_ui.upgrade() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            if key == gtk::gdk::Key::Escape {
+                ui.request_close_composer();
+                gtk::glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return
+                && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            {
+                ui.send_reply();
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        }
+    });
+    composer_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    ui.composer_window.add_controller(composer_keys);
+    ui.window.connect_close_request({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            let Some(ui) = weak_ui.upgrade() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            if matches!(
+                ui.state.borrow().snapshot().composer,
+                crate::state::ComposerState::Closed
+            ) {
+                gtk::glib::Propagation::Proceed
+            } else {
+                ui.composer_window.present();
+                ui.request_close_composer();
+                gtk::glib::Propagation::Stop
+            }
+        }
+    });
+    ui.composer_window.connect_close_request({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.request_close_composer();
+            }
+            gtk::glib::Propagation::Stop
+        }
+    });
     ui.search.connect_search_changed({
         let weak_ui = ui.downgrade();
         move |entry| {
@@ -161,7 +342,7 @@ fn build_folder_pane(
         .css_classes(["title-3"])
         .build();
     let address = gtk::Label::builder()
-        .label("Read-only · lightweight summaries")
+        .label("Lightweight Gmail")
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();

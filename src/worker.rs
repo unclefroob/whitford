@@ -1,8 +1,12 @@
 use crate::{
     cache, config, gmail, message,
-    model::{AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, SyncMetadata},
+    model::{
+        AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, ReplyContext,
+        SyncMetadata,
+    },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
+    smtp,
 };
 use futures_util::FutureExt;
 
@@ -36,6 +40,8 @@ pub struct OperationId(pub u64);
 pub struct BodyRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheOperationId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SendRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncKind {
     Restore,
@@ -90,6 +96,22 @@ pub enum BodyFailure {
     MailboxChanged,
     Missing,
     Protocol,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendFailure {
+    Empty,
+    TooLarge,
+    InvalidRecipient,
+    AuthorizationRequired,
+    Rejected,
+    DeliveryUncertain,
+    Protocol,
+}
+pub struct ReplySubmission {
+    pub account_email: String,
+    pub subject: String,
+    pub context: ReplyContext,
+    pub body: String,
 }
 impl FailureKind {
     pub fn is_configuration(self) -> bool {
@@ -157,6 +179,11 @@ pub enum WorkerCommand {
         operation_id: CacheOperationId,
         generation: u64,
     },
+    SendReply {
+        request_id: SendRequestId,
+        generation: u64,
+        submission: Box<ReplySubmission>,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -191,6 +218,16 @@ impl fmt::Debug for WorkerCommand {
                 .debug_struct("ClearBodyCache")
                 .field("operation_id", operation_id)
                 .field("generation", generation)
+                .finish(),
+            Self::SendReply {
+                request_id,
+                generation,
+                ..
+            } => f
+                .debug_struct("SendReply")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("content", &"[REDACTED]")
                 .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -260,6 +297,15 @@ pub enum WorkerEvent {
     },
     CacheUsageChanged {
         usage: CacheUsage,
+    },
+    ReplySent {
+        request_id: SendRequestId,
+        generation: u64,
+    },
+    ReplyFailed {
+        request_id: SendRequestId,
+        generation: u64,
+        failure: SendFailure,
     },
 }
 impl fmt::Debug for WorkerEvent {
@@ -343,6 +389,24 @@ impl fmt::Debug for WorkerEvent {
                 .field("body_bytes", &usage.body_bytes)
                 .field("body_count", &usage.body_count)
                 .finish(),
+            Self::ReplySent {
+                request_id,
+                generation,
+            } => f
+                .debug_struct("ReplySent")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .finish(),
+            Self::ReplyFailed {
+                request_id,
+                generation,
+                failure,
+            } => f
+                .debug_struct("ReplyFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("failure", failure)
+                .finish(),
         }
     }
 }
@@ -395,7 +459,9 @@ async fn controller(
     let auth = Arc::new(Mutex::new(None::<RuntimeAuth>));
     let cache_io = Arc::new(Mutex::new(()));
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut body_task: Option<JoinHandle<()>> = None;
+    let mut send_task: Option<JoinHandle<()>> = None;
     loop {
         let command = if let Some(current) = active.as_mut() {
             tokio::select! {
@@ -452,6 +518,83 @@ async fn controller(
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
+            continue;
+        }
+        if matches!(&command, WorkerCommand::SendReply { .. }) {
+            let WorkerCommand::SendReply {
+                request_id,
+                generation,
+                submission,
+            } = command
+            else {
+                unreachable!();
+            };
+            if let Some(task) = send_task.take() {
+                if !task.is_finished() {
+                    send_task = Some(task);
+                    let _ = events.send(WorkerEvent::ReplyFailed {
+                        request_id,
+                        generation,
+                        failure: SendFailure::Protocol,
+                    });
+                    continue;
+                }
+                let _ = task.await;
+            }
+            send_generation.store(generation, Ordering::Release);
+            let credentials = auth
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .filter(|value| value.email.eq_ignore_ascii_case(&submission.account_email))
+                .map(|value| {
+                    (
+                        value.email.clone(),
+                        Zeroizing::new(value.access_token.as_str().to_owned()),
+                    )
+                });
+            let tx = events.clone();
+            let ReplySubmission {
+                account_email: _,
+                subject,
+                context,
+                body,
+            } = *submission;
+            let gate = send_generation.clone();
+            send_task = Some(tokio::spawn(async move {
+                let result = guard_smtp_send(async move {
+                    if let Some((email, token)) = credentials {
+                        match smtp::build_reply(
+                            &email,
+                            &subject,
+                            &context,
+                            smtp::ReplyKind::Reply,
+                            &body,
+                        ) {
+                            Ok(message) => smtp::send_reply(&email, token.as_str(), message).await,
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Err(smtp::SmtpError::Authentication)
+                    }
+                })
+                .await;
+                if gate.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let event = match result {
+                    Ok(()) => WorkerEvent::ReplySent {
+                        request_id,
+                        generation,
+                    },
+                    Err(error) => WorkerEvent::ReplyFailed {
+                        request_id,
+                        generation,
+                        failure: map_send_failure(error),
+                    },
+                };
+                let _ = tx.send(event);
+            }));
             continue;
         }
         if let WorkerCommand::FetchBody {
@@ -541,6 +684,7 @@ async fn controller(
         }
         if let WorkerCommand::Disconnect { generation, .. } = &command {
             cache_generation.store(*generation, Ordering::Release);
+            send_generation.store(*generation, Ordering::Release);
             if let Some(task) = body_task.take() {
                 task.abort();
                 let _ = task.await;
@@ -551,6 +695,7 @@ async fn controller(
         }
         if matches!(command, WorkerCommand::Shutdown) {
             cache_generation.fetch_add(1, Ordering::AcqRel);
+            send_generation.fetch_add(1, Ordering::AcqRel);
             if let Some(task) = body_task.take() {
                 task.abort();
                 let _ = task.await;
@@ -661,6 +806,7 @@ async fn controller(
             | WorkerCommand::SetCacheLimit { .. }
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::ClearBodyCache { .. }
+            | WorkerCommand::SendReply { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
@@ -675,6 +821,17 @@ struct RuntimeAuth {
 struct BodyCacheServices {
     generation: Arc<std::sync::atomic::AtomicU64>,
     io: Arc<Mutex<()>>,
+}
+
+async fn guard_smtp_send<F>(send: F) -> Result<(), smtp::SmtpError>
+where
+    F: Future<Output = Result<(), smtp::SmtpError>>,
+{
+    std::panic::AssertUnwindSafe(send)
+        .catch_unwind()
+        .await
+        // A panic may happen after SMTP accepted DATA; never imply retry is safe.
+        .unwrap_or(Err(smtp::SmtpError::DeliveryUncertain))
 }
 
 async fn cache_blocking<T, F>(
@@ -759,6 +916,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         WorkerCommand::SetCacheLimit { .. }
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::ClearBodyCache { .. }
+        | WorkerCommand::SendReply { .. }
         | WorkerCommand::Shutdown => None,
     }
 }
@@ -1227,6 +1385,20 @@ fn map_body_failure(error: gmail::GmailError) -> BodyFailure {
     }
 }
 
+fn map_send_failure(error: smtp::SmtpError) -> SendFailure {
+    match error {
+        smtp::SmtpError::EmptyBody => SendFailure::Empty,
+        smtp::SmtpError::BodyTooLarge => SendFailure::TooLarge,
+        smtp::SmtpError::MissingRecipient
+        | smtp::SmtpError::InvalidAddress
+        | smtp::SmtpError::TooManyRecipients => SendFailure::InvalidRecipient,
+        smtp::SmtpError::Authentication => SendFailure::AuthorizationRequired,
+        smtp::SmtpError::Rejected => SendFailure::Rejected,
+        smtp::SmtpError::DeliveryUncertain => SendFailure::DeliveryUncertain,
+        smtp::SmtpError::Build => SendFailure::Protocol,
+    }
+}
+
 fn emit_phase(tx: &mpsc::UnboundedSender<WorkerEvent>, id: OperationId, phase: WorkerPhase) {
     let _ = tx.send(WorkerEvent::Phase { id, phase });
 }
@@ -1331,6 +1503,20 @@ mod tests {
             message_id: MessageId::gmail(7, 9),
         };
         assert!(!format!("{body_command:?}").contains("canary@example.com"));
+        let send_command = WorkerCommand::SendReply {
+            request_id: SendRequestId(5),
+            generation: 1,
+            submission: Box::new(ReplySubmission {
+                account_email: "canary@example.com".into(),
+                subject: "secret subject".into(),
+                context: ReplyContext::default(),
+                body: "secret body".into(),
+            }),
+        };
+        let debug = format!("{send_command:?}");
+        assert!(!debug.contains("canary@example.com"));
+        assert!(!debug.contains("secret subject"));
+        assert!(!debug.contains("secret body"));
         let event = WorkerEvent::Failed {
             id: OperationId(3),
             failure: failure(FailureKind::Network, true, true),
@@ -1627,5 +1813,19 @@ mod tests {
             let result = tokio::spawn(async { panic!("test panic") }).await;
             assert!(join_failed(&result));
         });
+    }
+
+    #[test]
+    fn panicked_smtp_task_finishes_as_delivery_uncertain() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(guard_smtp_send(async {
+            panic!("test SMTP panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+        assert_eq!(result, Err(smtp::SmtpError::DeliveryUncertain));
     }
 }

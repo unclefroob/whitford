@@ -17,7 +17,7 @@ pub const RETENTION_OPTIONS: [usize; 4] = [50, 100, 250, 500];
 pub const DEFAULT_RETENTION: usize = 100;
 pub const BODY_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const MAILBOX_VERSION: u8 = 2;
-const BODY_VERSION: u8 = 2;
+const BODY_VERSION: u8 = 3;
 const MANIFEST_VERSION: u8 = 2;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -757,6 +757,7 @@ mod tests {
             text: text.into(),
             html: None,
             attachments: Vec::new(),
+            reply_context: crate::model::ReplyContext::default(),
             used_fallback: false,
         }
     }
@@ -830,6 +831,21 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn previous_body_schema_is_removed_as_a_cache_miss() {
+        let root = TestRoot::new();
+        let id = MessageId::gmail(7, 9);
+        save_body_at(&root.0, EMAIL, &id, &body("old"), 10, u64::MAX).unwrap();
+        let path = bodies_path(&root.0).join("7-9.json");
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored["version"] = serde_json::json!(BODY_VERSION - 1);
+        write_private_json(&path, &stored).unwrap();
+
+        assert_eq!(load_body_at(&root.0, EMAIL, &id, 20).unwrap(), None);
+        assert!(!path.exists());
     }
 
     #[test]

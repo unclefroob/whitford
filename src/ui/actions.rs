@@ -22,6 +22,9 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
         ui.dispatch(Action::RequestClearCache)
     });
     add_disabled(ui, "compose");
+    add(ui, "reply", |ui| ui.dispatch(Action::BeginReply));
+    add(ui, "send-reply", Ui::send_reply);
+    add(ui, "cancel-reply", Ui::request_close_composer);
     add(ui, "focus-search", |ui| {
         ui.search.grab_focus();
     });
@@ -33,7 +36,6 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     });
     for name in [
         "archive",
-        "reply",
         "reply-all",
         "forward",
         "mark-read",

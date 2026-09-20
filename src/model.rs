@@ -99,7 +99,25 @@ pub struct MessageBody {
     pub text: String,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
+    pub reply_context: ReplyContext,
     pub used_fallback: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplyContext {
+    pub from: Vec<ReplyAddress>,
+    pub reply_to: Vec<ReplyAddress>,
+    pub to: Vec<ReplyAddress>,
+    pub cc: Vec<ReplyAddress>,
+    pub message_id: Option<String>,
+    pub references: Vec<String>,
+    pub sent_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplyAddress {
+    pub name: Option<String>,
+    pub email: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

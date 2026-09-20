@@ -1,6 +1,6 @@
 # Whitford
 
-Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores the refresh token in Freedesktop Secret Service, and quickly synchronizes 50, 100, 250, or 500 lightweight INBOX summaries. A complete message is fetched only when you open it, then saved privately for offline reading. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, and a separate attachment-save interface are deliberately unavailable.
+Whitford is a lightweight native Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores the refresh token in Freedesktop Secret Service, and quickly synchronizes 50, 100, 250, or 500 lightweight INBOX summaries. A complete message is fetched only when you open it, then saved privately for offline reading. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Plain-text replies are supported through Gmail SMTP. New-message composition, reply-all, forwarding, attachments, archive, delete, labels, read/star changes, additional folders, and a separate attachment-save interface are deliberately unavailable.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ Whitford is a native, read-only Gmail developer preview for Wayland. It authoriz
 - WebKitGTK 6.0 development files
 - A Wayland session
 - A session-bus Secret Service provider such as GNOME Keyring, KWallet, or KeePassXC
-- Network access to Google OAuth, userinfo, and `imap.gmail.com:993`
+- Network access to Google OAuth, userinfo, `imap.gmail.com:993`, and `smtp.gmail.com:465`
 
 On Arch Linux:
 
@@ -25,7 +25,7 @@ Native development is the golden path. Set up a local OAuth client as follows:
 2. [Enable the Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com) in that project. Google's [Gmail quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python) also documents the enable/consent/client sequence.
 3. In Google Auth Platform, configure Branding and Audience. Choose **External → Testing** for a personal Gmail account, or **Internal** only when the project belongs to a Google Workspace organization and all users are inside that organization.
 4. For External Testing, add the Gmail account you will connect under **Audience → Test users**. Google documents the audience and testing rules in [Manage App Audience](https://support.google.com/cloud/answer/15549945).
-5. Under Data Access, add exactly `https://mail.google.com/`, `openid`, and `email`. Gmail IMAP requires the broad [`https://mail.google.com/` scope](https://developers.google.com/identity/protocols/oauth2/scopes), which Google describes as full mail access. Whitford's implementation is nevertheless read-only: it uses `EXAMINE`, UID search, and bounded `BODY.PEEK`, and all mutation UI is disabled.
+5. Under Data Access, add exactly `https://mail.google.com/`, `openid`, and `email`. Gmail IMAP and SMTP OAuth require the broad [`https://mail.google.com/` scope](https://developers.google.com/identity/protocols/oauth2/scopes), which Google describes as full mail access. Whitford reads with `EXAMINE`, UID search, and bounded `BODY.PEEK`; its only server mutation is sending an explicit reply.
 6. Under Clients, create an OAuth 2.0 client with application type **Desktop app**. Download its JSON. Do not create or download a Web application client.
 7. Install the downloaded file for a native run. Replace `/path/to/downloaded-client.json` with the real download path:
 
@@ -87,19 +87,20 @@ Mail mutation shortcuts are intentionally absent.
 
 Use a non-production test mailbox and record each result without copying credentials or message content:
 
-1. Move `google-oauth.json` aside, start the native app, and confirm onboarding names the missing file, resolved path, project/API/test-user requirements, broad scope, and read-only limitation. Restore it with the `install -Dm600` command above.
+1. Move `google-oauth.json` aside, start the native app, and confirm onboarding names the missing file, resolved path, project/API/test-user requirements, broad scope, and reply-only sending limitation. Restore it with the `install -Dm600` command above.
 2. Run `GDK_BACKEND=wayland cargo run`, connect, complete consent, and confirm the configured number of summaries appears without downloading every body.
 3. Open a plain-text message and an HTML-only or multipart message. Confirm a loading state appears, the complete body renders, HTML typography and layout appear inside the reader, remote images start blocked, **Load images** affects only that message, external links open only after a click, and attachment/fallback copy remains honest.
 4. Reopen the same message and restart Whitford; confirm its downloaded body is reused without another network fetch while summary sync continues independently.
-5. Choose **Refresh** and confirm the displayed last-successful-sync time changes. At narrow width (about 600 px), confirm status/recovery banners remain visible above both the list and reader.
-6. Temporarily disconnect the network, choose **Refresh**, and confirm retained mail stays visible under an offline/stale banner with the real last sync and **Retry**. Restore the network and retry.
-7. Revoke Whitford from [Google Account third-party connections](https://myaccount.google.com/connections), refresh, and confirm stale mail remains visible with **Reconnect** rather than a retry loop.
-8. During a new authorization, exercise **Cancel** and **Reopen Browser**. Confirm an old or timed-out browser callback cannot change the current session.
-9. With a suitable test mailbox, confirm empty INBOX and malformed messages show human-readable states and zero fallback/skipped counters are hidden.
-10. Change **Keep summaries** among 50, 100, 250, and 500. Raising it should immediately refresh; lowering it should prune summaries and orphaned bodies. Restart and confirm the choice persists.
-11. Note the displayed downloaded-body count and disk usage, choose **Clear Cache**, and confirm summaries remain while the open body returns to an unloaded state. Reopen it deliberately to download again.
-12. Choose **Disconnect**, verify the confirmation copy, and confirm success clears summaries and bodies. A forced/unavailable cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
-13. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
+5. Choose **Reply**, confirm the fixed recipient and subject, type a plain-text response, and send it with the button and with Ctrl+Enter. Confirm Escape/Cancel/window close protect a dirty draft, a send error retains it, and success closes it exactly once. Verify the received reply remains in the original Gmail thread.
+6. Choose **Refresh** and confirm the displayed last-successful-sync time changes. At narrow width (about 600 px), confirm status/recovery banners remain visible above both the list and reader.
+7. Temporarily disconnect the network, choose **Refresh**, and confirm retained mail stays visible under an offline/stale banner with the real last sync and **Retry**. Restore the network and retry.
+8. Revoke Whitford from [Google Account third-party connections](https://myaccount.google.com/connections), refresh, and confirm stale mail remains visible with **Reconnect** rather than a retry loop.
+9. During a new authorization, exercise **Cancel** and **Reopen Browser**. Confirm an old or timed-out browser callback cannot change the current session.
+10. With a suitable test mailbox, confirm empty INBOX and malformed messages show human-readable states and zero fallback/skipped counters are hidden.
+11. Change **Keep summaries** among 50, 100, 250, and 500. Raising it should immediately refresh; lowering it should prune summaries and orphaned bodies. Restart and confirm the choice persists.
+12. Note the displayed downloaded-body count and disk usage, choose **Clear Cache**, and confirm summaries remain while the open body returns to an unloaded state. Reopen it deliberately to download again.
+13. Choose **Disconnect**, verify the confirmation copy, and confirm success clears summaries and bodies. A forced/unavailable cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
+14. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
 
 ## Logging
 

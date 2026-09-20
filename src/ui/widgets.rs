@@ -99,7 +99,7 @@ pub(super) fn status_panel(status: ViewStatus) -> gtk::Box {
         ViewStatus::Disconnected => (
             "network-offline-symbolic",
             "Connect Gmail",
-            "Developer preview: add your OAuth client, then connect. Gmail grants its broad IMAP scope; Whitford remains read-only.",
+            "Developer preview: add your OAuth client, then connect. Whitford uses Gmail’s broad mail scope for reading and explicit replies.",
         ),
         ViewStatus::Loading => (
             "content-loading-symbolic",

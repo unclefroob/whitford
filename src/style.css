@@ -31,6 +31,13 @@
   color: white;
 }
 
+.whitford-composer-body {
+  border: 1px solid @whitford_border;
+  border-radius: 8px;
+  background-color: @whitford_surface_2;
+  color: @whitford_text;
+}
+
 .whitford-folder-list,
 .whitford-message-list,
 .whitford-reader {
