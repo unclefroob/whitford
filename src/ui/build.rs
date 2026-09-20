@@ -34,7 +34,7 @@ pub(super) fn build(
 
     let list_menu = sidebar_button();
     let reader_menu = sidebar_button();
-    let (folder_pane, sync_title, sync_detail) = build_folder_pane(&folders);
+    let (folder_pane, sync_title, sync_detail, cache_limit) = build_folder_pane(&folders);
     let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &search, &list_menu);
     let (reader_page, reader, reader_banner) = build_reader_page(&reader_menu);
@@ -95,6 +95,7 @@ pub(super) fn build(
         toast_overlay,
         sync_title,
         sync_detail,
+        cache_limit,
         filter_buttons,
         worker,
         authorization,
@@ -119,9 +120,20 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         });
     }
+    ui.cache_limit.connect_selected_notify({
+        let weak_ui = ui.downgrade();
+        move |dropdown| {
+            if let Some(ui) = weak_ui.upgrade()
+                && let Some(limit) = crate::cache::limit_at(dropdown.selected())
+                && ui.state.borrow().snapshot().cache_limit != limit
+            {
+                ui.dispatch(Action::SetCacheLimit(limit));
+            }
+        }
+    });
 }
 
-fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Label) {
+fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Label, gtk::DropDown) {
     let pane = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["whitford-folder-pane"])
@@ -210,6 +222,30 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .vexpand(true)
         .child(folders)
         .build();
+    let cache_limit = gtk::DropDown::from_strings(&[
+        "50 messages",
+        "100 messages",
+        "250 messages",
+        "500 messages",
+    ]);
+    cache_limit.update_property(&[gtk::accessible::Property::Label(
+        "Number of messages to keep locally",
+    )]);
+    let cache_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(12)
+        .build();
+    cache_row.append(
+        &gtk::Label::builder()
+            .label("Keep locally")
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    cache_row.append(&cache_limit);
     let sync = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_start(24)
@@ -238,8 +274,9 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
     pane.append(&account_actions);
     pane.append(&recovery_actions);
     pane.append(&scroll);
+    pane.append(&cache_row);
     pane.append(&sync);
-    (pane, sync_title, sync_detail)
+    (pane, sync_title, sync_detail, cache_limit)
 }
 
 fn build_message_page(

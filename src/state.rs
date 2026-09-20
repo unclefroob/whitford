@@ -1,4 +1,5 @@
 use crate::{
+    cache,
     model::{AccountIdentity, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, Message, MessageId},
     worker::{
         FailureKind, OperationId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
@@ -17,6 +18,7 @@ pub struct AppState {
     search_query: String,
     message_filter: MessageFilter,
     recovery: Option<RecoveryAction>,
+    cache_limit: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryAction {
@@ -67,6 +69,7 @@ pub enum Action {
     SelectMessage(MessageId),
     SetSearch(String),
     SetFilter(MessageFilter),
+    SetCacheLimit(usize),
     SelectNext,
     SelectPrevious,
     BrowserLaunchFailed(OperationId),
@@ -104,6 +107,7 @@ pub struct ViewSnapshot {
     pub can_reopen: bool,
     pub can_cancel: bool,
     pub can_retry: bool,
+    pub cache_limit: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EscapeContext {
@@ -147,6 +151,7 @@ impl AppState {
             search_query: String::new(),
             message_filter: MessageFilter::All,
             recovery: None,
+            cache_limit: cache::load_limit(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -243,6 +248,7 @@ impl AppState {
                 self.normalize();
                 Update::default()
             }
+            Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::SelectNext => {
                 self.move_selection(1);
                 Update::default()
@@ -316,6 +322,7 @@ impl AppState {
             WorkerEvent::Phase { id, .. }
             | WorkerEvent::AuthorizationRequired { id, .. }
             | WorkerEvent::AccountPersisted { id, .. }
+            | WorkerEvent::CacheLoaded { id, .. }
             | WorkerEvent::NoStoredAccount { id }
             | WorkerEvent::SyncComplete { id, .. }
             | WorkerEvent::Disconnected { id }
@@ -352,6 +359,14 @@ impl AppState {
                     kind: SyncKind::Connect,
                     phase: WorkerPhase::ConnectingImap,
                 };
+                Update::default()
+            }
+            WorkerEvent::CacheLoaded {
+                account, snapshot, ..
+            } => {
+                self.account = Some(account);
+                self.mailbox = Some(snapshot);
+                self.normalize();
                 Update::default()
             }
             WorkerEvent::Cancelled { .. }
@@ -514,6 +529,7 @@ impl AppState {
                 | SessionState::ServiceError { failure } => failure.retryable,
                 _ => false,
             },
+            cache_limit: self.cache_limit,
         }
     }
     pub fn selected_message_id(&self) -> Option<MessageId> {
@@ -572,6 +588,21 @@ impl AppState {
                 feedback: Some("Message is unavailable"),
                 ..Default::default()
             }
+        }
+    }
+    fn set_cache_limit(&mut self, limit: usize) -> Update {
+        if !cache::is_valid_limit(limit) || self.cache_limit == limit {
+            return Update::default();
+        }
+        self.cache_limit = limit;
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.messages.truncate(limit);
+            mailbox.metadata.loaded_count = mailbox.messages.len();
+        }
+        self.normalize();
+        Update {
+            feedback: Some("Local mail limit updated"),
+            effects: vec![Effect::SendWorker(WorkerCommand::SetCacheLimit { limit })],
         }
     }
     fn normalize(&mut self) {

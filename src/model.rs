@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum FolderId {
     Inbox,
 }
@@ -8,7 +9,7 @@ impl FolderId {
     pub const INBOX: Self = Self::Inbox;
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct MessageId(pub String);
 impl MessageId {
     pub fn gmail(uid_validity: u32, uid: u32) -> Self {
@@ -39,14 +40,14 @@ pub const INBOX_FOLDER: Folder = Folder {
     icon: "mail-unread-symbolic",
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Attachment {
     pub name: String,
     pub media_type: Option<String>,
     pub octets: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Message {
     pub id: MessageId,
     pub folder_id: FolderId,

@@ -33,6 +33,7 @@ pub struct Ui {
     pub(crate) toast_overlay: adw::ToastOverlay,
     pub(crate) sync_title: gtk::Label,
     pub(crate) sync_detail: gtk::Label,
+    pub(crate) cache_limit: gtk::DropDown,
     pub(crate) filter_buttons: Vec<(MessageFilter, gtk::Button)>,
     pub(crate) worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     pub(crate) authorization: Rc<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
@@ -53,6 +54,7 @@ pub(crate) struct WeakUi {
     toast_overlay: gtk::glib::WeakRef<adw::ToastOverlay>,
     sync_title: gtk::glib::WeakRef<gtk::Label>,
     sync_detail: gtk::glib::WeakRef<gtk::Label>,
+    cache_limit: gtk::glib::WeakRef<gtk::DropDown>,
     filter_buttons: Vec<(MessageFilter, gtk::glib::WeakRef<gtk::Button>)>,
     worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     authorization: Weak<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
@@ -102,6 +104,7 @@ impl Ui {
             toast_overlay: self.toast_overlay.downgrade(),
             sync_title: self.sync_title.downgrade(),
             sync_detail: self.sync_detail.downgrade(),
+            cache_limit: self.cache_limit.downgrade(),
             filter_buttons: self
                 .filter_buttons
                 .iter()
@@ -188,7 +191,7 @@ impl Ui {
                 });
             }
             Effect::PresentDisconnectConfirmation => {
-                let dialog = adw::AlertDialog::builder().heading("Disconnect Gmail?").body("This removes Whitford’s saved authorization from Secret Service and clears mail from this session. Revoke Google access separately in your Google Account.").build();
+                let dialog = adw::AlertDialog::builder().heading("Disconnect Gmail?").body("This removes Whitford’s saved authorization from Secret Service and deletes its local mail cache. Revoke Google access separately in your Google Account.").build();
                 dialog.add_response("cancel", "Cancel");
                 dialog.add_response("disconnect", "Disconnect");
                 dialog.set_response_appearance("disconnect", adw::ResponseAppearance::Destructive);
@@ -225,6 +228,7 @@ impl WeakUi {
             toast_overlay: self.toast_overlay.upgrade()?,
             sync_title: self.sync_title.upgrade()?,
             sync_detail: self.sync_detail.upgrade()?,
+            cache_limit: self.cache_limit.upgrade()?,
             filter_buttons: self
                 .filter_buttons
                 .iter()

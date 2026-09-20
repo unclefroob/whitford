@@ -19,6 +19,10 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     if ui.search.text().as_str() != snapshot.search_query {
         ui.search.set_text(&snapshot.search_query);
     }
+    let cache_index = crate::cache::selected_index(snapshot.cache_limit);
+    if ui.cache_limit.selected() != cache_index {
+        ui.cache_limit.set_selected(cache_index);
+    }
     render_folders(ui, snapshot);
     render_filters(ui, snapshot.message_filter);
     render_sync(ui, snapshot);
@@ -498,7 +502,7 @@ fn sync_detail(snapshot: &ViewSnapshot) -> String {
                 |value| format_unix_local(Some(value), now_unix()),
             );
             format!(
-                "Synced {synced} · loaded {} of newest {}",
+                "Synced {synced} · {} cached · newest {} refreshed",
                 meta.loaded_count, meta.requested_limit
             )
         },

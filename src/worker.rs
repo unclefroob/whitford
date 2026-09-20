@@ -1,5 +1,5 @@
 use crate::{
-    config, gmail, message,
+    cache, config, gmail, message,
     model::{AccountIdentity, MailboxSnapshot, SyncMetadata},
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -117,6 +117,7 @@ pub enum WorkerCommand {
     Refresh { id: OperationId },
     Disconnect { id: OperationId },
     Cancel { id: OperationId },
+    SetCacheLimit { limit: usize },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -127,6 +128,10 @@ impl fmt::Debug for WorkerCommand {
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
             Self::Disconnect { id } => f.debug_tuple("Disconnect").field(id).finish(),
             Self::Cancel { id } => f.debug_tuple("Cancel").field(id).finish(),
+            Self::SetCacheLimit { limit } => f
+                .debug_struct("SetCacheLimit")
+                .field("limit", limit)
+                .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -145,6 +150,11 @@ pub enum WorkerEvent {
     AccountPersisted {
         id: OperationId,
         account: AccountIdentity,
+    },
+    CacheLoaded {
+        id: OperationId,
+        account: AccountIdentity,
+        snapshot: MailboxSnapshot,
     },
     NoStoredAccount {
         id: OperationId,
@@ -180,6 +190,11 @@ impl fmt::Debug for WorkerEvent {
             Self::AccountPersisted { id, .. } => {
                 f.debug_struct("AccountPersisted").field("id", id).finish()
             }
+            Self::CacheLoaded { id, snapshot, .. } => f
+                .debug_struct("CacheLoaded")
+                .field("id", id)
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
             Self::NoStoredAccount { id } => {
                 f.debug_struct("NoStoredAccount").field("id", id).finish()
             }
@@ -286,6 +301,10 @@ async fn controller(
             }
             break;
         };
+        if let WorkerCommand::SetCacheLimit { limit } = &command {
+            let _ = cache::save_limit_and_prune(*limit);
+            continue;
+        }
         let cleanup_failed = if let Some(current) = active.take() {
             let Active { task, cleanup, .. } = current;
             abort_with_cleanup(task, &cleanup, async {
@@ -323,7 +342,11 @@ async fn controller(
                     emit_phase(&tx, id, WorkerPhase::Disconnecting);
                     match timeout(KEYRING_TIMEOUT, secrets::delete()).await {
                         Ok(Ok(())) => {
-                            let _ = tx.send(WorkerEvent::Disconnected { id });
+                            if cache::clear_mailbox().is_ok() {
+                                let _ = tx.send(WorkerEvent::Disconnected { id });
+                            } else {
+                                fail_cleanup(&tx, id, true);
+                            }
                         }
                         Ok(Err(_)) | Err(_) => fail_cleanup(&tx, id, true),
                     }
@@ -368,7 +391,9 @@ async fn controller(
                     }
                 })
             }
-            WorkerCommand::Cancel { .. } | WorkerCommand::Shutdown => unreachable!(),
+            WorkerCommand::Cancel { .. }
+            | WorkerCommand::SetCacheLimit { .. }
+            | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
     }
@@ -436,7 +461,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::Refresh { id }
         | WorkerCommand::Disconnect { id }
         | WorkerCommand::Cancel { id } => Some(*id),
-        WorkerCommand::Shutdown => None,
+        WorkerCommand::SetCacheLimit { .. } | WorkerCommand::Shutdown => None,
     }
 }
 
@@ -605,6 +630,13 @@ async fn restore_or_refresh(
         }
         return Err(failure(FailureKind::AuthorizationExpired, false, true));
     };
+    if let Ok(Some((account, snapshot))) = cache::load_latest(cache::load_limit()) {
+        let _ = tx.send(WorkerEvent::CacheLoaded {
+            id,
+            account,
+            snapshot,
+        });
+    }
     emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
     let config = config::load().map_err(|error| map_config(error, true))?;
     let client = oauth::http_client().map_err(map_oauth)?;
@@ -686,7 +718,7 @@ fn complete_sync(
 ) -> Result<(), ServiceFailure> {
     emit_phase(tx, id, WorkerPhase::FetchingInbox);
     let (messages, fallback_count) = message::map_messages(fetched.records);
-    let snapshot = MailboxSnapshot {
+    let fresh = MailboxSnapshot {
         metadata: SyncMetadata {
             completed_at: SystemTime::now(),
             requested_limit: gmail::MESSAGE_LIMIT,
@@ -696,6 +728,8 @@ fn complete_sync(
         },
         messages,
     };
+    let limit = cache::load_limit();
+    let snapshot = cache::merge_and_save(&account, fresh.clone(), limit).unwrap_or(fresh);
     let _ = tx.send(WorkerEvent::SyncComplete {
         id,
         account,

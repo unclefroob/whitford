@@ -1,6 +1,6 @@
 # Whitford
 
-Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores only the refresh token in Freedesktop Secret Service, and displays a bounded snapshot of the newest 50 INBOX messages. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, downloads, and offline disk storage are deliberately unavailable.
+Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores the refresh token in Freedesktop Secret Service, and keeps a private local cache of up to 50, 100, 250, or 500 INBOX messages. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, and downloads are deliberately unavailable.
 
 ## Requirements
 
@@ -66,9 +66,9 @@ cargo build --release
 
 On first connection, Whitford binds a loopback callback, opens the system browser, validates PKCE and state, verifies the returned identity, and saves the refresh token through Secret Service. Access tokens stay in memory. Restart restores the secure authorization and refreshes INBOX without prompting.
 
-Local **Disconnect** removes Whitford's saved authorization and clears session mail only after secure deletion succeeds. It does not revoke Google-side access; use [Google Account third-party connections](https://myaccount.google.com/connections) for revocation.
+Local **Disconnect** removes Whitford's saved authorization and deletes its local mail cache only after cleanup succeeds. It does not revoke Google-side access; use [Google Account third-party connections](https://myaccount.google.com/connections) for revocation.
 
-Search and filters apply only to the loaded newest-50 snapshot. A transient sync error keeps the prior in-process snapshot marked stale. No mail or token cache is written to disk.
+Use **Keep locally** in the folder sidebar to retain up to 50, 100, 250, or 500 messages; the default is 100. Each refresh fetches the newest 50 from Gmail, merges them with older cached messages, and prunes to the chosen limit. Lowering the limit prunes immediately. The cache is stored under `${XDG_CACHE_HOME:-$HOME/.cache}/whitford/` with private directory and file permissions; preferences live under `${XDG_CONFIG_HOME:-$HOME/.config}/whitford/`. Search and filters apply to this loaded cache. A transient sync error keeps cached mail visible and marks it stale.
 
 ## Shortcuts
 
@@ -88,14 +88,15 @@ Use a non-production test mailbox and record each result without copying credent
 1. Move `google-oauth.json` aside, start the native app, and confirm onboarding names the missing file, resolved path, project/API/test-user requirements, broad scope, and read-only limitation. Restore it with the `install -Dm600` command above.
 2. Run `GDK_BACKEND=wayland cargo run`, connect, complete consent, and confirm the verified account plus newest-50 metadata appear.
 3. Open a plain-text message and an HTML-only or multipart message. Confirm the complete body renders, HTML typography and layout appear inside the reader, remote images start blocked, **Load images** affects only that message, external links open only after a click, and attachment/fallback copy remains honest.
-4. Restart Whitford and confirm Secret Service restores the authorization without another browser prompt.
+4. Restart Whitford and confirm Secret Service restores the authorization without another browser prompt and cached mail appears while the fresh sync runs.
 5. Choose **Refresh** and confirm the displayed last-successful-sync time changes. At narrow width (about 600 px), confirm status/recovery banners remain visible above both the list and reader.
 6. Temporarily disconnect the network, choose **Refresh**, and confirm retained mail stays visible under an offline/stale banner with the real last sync and **Retry**. Restore the network and retry.
 7. Revoke Whitford from [Google Account third-party connections](https://myaccount.google.com/connections), refresh, and confirm stale mail remains visible with **Reconnect** rather than a retry loop.
 8. During a new authorization, exercise **Cancel** and **Reopen Browser**. Confirm an old or timed-out browser callback cannot change the current session.
 9. With a suitable test mailbox, confirm empty INBOX and malformed messages show human-readable states and zero fallback/skipped counters are hidden.
-10. Choose **Disconnect**, verify the confirmation copy, and confirm success clears mail. A forced/unavailable Secret Service cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
-11. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
+10. Change **Keep locally** among 50, 100, 250, and 500, restart, and confirm the choice persists. Lower it and confirm the visible/cache count is pruned immediately.
+11. Choose **Disconnect**, verify the confirmation copy, and confirm success clears mail and deletes the local cache. A forced/unavailable cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
+12. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
 
 ## Logging
 
