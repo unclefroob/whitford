@@ -131,7 +131,6 @@ fn document(initial_json: &str, nonce: &str) -> String {
 <style>:root{{color-scheme:light dark}}html,body{{min-height:100%;margin:0;background:transparent;color:#2e3436;font:15px system-ui}}#editor{{box-sizing:border-box;min-height:250px;padding:14px;outline:none;line-height:1.5;caret-color:currentColor}}blockquote{{border-left:3px solid #7b8490;margin-left:8px;padding-left:12px;color:#5e6670}}a{{color:#1c71d8}}img{{max-width:100%;height:auto}}@media(prefers-color-scheme:dark){{html,body{{color:#f6f5f4}}blockquote{{color:#b6bbc0}}a{{color:#62a0ea}}}}</style></head>
 <body><div id="editor" contenteditable="true" role="textbox" aria-label="Message body" aria-multiline="true"></div><script nonce="{nonce}">
 const editor=document.getElementById('editor'); editor.innerHTML={initial_json}; let timer;
-const initialQuote=editor.querySelector('blockquote');if(initialQuote)initialQuote.hidden=true;
 const MAX_HTML={MAX_HTML_BYTES};
 function snapshot(){{let html=editor.innerHTML;if(new TextEncoder().encode(html).length>MAX_HTML)return null;return [html,editor.innerText.slice(0,MAX_HTML)]}}
 function publish(){{clearTimeout(timer);timer=setTimeout(()=>{{const value=snapshot();if(value)window.webkit.messageHandlers.changed.postMessage(JSON.stringify(value))}},500)}}
@@ -142,8 +141,8 @@ window.whitfordSnapshot=()=>snapshot()||['',''];
 window.whitfordCommand=(cmd,value)=>{{
  editor.focus();
  if(cmd==='promptLink'){{const url=window.prompt('Link address','https://');if(url)document.execCommand('createLink',false,url);publish();return}}
- if(cmd==='toggleQuote'){{const quote=editor.querySelector('blockquote');if(quote)quote.hidden=!quote.hidden;return}}
- if(cmd==='removeQuote'){{editor.querySelectorAll('blockquote').forEach(node=>node.remove());publish();return}}
+ if(cmd==='toggleQuote'){{const quote=editor.querySelector('.whitford-quote');const intro=editor.querySelector('.whitford-quote-intro');if(quote){{const hidden=!quote.hidden;quote.hidden=hidden;if(intro)intro.hidden=hidden}}return}}
+ if(cmd==='removeQuote'){{editor.querySelectorAll('.whitford-quote,.whitford-quote-intro').forEach(node=>node.remove());publish();return}}
  if(cmd==='insertCid'){{const img=document.createElement('img');img.src='cid:'+value;img.dataset.whitfordCid=value;editor.prepend(img);publish();return}}
  if(cmd==='removeCid'){{editor.querySelectorAll('img').forEach(img=>{{if(img.getAttribute('src')==='cid:'+value)img.remove()}});publish();return}}
  if(cmd==='promptSignature'){{const signature=window.prompt('Signature text','');if(signature)document.execCommand('insertText',false,'\n'+signature);publish();return}}
@@ -191,5 +190,16 @@ mod tests {
         assert!(html.contains("prefers-color-scheme:dark"));
         assert!(html.contains("color:#f6f5f4"));
         assert!(html.contains("caret-color:currentColor"));
+    }
+
+    #[test]
+    fn original_message_is_visible_until_the_user_collapses_it() {
+        let html = document(
+            "\"<blockquote class='whitford-quote'>Original</blockquote>\"",
+            "test-nonce",
+        );
+        assert!(!html.contains("initialQuote.hidden=true"));
+        assert!(html.contains("quote.hidden=hidden"));
+        assert!(html.contains("intro.hidden=hidden"));
     }
 }
