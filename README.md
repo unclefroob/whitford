@@ -1,6 +1,6 @@
 # Whitford
 
-Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores the refresh token in Freedesktop Secret Service, and keeps a private local cache of up to 50, 100, 250, or 500 INBOX messages. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, and downloads are deliberately unavailable.
+Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores the refresh token in Freedesktop Secret Service, and quickly synchronizes 50, 100, 250, or 500 lightweight INBOX summaries. A complete message is fetched only when you open it, then saved privately for offline reading. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, and a separate attachment-save interface are deliberately unavailable.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ Native development is the golden path. Set up a local OAuth client as follows:
    ```
 
    The check should show mode `600`, your user, and the resolved path. **Never copy `google-oauth.json` into this repository or any other source tree.** Whitford validates the project, Desktop-client shape, size, and Google endpoints without displaying credential values.
-8. Start Whitford with `GDK_BACKEND=wayland cargo run`, choose **Connect Gmail**, select the configured test user, review the three scopes, and approve consent. The browser returns to a loopback address; Whitford then verifies the identity, stores only the refresh token in Secret Service, and loads up to 50 newest INBOX messages.
+8. Start Whitford with `GDK_BACKEND=wayland cargo run`, choose **Connect Gmail**, select the configured test user, review the three scopes, and approve consent. The browser returns to a loopback address; Whitford then verifies the identity, stores only the refresh token in Secret Service, and loads the configured number of newest INBOX summaries.
 
 External apps left in **Testing** issue authorizations—and offline refresh tokens for these non-identity scopes—that expire after seven days. This is expected developer-preview behavior: choose **Reconnect** and complete consent again. Internal audience behavior depends on the Workspace organization policy.
 
@@ -68,7 +68,9 @@ On first connection, Whitford binds a loopback callback, opens the system browse
 
 Local **Disconnect** removes Whitford's saved authorization and deletes its local mail cache only after cleanup succeeds. It does not revoke Google-side access; use [Google Account third-party connections](https://myaccount.google.com/connections) for revocation.
 
-Use **Keep locally** in the folder sidebar to retain up to 50, 100, 250, or 500 messages; the default is 100. Each refresh fetches the newest 50 from Gmail, merges them with older cached messages, and prunes to the chosen limit. Lowering the limit prunes immediately. The cache is stored under `${XDG_CACHE_HOME:-$HOME/.cache}/whitford/` with private directory and file permissions; preferences live under `${XDG_CONFIG_HOME:-$HOME/.config}/whitford/`. Search and filters apply to this loaded cache. A transient sync error keeps cached mail visible and marks it stale.
+Use **Keep summaries** in the folder sidebar to synchronize the newest 50, 100, 250, or 500 messages; the default is 100. Summary sync transfers bounded headers and MIME structure, not message bodies or attachment payloads. Opening a message downloads its complete RFC 5322 content without marking it read, including any MIME attachment payloads in that message, caches the readable body, and reuses it on later opens and restarts. Search covers sender and subject; attachment filtering comes from MIME structure without downloading attachment payloads during list sync.
+
+The cache is stored under `${XDG_CACHE_HOME:-$HOME/.cache}/whitford/` with directory mode `700` and file mode `600`; preferences live under `${XDG_CONFIG_HOME:-$HOME/.config}/whitford/`. Opened bodies are stored separately with a 128 MiB least-recently-used budget and are never truncated to fit it. **Clear Cache** removes downloaded bodies while preserving summaries, authorization, and the retention preference. **Disconnect** removes authorization, summaries, and bodies. A transient sync error keeps cached summaries and downloaded bodies visible and marks them stale.
 
 ## Shortcuts
 
@@ -86,17 +88,18 @@ Mail mutation shortcuts are intentionally absent.
 Use a non-production test mailbox and record each result without copying credentials or message content:
 
 1. Move `google-oauth.json` aside, start the native app, and confirm onboarding names the missing file, resolved path, project/API/test-user requirements, broad scope, and read-only limitation. Restore it with the `install -Dm600` command above.
-2. Run `GDK_BACKEND=wayland cargo run`, connect, complete consent, and confirm the verified account plus newest-50 metadata appear.
-3. Open a plain-text message and an HTML-only or multipart message. Confirm the complete body renders, HTML typography and layout appear inside the reader, remote images start blocked, **Load images** affects only that message, external links open only after a click, and attachment/fallback copy remains honest.
-4. Restart Whitford and confirm Secret Service restores the authorization without another browser prompt and cached mail appears while the fresh sync runs.
+2. Run `GDK_BACKEND=wayland cargo run`, connect, complete consent, and confirm the configured number of summaries appears without downloading every body.
+3. Open a plain-text message and an HTML-only or multipart message. Confirm a loading state appears, the complete body renders, HTML typography and layout appear inside the reader, remote images start blocked, **Load images** affects only that message, external links open only after a click, and attachment/fallback copy remains honest.
+4. Reopen the same message and restart Whitford; confirm its downloaded body is reused without another network fetch while summary sync continues independently.
 5. Choose **Refresh** and confirm the displayed last-successful-sync time changes. At narrow width (about 600 px), confirm status/recovery banners remain visible above both the list and reader.
 6. Temporarily disconnect the network, choose **Refresh**, and confirm retained mail stays visible under an offline/stale banner with the real last sync and **Retry**. Restore the network and retry.
 7. Revoke Whitford from [Google Account third-party connections](https://myaccount.google.com/connections), refresh, and confirm stale mail remains visible with **Reconnect** rather than a retry loop.
 8. During a new authorization, exercise **Cancel** and **Reopen Browser**. Confirm an old or timed-out browser callback cannot change the current session.
 9. With a suitable test mailbox, confirm empty INBOX and malformed messages show human-readable states and zero fallback/skipped counters are hidden.
-10. Change **Keep locally** among 50, 100, 250, and 500, restart, and confirm the choice persists. Lower it and confirm the visible/cache count is pruned immediately.
-11. Choose **Disconnect**, verify the confirmation copy, and confirm success clears mail and deletes the local cache. A forced/unavailable cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
-12. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
+10. Change **Keep summaries** among 50, 100, 250, and 500. Raising it should immediately refresh; lowering it should prune summaries and orphaned bodies. Restart and confirm the choice persists.
+11. Note the displayed downloaded-body count and disk usage, choose **Clear Cache**, and confirm summaries remain while the open body returns to an unloaded state. Reopen it deliberately to download again.
+12. Choose **Disconnect**, verify the confirmation copy, and confirm success clears summaries and bodies. A forced/unavailable cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
+13. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
 
 ## Logging
 

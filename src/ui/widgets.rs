@@ -2,12 +2,12 @@ use adw::prelude::*;
 
 use super::time::format_unix_local;
 use crate::{
-    model::{Attachment, Message},
+    model::{Attachment, MessageSummary},
     state::ViewStatus,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) fn message_row(message: &Message, selected: bool) -> gtk::Button {
+pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Button {
     let row = gtk::Button::builder()
         .has_frame(false)
         .css_classes(["whitford-message-row"])
@@ -56,10 +56,6 @@ pub(super) fn message_row(message: &Message, selected: bool) -> gtk::Button {
     );
     copy.append(&top);
     copy.append(&ellipsized(&message.subject, message.unread));
-    copy.append(&ellipsized(
-        message.preview.as_deref().unwrap_or("No preview available"),
-        false,
-    ));
     line.append(&avatar);
     line.append(&copy);
     if message.starred {
@@ -76,7 +72,7 @@ pub(super) fn message_row(message: &Message, selected: bool) -> gtk::Button {
     if message.starred {
         traits.push("starred");
     }
-    if !message.attachments.is_empty() {
+    if message.attachment_state.has_attachments() {
         traits.push("has attachments");
     }
     let traits = if traits.is_empty() {
@@ -123,7 +119,7 @@ pub(super) fn status_panel(status: ViewStatus) -> gtk::Box {
         ViewStatus::EmptyInbox => (
             "mail-read-symbolic",
             "Nothing here",
-            "No messages were returned in the newest 50.",
+            "No messages were returned in the configured summary window.",
         ),
         ViewStatus::NoSearchResults => (
             "system-search-symbolic",
@@ -203,7 +199,7 @@ pub(super) fn onboarding_panel(path: Option<&str>, is_flatpak: bool) -> gtk::Box
         "In Google Cloud project whitford-email, enable Gmail API, configure the consent audience, and add this Gmail account as a test user.",
         "Download a Desktop app credential, name it google-oauth.json, and install it at:",
         resolved,
-        "Google requires https://mail.google.com/ for IMAP, plus openid and email. That scope is broad, but this preview only reads the newest 50 INBOX messages.",
+        "Google requires https://mail.google.com/ for IMAP, plus openid and email. That scope is broad, but this preview only reads the configured number of newest INBOX messages.",
     ] {
         panel.append(
             &gtk::Label::builder()

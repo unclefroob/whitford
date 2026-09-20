@@ -1,11 +1,15 @@
 use crate::{
     cache,
-    model::{AccountIdentity, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, Message, MessageId},
+    model::{
+        AccountIdentity, CacheUsage, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, MessageBody,
+        MessageId, MessageSummary,
+    },
     worker::{
-        FailureKind, OperationId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+        BodyFailure, BodyRequestId, CacheOperationId, FailureKind, OperationId, ServiceFailure,
+        SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
-use std::time::SystemTime;
+use std::{sync::Arc, time::SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -19,6 +23,13 @@ pub struct AppState {
     message_filter: MessageFilter,
     recovery: Option<RecoveryAction>,
     cache_limit: usize,
+    next_body_request: u64,
+    cache_generation: u64,
+    pending_cache_clear: Option<CacheOperationId>,
+    reader: ReaderState,
+    cache_usage: CacheUsage,
+    list_revision: u64,
+    reader_revision: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryAction {
@@ -43,6 +54,23 @@ pub enum MessageFilter {
     All,
     Unread,
     Attachments,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReaderState {
+    Closed,
+    Loading {
+        id: MessageId,
+        request_id: BodyRequestId,
+        generation: u64,
+    },
+    Loaded {
+        id: MessageId,
+        body: Arc<MessageBody>,
+    },
+    Failed {
+        id: MessageId,
+        failure: BodyFailure,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewStatus {
@@ -70,6 +98,9 @@ pub enum Action {
     SetSearch(String),
     SetFilter(MessageFilter),
     SetCacheLimit(usize),
+    RetryBody,
+    RequestClearCache,
+    ConfirmClearCache,
     SelectNext,
     SelectPrevious,
     BrowserLaunchFailed(OperationId),
@@ -82,6 +113,7 @@ pub enum Effect {
     LaunchAuthorization { id: OperationId },
     ClearAuthorization { id: OperationId },
     PresentDisconnectConfirmation,
+    PresentClearCacheConfirmation,
 }
 #[derive(Default, Debug)]
 pub struct Update {
@@ -91,8 +123,8 @@ pub struct Update {
 #[derive(Clone, Debug)]
 pub struct ViewSnapshot {
     pub folders: Vec<Folder>,
-    pub visible_messages: Vec<Message>,
-    pub selected_message: Option<Message>,
+    pub visible_messages: Vec<MessageSummary>,
+    pub selected_message: Option<MessageSummary>,
     pub selected_folder_id: FolderId,
     pub search_query: String,
     pub message_filter: MessageFilter,
@@ -108,6 +140,10 @@ pub struct ViewSnapshot {
     pub can_cancel: bool,
     pub can_retry: bool,
     pub cache_limit: usize,
+    pub reader: ReaderState,
+    pub cache_usage: CacheUsage,
+    pub list_revision: u64,
+    pub reader_revision: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EscapeContext {
@@ -152,6 +188,13 @@ impl AppState {
             message_filter: MessageFilter::All,
             recovery: None,
             cache_limit: cache::load_limit(),
+            next_body_request: 1,
+            cache_generation: 0,
+            pending_cache_clear: None,
+            reader: ReaderState::Closed,
+            cache_usage: CacheUsage::default(),
+            list_revision: 1,
+            reader_revision: 1,
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -218,6 +261,13 @@ impl AppState {
             Action::WorkerUnavailable => {
                 self.active_operation = None;
                 self.recovery = None;
+                if let ReaderState::Loading { id, .. } = &self.reader {
+                    self.reader = ReaderState::Failed {
+                        id: id.clone(),
+                        failure: BodyFailure::Offline,
+                    };
+                    self.bump_reader();
+                }
                 let failure = ServiceFailure {
                     kind: FailureKind::WorkerUnavailable,
                     retryable: false,
@@ -241,22 +291,24 @@ impl AppState {
             Action::SetSearch(query) => {
                 self.search_query = query.trim().to_owned();
                 self.normalize();
+                self.bump_list();
                 Update::default()
             }
             Action::SetFilter(filter) => {
                 self.message_filter = filter;
                 self.normalize();
+                self.bump_list();
                 Update::default()
             }
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
-            Action::SelectNext => {
-                self.move_selection(1);
-                Update::default()
-            }
-            Action::SelectPrevious => {
-                self.move_selection(-1);
-                Update::default()
-            }
+            Action::RetryBody => self.retry_body(),
+            Action::RequestClearCache => Update {
+                effects: vec![Effect::PresentClearCacheConfirmation],
+                ..Default::default()
+            },
+            Action::ConfirmClearCache => self.clear_body_cache(),
+            Action::SelectNext => self.move_selection(1),
+            Action::SelectPrevious => self.move_selection(-1),
         }
     }
     fn start(&mut self, kind: SyncKind) -> Update {
@@ -303,10 +355,16 @@ impl AppState {
         let Some(id) = self.allocate() else {
             return Update::default();
         };
+        self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.reader = ReaderState::Closed;
+        self.bump_reader();
         self.session = SessionState::Disconnecting;
         self.recovery = Some(RecoveryAction::Disconnect);
         Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::Disconnect { id })],
+            effects: vec![Effect::SendWorker(WorkerCommand::Disconnect {
+                id,
+                generation: self.cache_generation,
+            })],
             ..Default::default()
         }
     }
@@ -318,6 +376,106 @@ impl AppState {
         Some(id)
     }
     fn worker_event(&mut self, event: WorkerEvent) -> Update {
+        match event {
+            WorkerEvent::BodyLoaded {
+                request_id,
+                generation,
+                message_id,
+                body,
+                usage,
+                saved,
+            } => {
+                let matches = matches!(
+                    &self.reader,
+                    ReaderState::Loading { id, request_id: current, generation: current_generation }
+                        if id == &message_id && *current == request_id && *current_generation == generation
+                );
+                if matches && generation == self.cache_generation {
+                    self.reader = ReaderState::Loaded {
+                        id: message_id,
+                        body,
+                    };
+                    self.cache_usage = usage;
+                    self.bump_reader();
+                    return Update {
+                        feedback: (!saved)
+                            .then_some("Message loaded but could not be saved offline"),
+                        ..Default::default()
+                    };
+                }
+                Update::default()
+            }
+            WorkerEvent::BodyFailed {
+                request_id,
+                generation,
+                message_id,
+                failure,
+            } => {
+                let matches = matches!(
+                    &self.reader,
+                    ReaderState::Loading { id, request_id: current, generation: current_generation }
+                        if id == &message_id && *current == request_id && *current_generation == generation
+                );
+                if matches && generation == self.cache_generation {
+                    let failure = if failure == BodyFailure::AuthorizationRequired
+                        && matches!(self.session, SessionState::Offline { .. })
+                    {
+                        BodyFailure::Offline
+                    } else {
+                        failure
+                    };
+                    self.reader = ReaderState::Failed {
+                        id: message_id,
+                        failure,
+                    };
+                    self.bump_reader();
+                }
+                Update::default()
+            }
+            WorkerEvent::CacheCleared {
+                operation_id,
+                generation,
+                reclaimed_bytes: _,
+                usage,
+            } => {
+                if self.pending_cache_clear == Some(operation_id)
+                    && self.cache_generation == generation
+                {
+                    self.pending_cache_clear = None;
+                    self.cache_usage = usage;
+                    self.reader = ReaderState::Closed;
+                    self.bump_reader();
+                    return Update {
+                        feedback: Some("Downloaded message bodies cleared"),
+                        ..Default::default()
+                    };
+                }
+                Update::default()
+            }
+            WorkerEvent::CacheClearFailed {
+                operation_id,
+                generation,
+            } => {
+                if self.pending_cache_clear == Some(operation_id)
+                    && self.cache_generation == generation
+                {
+                    self.pending_cache_clear = None;
+                    return Update {
+                        feedback: Some("Could not fully clear downloaded messages"),
+                        ..Default::default()
+                    };
+                }
+                Update::default()
+            }
+            WorkerEvent::CacheUsageChanged { usage } => {
+                self.cache_usage = usage;
+                Update::default()
+            }
+            other => self.account_worker_event(other),
+        }
+    }
+
+    fn account_worker_event(&mut self, event: WorkerEvent) -> Update {
         let id = match &event {
             WorkerEvent::Phase { id, .. }
             | WorkerEvent::AuthorizationRequired { id, .. }
@@ -328,6 +486,11 @@ impl AppState {
             | WorkerEvent::Disconnected { id }
             | WorkerEvent::Cancelled { id }
             | WorkerEvent::Failed { id, .. } => *id,
+            WorkerEvent::BodyLoaded { .. }
+            | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::CacheCleared { .. }
+            | WorkerEvent::CacheClearFailed { .. }
+            | WorkerEvent::CacheUsageChanged { .. } => unreachable!(),
         };
         if self.active_operation != Some(id) {
             return Update::default();
@@ -354,6 +517,14 @@ impl AppState {
                 }
             }
             WorkerEvent::AccountPersisted { account, .. } => {
+                if self.account_changed(&account) {
+                    self.mailbox = None;
+                    self.selected_message_id = None;
+                    self.reader = ReaderState::Closed;
+                    self.cache_usage = CacheUsage::default();
+                    self.bump_list();
+                    self.bump_reader();
+                }
                 self.account = Some(account);
                 self.session = SessionState::Syncing {
                     kind: SyncKind::Connect,
@@ -367,6 +538,7 @@ impl AppState {
                 self.account = Some(account);
                 self.mailbox = Some(snapshot);
                 self.normalize();
+                self.bump_list();
                 Update::default()
             }
             WorkerEvent::Cancelled { .. }
@@ -392,12 +564,19 @@ impl AppState {
             WorkerEvent::SyncComplete {
                 account, snapshot, ..
             } => {
+                if self.account_changed(&account) {
+                    self.selected_message_id = None;
+                    self.reader = ReaderState::Closed;
+                    self.cache_usage = CacheUsage::default();
+                    self.bump_reader();
+                }
                 self.account = Some(account);
                 self.mailbox = Some(snapshot);
                 self.session = SessionState::Ready;
                 self.active_operation = None;
                 self.recovery = None;
                 self.normalize();
+                self.bump_list();
                 Update {
                     effects: vec![Effect::ClearAuthorization { id }],
                     ..Default::default()
@@ -410,6 +589,10 @@ impl AppState {
                 self.session = SessionState::Disconnected;
                 self.active_operation = None;
                 self.recovery = None;
+                self.reader = ReaderState::Closed;
+                self.cache_usage = CacheUsage::default();
+                self.bump_list();
+                self.bump_reader();
                 Update::default()
             }
             WorkerEvent::Failed { failure, .. } => {
@@ -448,14 +631,31 @@ impl AppState {
                     ..Default::default()
                 }
             }
+            WorkerEvent::BodyLoaded { .. }
+            | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::CacheCleared { .. }
+            | WorkerEvent::CacheClearFailed { .. }
+            | WorkerEvent::CacheUsageChanged { .. } => unreachable!(),
         }
     }
     pub fn snapshot(&self) -> ViewSnapshot {
-        let visible = self
-            .visible_messages()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        self.snapshot_for_render(true)
+    }
+
+    pub(crate) fn list_revision(&self) -> u64 {
+        self.list_revision
+    }
+
+    pub(crate) fn snapshot_for_render(&self, include_visible_messages: bool) -> ViewSnapshot {
+        let has_visible_messages = self.has_visible_messages();
+        let visible = if include_visible_messages {
+            self.visible_messages()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let status = match self.session {
             SessionState::Disconnected
             | SessionState::AuthRequired { .. }
@@ -481,12 +681,12 @@ impl AppState {
             SessionState::ServiceError { .. } | SessionState::ConfigurationError { .. } => {
                 ViewStatus::Error
             }
-            _ if visible.is_empty()
+            _ if !has_visible_messages
                 && (!self.search_query.is_empty() || self.message_filter != MessageFilter::All) =>
             {
                 ViewStatus::NoSearchResults
             }
-            _ if visible.is_empty() => ViewStatus::EmptyInbox,
+            _ if !has_visible_messages => ViewStatus::EmptyInbox,
             _ => ViewStatus::Ready,
         };
         ViewSnapshot {
@@ -530,12 +730,16 @@ impl AppState {
                 _ => false,
             },
             cache_limit: self.cache_limit,
+            reader: self.reader.clone(),
+            cache_usage: self.cache_usage,
+            list_revision: self.list_revision,
+            reader_revision: self.reader_revision,
         }
     }
     pub fn selected_message_id(&self) -> Option<MessageId> {
         self.selected_message_id.clone()
     }
-    pub fn selected_message(&self) -> Option<&Message> {
+    pub fn selected_message(&self) -> Option<&MessageSummary> {
         let id = self.selected_message_id.as_ref()?;
         self.mailbox
             .as_ref()?
@@ -554,7 +758,7 @@ impl AppState {
             .as_ref()
             .map_or(0, |m| m.messages.iter().filter(|m| m.unread).count())
     }
-    fn visible_messages(&self) -> Vec<&Message> {
+    fn visible_messages(&self) -> Vec<&MessageSummary> {
         let query = self.search_query.to_lowercase();
         self.mailbox
             .as_ref()
@@ -565,24 +769,37 @@ impl AppState {
                     .filter(|m| {
                         (query.is_empty()
                             || m.sender.to_lowercase().contains(&query)
-                            || m.subject.to_lowercase().contains(&query)
-                            || m.preview
-                                .as_ref()
-                                .is_some_and(|p| p.to_lowercase().contains(&query)))
+                            || m.subject.to_lowercase().contains(&query))
                             && match self.message_filter {
                                 MessageFilter::All => true,
                                 MessageFilter::Unread => m.unread,
-                                MessageFilter::Attachments => !m.attachments.is_empty(),
+                                MessageFilter::Attachments => m.attachment_state.has_attachments(),
                             }
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
+    fn has_visible_messages(&self) -> bool {
+        let query = self.search_query.to_lowercase();
+        self.mailbox.as_ref().is_some_and(|mailbox| {
+            mailbox.messages.iter().any(|message| {
+                (query.is_empty()
+                    || message.sender.to_lowercase().contains(&query)
+                    || message.subject.to_lowercase().contains(&query))
+                    && match self.message_filter {
+                        MessageFilter::All => true,
+                        MessageFilter::Unread => message.unread,
+                        MessageFilter::Attachments => message.attachment_state.has_attachments(),
+                    }
+            })
+        })
+    }
     fn select_message(&mut self, id: MessageId) -> Update {
         if self.visible_message_ids().contains(&id) {
             self.selected_message_id = Some(id);
-            Update::default()
+            self.bump_list();
+            self.open_selected()
         } else {
             Update {
                 feedback: Some("Message is unavailable"),
@@ -595,14 +812,26 @@ impl AppState {
             return Update::default();
         }
         self.cache_limit = limit;
+        let increased = limit
+            > self
+                .mailbox
+                .as_ref()
+                .map_or(0, |mailbox| mailbox.metadata.requested_limit);
         if let Some(mailbox) = self.mailbox.as_mut() {
             mailbox.messages.truncate(limit);
+            mailbox.metadata.requested_limit = limit;
             mailbox.metadata.loaded_count = mailbox.messages.len();
         }
         self.normalize();
+        self.bump_list();
+        let mut effects = vec![Effect::SendWorker(WorkerCommand::SetCacheLimit { limit })];
+        if increased && self.account.is_some() {
+            let refresh = self.start(SyncKind::Refresh);
+            effects.extend(refresh.effects);
+        }
         Update {
             feedback: Some("Local mail limit updated"),
-            effects: vec![Effect::SendWorker(WorkerCommand::SetCacheLimit { limit })],
+            effects,
         }
     }
     fn normalize(&mut self) {
@@ -614,11 +843,21 @@ impl AppState {
         {
             self.selected_message_id = visible.first().cloned();
         }
+        let reader_id = match &self.reader {
+            ReaderState::Closed => None,
+            ReaderState::Loading { id, .. }
+            | ReaderState::Loaded { id, .. }
+            | ReaderState::Failed { id, .. } => Some(id),
+        };
+        if reader_id.is_some_and(|id| !visible.contains(id)) {
+            self.reader = ReaderState::Closed;
+            self.bump_reader();
+        }
     }
-    fn move_selection(&mut self, step: isize) {
+    fn move_selection(&mut self, step: isize) -> Update {
         let visible = self.visible_message_ids();
         if visible.is_empty() {
-            return;
+            return Update::default();
         }
         let index = self
             .selected_message_id
@@ -628,6 +867,73 @@ impl AppState {
             .saturating_add_signed(step)
             .min(visible.len() - 1);
         self.selected_message_id = Some(visible[index].clone());
+        self.bump_list();
+        self.open_selected()
+    }
+    fn open_selected(&mut self) -> Update {
+        let Some(id) = self.selected_message_id.clone() else {
+            self.reader = ReaderState::Closed;
+            self.bump_reader();
+            return Update::default();
+        };
+        if matches!(&self.reader, ReaderState::Loaded { id: loaded, .. } if loaded == &id) {
+            return Update::default();
+        }
+        let request_id = BodyRequestId(self.next_body_request);
+        self.next_body_request = self.next_body_request.wrapping_add(1).max(1);
+        self.reader = ReaderState::Loading {
+            id: id.clone(),
+            request_id,
+            generation: self.cache_generation,
+        };
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::FetchBody {
+                request_id,
+                generation: self.cache_generation,
+                account_email: self
+                    .account
+                    .as_ref()
+                    .map(|account| account.email.clone())
+                    .unwrap_or_default(),
+                message_id: id,
+            })],
+            ..Default::default()
+        }
+    }
+    fn retry_body(&mut self) -> Update {
+        if matches!(self.reader, ReaderState::Failed { .. }) {
+            self.open_selected()
+        } else {
+            Update::default()
+        }
+    }
+    fn clear_body_cache(&mut self) -> Update {
+        self.cache_generation = self.cache_generation.wrapping_add(1);
+        let operation_id = CacheOperationId(self.next_body_request);
+        self.next_body_request = self.next_body_request.wrapping_add(1).max(1);
+        self.pending_cache_clear = Some(operation_id);
+        self.reader = ReaderState::Closed;
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::ClearBodyCache {
+                operation_id,
+                generation: self.cache_generation,
+            })],
+            ..Default::default()
+        }
+    }
+    fn bump_list(&mut self) {
+        self.list_revision = self.list_revision.wrapping_add(1);
+    }
+    fn bump_reader(&mut self) {
+        self.reader_revision = self.reader_revision.wrapping_add(1);
+    }
+
+    fn account_changed(&self, account: &AccountIdentity) -> bool {
+        self.account
+            .as_ref()
+            .is_some_and(|current| !current.email.eq_ignore_ascii_case(&account.email))
     }
 }
 

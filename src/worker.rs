@@ -1,16 +1,17 @@
 use crate::{
     cache, config, gmail, message,
-    model::{AccountIdentity, MailboxSnapshot, SyncMetadata},
+    model::{AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, SyncMetadata},
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
 };
+use futures_util::FutureExt;
 
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use std::{
     fmt,
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle as ThreadJoinHandle},
@@ -23,6 +24,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
+use zeroize::Zeroizing;
 
 const MAX_CALLBACK_HEADERS: usize = 8192;
 const CALLBACK_SUCCESS_BODY: &[u8] =
@@ -30,6 +32,10 @@ const CALLBACK_SUCCESS_BODY: &[u8] =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BodyRequestId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheOperationId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncKind {
     Restore,
@@ -75,6 +81,16 @@ pub enum FailureKind {
     SyncTimedOut,
     WorkerUnavailable,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyFailure {
+    Offline,
+    TimedOut,
+    AuthorizationRequired,
+    MailboxChanged,
+    Missing,
+    Protocol,
+}
 impl FailureKind {
     pub fn is_configuration(self) -> bool {
         matches!(
@@ -112,12 +128,35 @@ impl fmt::Debug for ServiceFailure {
 }
 
 pub enum WorkerCommand {
-    Restore { id: OperationId },
-    Connect { id: OperationId },
-    Refresh { id: OperationId },
-    Disconnect { id: OperationId },
-    Cancel { id: OperationId },
-    SetCacheLimit { limit: usize },
+    Restore {
+        id: OperationId,
+    },
+    Connect {
+        id: OperationId,
+    },
+    Refresh {
+        id: OperationId,
+    },
+    Disconnect {
+        id: OperationId,
+        generation: u64,
+    },
+    Cancel {
+        id: OperationId,
+    },
+    SetCacheLimit {
+        limit: usize,
+    },
+    FetchBody {
+        request_id: BodyRequestId,
+        generation: u64,
+        account_email: String,
+        message_id: MessageId,
+    },
+    ClearBodyCache {
+        operation_id: CacheOperationId,
+        generation: u64,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -126,11 +165,32 @@ impl fmt::Debug for WorkerCommand {
             Self::Restore { id } => f.debug_tuple("Restore").field(id).finish(),
             Self::Connect { id } => f.debug_tuple("Connect").field(id).finish(),
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
-            Self::Disconnect { id } => f.debug_tuple("Disconnect").field(id).finish(),
+            Self::Disconnect { id, generation } => f
+                .debug_struct("Disconnect")
+                .field("id", id)
+                .field("generation", generation)
+                .finish(),
             Self::Cancel { id } => f.debug_tuple("Cancel").field(id).finish(),
             Self::SetCacheLimit { limit } => f
                 .debug_struct("SetCacheLimit")
                 .field("limit", limit)
+                .finish(),
+            Self::FetchBody {
+                request_id,
+                generation,
+                ..
+            } => f
+                .debug_struct("FetchBody")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .finish(),
+            Self::ClearBodyCache {
+                operation_id,
+                generation,
+            } => f
+                .debug_struct("ClearBodyCache")
+                .field("operation_id", operation_id)
+                .field("generation", generation)
                 .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -174,6 +234,33 @@ pub enum WorkerEvent {
         id: OperationId,
         failure: ServiceFailure,
     },
+    BodyLoaded {
+        request_id: BodyRequestId,
+        generation: u64,
+        message_id: MessageId,
+        body: Arc<MessageBody>,
+        usage: CacheUsage,
+        saved: bool,
+    },
+    BodyFailed {
+        request_id: BodyRequestId,
+        generation: u64,
+        message_id: MessageId,
+        failure: BodyFailure,
+    },
+    CacheCleared {
+        operation_id: CacheOperationId,
+        generation: u64,
+        reclaimed_bytes: u64,
+        usage: CacheUsage,
+    },
+    CacheClearFailed {
+        operation_id: CacheOperationId,
+        generation: u64,
+    },
+    CacheUsageChanged {
+        usage: CacheUsage,
+    },
 }
 impl fmt::Debug for WorkerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -209,6 +296,52 @@ impl fmt::Debug for WorkerEvent {
                 .debug_struct("Failed")
                 .field("id", id)
                 .field("failure", failure)
+                .finish(),
+            Self::BodyLoaded {
+                request_id,
+                generation,
+                saved,
+                ..
+            } => f
+                .debug_struct("BodyLoaded")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("saved", saved)
+                .finish(),
+            Self::BodyFailed {
+                request_id,
+                generation,
+                failure,
+                ..
+            } => f
+                .debug_struct("BodyFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("failure", failure)
+                .finish(),
+            Self::CacheCleared {
+                operation_id,
+                generation,
+                reclaimed_bytes,
+                ..
+            } => f
+                .debug_struct("CacheCleared")
+                .field("operation_id", operation_id)
+                .field("generation", generation)
+                .field("reclaimed_bytes", reclaimed_bytes)
+                .finish(),
+            Self::CacheClearFailed {
+                operation_id,
+                generation,
+            } => f
+                .debug_struct("CacheClearFailed")
+                .field("operation_id", operation_id)
+                .field("generation", generation)
+                .finish(),
+            Self::CacheUsageChanged { usage } => f
+                .debug_struct("CacheUsageChanged")
+                .field("body_bytes", &usage.body_bytes)
+                .field("body_count", &usage.body_count)
                 .finish(),
         }
     }
@@ -259,6 +392,10 @@ async fn controller(
         cleanup: Arc<AtomicBool>,
     }
     let mut active: Option<Active> = None;
+    let auth = Arc::new(Mutex::new(None::<RuntimeAuth>));
+    let cache_io = Arc::new(Mutex::new(()));
+    let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut body_task: Option<JoinHandle<()>> = None;
     loop {
         let command = if let Some(current) = active.as_mut() {
             tokio::select! {
@@ -299,11 +436,128 @@ async fn controller(
                     fail_cleanup(&events, id, true);
                 }
             }
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
             break;
         };
         if let WorkerCommand::SetCacheLimit { limit } = &command {
-            let _ = cache::save_limit_and_prune(*limit);
+            let limit = *limit;
+            let result = cache_blocking(cache_io.clone(), move || {
+                let _ = cache::save_limit_and_prune(limit);
+                cache::usage()
+            })
+            .await;
+            if let Ok(Ok(usage)) = result {
+                let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
+            }
             continue;
+        }
+        if let WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            account_email,
+            message_id,
+        } = &command
+        {
+            if *generation != cache_generation.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let tx = events.clone();
+            let request_id = *request_id;
+            let generation = *generation;
+            let account_email = account_email.clone();
+            let message_id = message_id.clone();
+            let failure_message_id = message_id.clone();
+            let auth = auth.clone();
+            let cache_generation = cache_generation.clone();
+            let body_cache_generation = cache_generation.clone();
+            let cache_io = cache_io.clone();
+            body_task = Some(tokio::spawn(async move {
+                let result = std::panic::AssertUnwindSafe(fetch_body(
+                    request_id,
+                    generation,
+                    account_email,
+                    message_id,
+                    &tx,
+                    &auth,
+                    BodyCacheServices {
+                        generation: body_cache_generation,
+                        io: cache_io,
+                    },
+                ))
+                .catch_unwind()
+                .await;
+                if result.is_err() && cache_generation.load(Ordering::Acquire) == generation {
+                    send_body_failure(
+                        &tx,
+                        request_id,
+                        generation,
+                        failure_message_id,
+                        BodyFailure::Protocol,
+                    );
+                }
+            }));
+            continue;
+        }
+        if let WorkerCommand::ClearBodyCache {
+            operation_id,
+            generation,
+        } = &command
+        {
+            cache_generation.store(*generation, Ordering::Release);
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let cleared = cache_blocking(cache_io.clone(), || {
+                let reclaimed = cache::clear_bodies()?;
+                let usage = cache::usage().unwrap_or_default();
+                Ok::<_, std::io::Error>((reclaimed, usage))
+            })
+            .await;
+            match cleared {
+                Ok(Ok((reclaimed_bytes, usage))) => {
+                    let _ = events.send(WorkerEvent::CacheCleared {
+                        operation_id: *operation_id,
+                        generation: *generation,
+                        reclaimed_bytes,
+                        usage,
+                    });
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let _ = events.send(WorkerEvent::CacheClearFailed {
+                        operation_id: *operation_id,
+                        generation: *generation,
+                    });
+                }
+            }
+            continue;
+        }
+        if let WorkerCommand::Disconnect { generation, .. } = &command {
+            cache_generation.store(*generation, Ordering::Release);
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            auth.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+        if matches!(command, WorkerCommand::Shutdown) {
+            cache_generation.fetch_add(1, Ordering::AcqRel);
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            auth.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
         }
         let cleanup_failed = if let Some(current) = active.take() {
             let Active { task, cleanup, .. } = current;
@@ -336,13 +590,17 @@ async fn controller(
         let id = command_id(&command).unwrap_or(OperationId(0));
         let cleanup = Arc::new(AtomicBool::new(false));
         let task = match command {
-            WorkerCommand::Disconnect { id } => {
+            WorkerCommand::Disconnect { id, .. } => {
                 let tx = events.clone();
+                let cache_io = cache_io.clone();
                 tokio::spawn(async move {
                     emit_phase(&tx, id, WorkerPhase::Disconnecting);
                     match timeout(KEYRING_TIMEOUT, secrets::delete()).await {
                         Ok(Ok(())) => {
-                            if cache::clear_mailbox().is_ok() {
+                            if matches!(
+                                cache_blocking(cache_io, cache::clear_mailbox).await,
+                                Ok(Ok(()))
+                            ) {
                                 let _ = tx.send(WorkerEvent::Disconnected { id });
                             } else {
                                 fail_cleanup(&tx, id, true);
@@ -355,8 +613,10 @@ async fn controller(
             WorkerCommand::Connect { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
+                let auth = auth.clone();
+                let cache_io = cache_io.clone();
                 tokio::spawn(async move {
-                    let result = connect(id, &tx, &cleanup_task).await;
+                    let result = connect(id, &tx, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
                         cleanup_task.store(false, Ordering::Release);
                     }
@@ -368,8 +628,11 @@ async fn controller(
             WorkerCommand::Restore { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
+                let auth = auth.clone();
+                let cache_io = cache_io.clone();
                 tokio::spawn(async move {
-                    let result = restore_or_refresh(id, &tx, true, &cleanup_task).await;
+                    let result =
+                        restore_or_refresh(id, &tx, true, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
                         cleanup_task.store(false, Ordering::Release);
                     }
@@ -381,8 +644,11 @@ async fn controller(
             WorkerCommand::Refresh { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
+                let auth = auth.clone();
+                let cache_io = cache_io.clone();
                 tokio::spawn(async move {
-                    let result = restore_or_refresh(id, &tx, false, &cleanup_task).await;
+                    let result =
+                        restore_or_refresh(id, &tx, false, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
                         cleanup_task.store(false, Ordering::Release);
                     }
@@ -393,10 +659,39 @@ async fn controller(
             }
             WorkerCommand::Cancel { .. }
             | WorkerCommand::SetCacheLimit { .. }
+            | WorkerCommand::FetchBody { .. }
+            | WorkerCommand::ClearBodyCache { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
     }
+}
+
+struct RuntimeAuth {
+    email: String,
+    access_token: Zeroizing<String>,
+}
+
+struct BodyCacheServices {
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    io: Arc<Mutex<()>>,
+}
+
+async fn cache_blocking<T, F>(
+    cache_io: Arc<Mutex<()>>,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _guard = cache_io
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation()
+    })
+    .await
 }
 
 fn join_failed(result: &Result<(), tokio::task::JoinError>) -> bool {
@@ -459,9 +754,12 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         WorkerCommand::Restore { id }
         | WorkerCommand::Connect { id }
         | WorkerCommand::Refresh { id }
-        | WorkerCommand::Disconnect { id }
+        | WorkerCommand::Disconnect { id, .. }
         | WorkerCommand::Cancel { id } => Some(*id),
-        WorkerCommand::SetCacheLimit { .. } | WorkerCommand::Shutdown => None,
+        WorkerCommand::SetCacheLimit { .. }
+        | WorkerCommand::FetchBody { .. }
+        | WorkerCommand::ClearBodyCache { .. }
+        | WorkerCommand::Shutdown => None,
     }
 }
 
@@ -469,6 +767,8 @@ async fn connect(
     id: OperationId,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     cleanup_required: &AtomicBool,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
     emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
     let config = config::load().map_err(|error| map_config(error, false))?;
@@ -522,10 +822,17 @@ async fn connect(
     let account = oauth::fetch_identity(&grant.access_token, &client)
         .await
         .map_err(map_oauth)?;
+    *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
+        email: account.email.clone(),
+        access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
+    });
     let refresh = oauth::require_initial_refresh_token(&grant)
         .map_err(|_| failure(FailureKind::AuthorizationExpired, false, false))?;
     let token = RefreshToken::new(refresh.expose().to_owned())
         .map_err(|_| failure(FailureKind::CredentialSaveFailed, true, false))?;
+    let requested_limit = cache_blocking(cache_io.clone(), cache::load_limit)
+        .await
+        .map_err(|_| failure(FailureKind::WorkerUnavailable, false, false))?;
     emit_phase(tx, id, WorkerPhase::OpeningKeyring);
     let fetched = persist_then_fetch(
         || async {
@@ -555,13 +862,13 @@ async fn connect(
             emit_phase(tx, id, WorkerPhase::ConnectingImap);
         },
         || async {
-            gmail::fetch_inbox(&account.email, grant.access_token.expose())
+            gmail::fetch_inbox(&account.email, grant.access_token.expose(), requested_limit)
                 .await
                 .map_err(map_gmail)
         },
     )
     .await?;
-    complete_sync(id, tx, account, fetched)
+    complete_sync(id, tx, account, fetched, cache_io).await
 }
 
 fn callback_success_header() -> String {
@@ -617,6 +924,8 @@ async fn restore_or_refresh(
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     restore: bool,
     cleanup_required: &AtomicBool,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
     emit_phase(tx, id, WorkerPhase::OpeningKeyring);
     let Some(token) = timeout(KEYRING_TIMEOUT, secrets::load())
@@ -630,12 +939,21 @@ async fn restore_or_refresh(
         }
         return Err(failure(FailureKind::AuthorizationExpired, false, true));
     };
-    if let Ok(Some((account, snapshot))) = cache::load_latest(cache::load_limit()) {
+    let cached = cache_blocking(cache_io.clone(), || {
+        let latest = cache::load_latest(cache::load_limit());
+        let usage = cache::usage();
+        (latest, usage)
+    })
+    .await;
+    if let Ok((Ok(Some((account, snapshot))), usage)) = cached {
         let _ = tx.send(WorkerEvent::CacheLoaded {
             id,
             account,
             snapshot,
         });
+        if let Ok(usage) = usage {
+            let _ = tx.send(WorkerEvent::CacheUsageChanged { usage });
+        }
     }
     emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
     let config = config::load().map_err(|error| map_config(error, true))?;
@@ -694,7 +1012,11 @@ async fn restore_or_refresh(
     let account = oauth::fetch_identity(&grant.access_token, &client)
         .await
         .map_err(map_oauth)?;
-    sync(id, tx, account, grant.access_token.expose()).await
+    *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
+        email: account.email.clone(),
+        access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
+    });
+    sync(id, tx, account, grant.access_token.expose(), cache_io).await
 }
 
 async fn sync(
@@ -702,40 +1024,207 @@ async fn sync(
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     account: AccountIdentity,
     access_token: &str,
+    cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
     emit_phase(tx, id, WorkerPhase::ConnectingImap);
-    let fetched = gmail::fetch_inbox(&account.email, access_token)
+    let requested_limit = cache_blocking(cache_io.clone(), cache::load_limit)
+        .await
+        .map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?;
+    let fetched = gmail::fetch_inbox(&account.email, access_token, requested_limit)
         .await
         .map_err(map_gmail)?;
-    complete_sync(id, tx, account, fetched)
+    complete_sync(id, tx, account, fetched, cache_io).await
 }
 
-fn complete_sync(
+async fn complete_sync(
     id: OperationId,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     account: AccountIdentity,
     fetched: gmail::InboxFetch,
+    cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
     emit_phase(tx, id, WorkerPhase::FetchingInbox);
-    let (messages, fallback_count) = message::map_messages(fetched.records);
-    let fresh = MailboxSnapshot {
-        metadata: SyncMetadata {
-            completed_at: SystemTime::now(),
-            requested_limit: gmail::MESSAGE_LIMIT,
-            loaded_count: messages.len(),
-            fallback_count,
-            skipped_count: fetched.skipped_count,
-        },
-        messages,
-    };
-    let limit = cache::load_limit();
-    let snapshot = cache::merge_and_save(&account, fresh.clone(), limit).unwrap_or(fresh);
+    let account_for_cache = account.clone();
+    let result = cache_blocking(cache_io.clone(), move || {
+        let (messages, fallback_count) = message::map_summaries(fetched.records);
+        let requested_limit = cache::load_limit();
+        let fresh = MailboxSnapshot {
+            metadata: SyncMetadata {
+                completed_at: SystemTime::now(),
+                requested_limit,
+                loaded_count: messages.len(),
+                fallback_count,
+                skipped_count: fetched.skipped_count,
+            },
+            messages,
+        };
+        let snapshot = cache::replace_and_save(&account_for_cache, fresh.clone(), requested_limit)
+            .unwrap_or(fresh);
+        let usage = cache::usage();
+        (snapshot, usage)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?;
+    let (snapshot, usage) = result;
     let _ = tx.send(WorkerEvent::SyncComplete {
         id,
         account,
         snapshot,
     });
+    if let Ok(usage) = usage {
+        let _ = tx.send(WorkerEvent::CacheUsageChanged { usage });
+    }
     Ok(())
+}
+
+async fn fetch_body(
+    request_id: BodyRequestId,
+    generation: u64,
+    account_email: String,
+    message_id: MessageId,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    cache: BodyCacheServices,
+) {
+    let cache_generation = cache.generation;
+    let cache_io = cache.io;
+    let load_account = account_email.clone();
+    let load_id = message_id.clone();
+    let loaded = cache_blocking(cache_io.clone(), move || {
+        let body = cache::load_body(&load_account, &load_id);
+        let usage = body
+            .as_ref()
+            .ok()
+            .and_then(|body| body.as_ref())
+            .map(|_| cache::usage().unwrap_or_default());
+        (body, usage)
+    })
+    .await;
+    if let Ok((Ok(Some(body)), usage)) = loaded {
+        if cache_generation.load(Ordering::Acquire) == generation {
+            let _ = tx.send(WorkerEvent::BodyLoaded {
+                request_id,
+                generation,
+                message_id,
+                body: Arc::new(body),
+                usage: usage.unwrap_or_default(),
+                saved: true,
+            });
+        }
+        return;
+    }
+    let Some((uid_validity, uid)) = message_id.gmail_parts() else {
+        send_body_failure(
+            tx,
+            request_id,
+            generation,
+            message_id,
+            BodyFailure::Protocol,
+        );
+        return;
+    };
+    let credentials = auth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|value| {
+            (
+                value.email.clone(),
+                Zeroizing::new(value.access_token.as_str().to_owned()),
+            )
+        });
+    let Some((email, access_token)) = credentials else {
+        send_body_failure(
+            tx,
+            request_id,
+            generation,
+            message_id,
+            BodyFailure::AuthorizationRequired,
+        );
+        return;
+    };
+    if !email.eq_ignore_ascii_case(&account_email) {
+        send_body_failure(
+            tx,
+            request_id,
+            generation,
+            message_id,
+            BodyFailure::AuthorizationRequired,
+        );
+        return;
+    }
+    let raw = match gmail::fetch_body(&email, access_token.as_str(), uid_validity, uid).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            send_body_failure(
+                tx,
+                request_id,
+                generation,
+                message_id,
+                map_body_failure(error),
+            );
+            return;
+        }
+    };
+    if cache_generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let body = message::map_body(raw);
+    let save_account = account_email.clone();
+    let save_id = message_id.clone();
+    let save_generation = cache_generation.clone();
+    let saved = cache_blocking(cache_io, move || {
+        if save_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let saved_usage = cache::save_body(&save_account, &save_id, &body);
+        let (usage, saved) = match saved_usage {
+            Ok(usage) => (usage, true),
+            Err(_) => (cache::usage().unwrap_or_default(), false),
+        };
+        Some((body, usage, saved))
+    })
+    .await;
+    if cache_generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let Ok(Some((body, usage, saved))) = saved else {
+        return;
+    };
+    let _ = tx.send(WorkerEvent::BodyLoaded {
+        request_id,
+        generation,
+        message_id,
+        body: Arc::new(body),
+        usage,
+        saved,
+    });
+}
+
+fn send_body_failure(
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    request_id: BodyRequestId,
+    generation: u64,
+    message_id: MessageId,
+    failure: BodyFailure,
+) {
+    let _ = tx.send(WorkerEvent::BodyFailed {
+        request_id,
+        generation,
+        message_id,
+        failure,
+    });
+}
+
+fn map_body_failure(error: gmail::GmailError) -> BodyFailure {
+    match error {
+        gmail::GmailError::Offline | gmail::GmailError::TlsFailed => BodyFailure::Offline,
+        gmail::GmailError::TimedOut => BodyFailure::TimedOut,
+        gmail::GmailError::AuthenticationFailed => BodyFailure::AuthorizationRequired,
+        gmail::GmailError::MailboxChanged => BodyFailure::MailboxChanged,
+        gmail::GmailError::MessageMissing => BodyFailure::Missing,
+        gmail::GmailError::InboxUnavailable | gmail::GmailError::Protocol => BodyFailure::Protocol,
+    }
 }
 
 fn emit_phase(tx: &mpsc::UnboundedSender<WorkerEvent>, id: OperationId, phase: WorkerPhase) {
@@ -818,6 +1307,9 @@ fn map_gmail(error: gmail::GmailError) -> ServiceFailure {
         gmail::GmailError::TlsFailed => FailureKind::TlsFailed,
         gmail::GmailError::AuthenticationFailed => FailureKind::ImapAuthenticationFailed,
         gmail::GmailError::InboxUnavailable => FailureKind::InboxUnavailable,
+        gmail::GmailError::MailboxChanged | gmail::GmailError::MessageMissing => {
+            FailureKind::ImapProtocol
+        }
         gmail::GmailError::Protocol => FailureKind::ImapProtocol,
         gmail::GmailError::TimedOut => FailureKind::SyncTimedOut,
     };
@@ -832,6 +1324,13 @@ mod tests {
     fn debug_contract_redacts_payloads() {
         let command = WorkerCommand::Refresh { id: OperationId(3) };
         assert!(!format!("{command:?}").contains("token"));
+        let body_command = WorkerCommand::FetchBody {
+            request_id: BodyRequestId(4),
+            generation: 1,
+            account_email: "canary@example.com".into(),
+            message_id: MessageId::gmail(7, 9),
+        };
+        assert!(!format!("{body_command:?}").contains("canary@example.com"));
         let event = WorkerEvent::Failed {
             id: OperationId(3),
             failure: failure(FailureKind::Network, true, true),

@@ -17,6 +17,10 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
         ui.dispatch(Action::RequestDisconnect)
     });
     add(ui, "retry", |ui| ui.dispatch(Action::Retry));
+    add(ui, "retry-body", |ui| ui.dispatch(Action::RetryBody));
+    add(ui, "clear-cache", |ui| {
+        ui.dispatch(Action::RequestClearCache)
+    });
     add_disabled(ui, "compose");
     add(ui, "focus-search", |ui| {
         ui.search.grab_focus();

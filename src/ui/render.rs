@@ -10,8 +10,8 @@ use super::{
 };
 use crate::{
     config,
-    state::{Action, MessageFilter, SessionState, ViewSnapshot, ViewStatus},
-    worker::{FailureKind, ServiceFailure, WorkerPhase},
+    state::{Action, MessageFilter, ReaderState, SessionState, ViewSnapshot, ViewStatus},
+    worker::{BodyFailure, FailureKind, ServiceFailure, WorkerPhase},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +26,7 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     render_folders(ui, snapshot);
     render_filters(ui, snapshot.message_filter);
     render_sync(ui, snapshot);
+    render_cache_usage(ui, snapshot);
     render_banners(ui, snapshot);
     set_action_enabled(ui, "connect", snapshot.can_connect);
     set_action_enabled(ui, "refresh", snapshot.can_refresh);
@@ -33,8 +34,40 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "reopen-authorization", snapshot.can_reopen);
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
-    render_messages(ui, snapshot);
-    render_reader(ui, snapshot);
+    if ui.last_list_revision.get() != snapshot.list_revision {
+        render_messages(ui, snapshot);
+        ui.last_list_revision.set(snapshot.list_revision);
+    }
+    if ui.last_reader_revision.get() != snapshot.reader_revision {
+        render_reader(ui, snapshot);
+        ui.last_reader_revision.set(snapshot.reader_revision);
+    }
+}
+
+fn render_cache_usage(ui: &Ui, snapshot: &ViewSnapshot) {
+    let usage = snapshot.cache_usage;
+    let text = if !usage.available {
+        "Cache usage unavailable".into()
+    } else if usage.body_count == 0 {
+        "No downloaded messages".into()
+    } else {
+        format!(
+            "{} downloaded · {}",
+            usage.body_count,
+            format_bytes(usage.body_bytes)
+        )
+    };
+    ui.cache_usage.set_text(&text);
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
@@ -136,6 +169,10 @@ fn should_render_mail(status: ViewStatus, has_messages: bool) -> bool {
 
 fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
     clear_box(&ui.reader);
+    if matches!(&snapshot.reader, ReaderState::Closed) {
+        ui.reader.append(&status_panel(ViewStatus::Ready));
+        return;
+    }
     if snapshot.selected_message.is_none() {
         ui.reader.append(&main_status_panel(snapshot));
         return;
@@ -164,7 +201,11 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
     ));
     ui.reader.append(&title_line);
 
-    if message.used_fallback {
+    let loaded_body = match &snapshot.reader {
+        ReaderState::Loaded { id, body } if id == &message.id => Some(body.as_ref()),
+        _ => None,
+    };
+    if loaded_body.is_some_and(|body| body.used_fallback) {
         ui.reader.append(&notice_banner(
             "Fallback content",
             "Whitford could not extract the preferred message body, so this reader shows a safe fallback.",
@@ -218,23 +259,79 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         "win.reply",
     ));
     ui.reader.append(&sender_line);
-    if let Some(html) = &message.html_body {
-        ui.reader.append(&super::email_view::message_body(html));
-    } else {
-        ui.reader.append(
-            &gtk::Label::builder()
-                .label(&message.body)
-                .xalign(0.0)
-                .yalign(0.0)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .selectable(true)
-                .css_classes(["whitford-body"])
-                .build(),
-        );
-    }
-    for attachment in &message.attachments {
-        ui.reader.append(&attachment_card(attachment));
+    match &snapshot.reader {
+        ReaderState::Loading { id, .. } if id == &message.id => {
+            let loading = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .halign(gtk::Align::Center)
+                .margin_top(36)
+                .build();
+            loading.append(&gtk::Spinner::builder().spinning(true).build());
+            loading.append(&gtk::Label::new(Some("Loading message…")));
+            ui.reader.append(&loading);
+            return;
+        }
+        ReaderState::Failed { id, failure } if id == &message.id => {
+            let (title, detail, action) = match failure {
+                BodyFailure::Offline => (
+                    "Not available offline",
+                    "This message has not been downloaded yet.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+                BodyFailure::TimedOut => (
+                    "Message loading timed out",
+                    "Gmail took too long to return this message.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+                BodyFailure::AuthorizationRequired => (
+                    "Authorization required",
+                    "Refresh Gmail authorization, then open this message again.",
+                    Some(("Refresh", "win.refresh", "Refresh Gmail authorization")),
+                ),
+                BodyFailure::MailboxChanged => (
+                    "Inbox changed",
+                    "Refresh the inbox before opening this message.",
+                    Some(("Refresh", "win.refresh", "Refresh Gmail inbox")),
+                ),
+                BodyFailure::Missing => (
+                    "Message no longer available",
+                    "This message may have been removed from Gmail.",
+                    Some(("Refresh", "win.refresh", "Refresh Gmail inbox")),
+                ),
+                BodyFailure::Protocol => (
+                    "Could not read this message",
+                    "Gmail returned an unexpected response.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+            };
+            ui.reader.append(&notice_banner(title, detail, action));
+            return;
+        }
+        ReaderState::Loaded { id, body } if id == &message.id => {
+            if let Some(html) = &body.html {
+                ui.reader.append(&super::email_view::message_body(html));
+            } else {
+                ui.reader.append(
+                    &gtk::Label::builder()
+                        .label(&body.text)
+                        .xalign(0.0)
+                        .yalign(0.0)
+                        .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                        .selectable(true)
+                        .css_classes(["whitford-body"])
+                        .build(),
+                );
+            }
+            for attachment in &body.attachments {
+                ui.reader.append(&attachment_card(attachment));
+            }
+        }
+        _ => {
+            ui.reader.append(&status_panel(ViewStatus::Ready));
+            return;
+        }
     }
     let replies = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -495,7 +592,7 @@ fn sync_detail(snapshot: &ViewSnapshot) -> String {
         .map(|account| account.email.as_str())
         .unwrap_or("No verified account");
     let detail = snapshot.sync_metadata.as_ref().map_or_else(
-        || "Newest 50 messages · read-only".into(),
+        || format!("Newest {} messages · read-only", snapshot.cache_limit),
         |meta| {
             let synced = system_time_unix(meta.completed_at).map_or_else(
                 || "unknown time".into(),
@@ -519,7 +616,7 @@ fn worker_phase_copy(phase: WorkerPhase) -> &'static str {
         WorkerPhase::RefreshingToken => "Refreshing authorization",
         WorkerPhase::VerifyingIdentity => "Verifying Gmail identity",
         WorkerPhase::ConnectingImap => "Connecting securely to Gmail IMAP",
-        WorkerPhase::FetchingInbox => "Loading the newest 50 INBOX messages",
+        WorkerPhase::FetchingInbox => "Loading the newest INBOX summaries",
         WorkerPhase::Disconnecting => "Removing saved authorization",
     }
 }

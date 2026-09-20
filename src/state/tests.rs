@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{MailProvider, SyncMetadata, fixture_messages};
+use std::sync::Arc;
 
 fn account() -> AccountIdentity {
     AccountIdentity {
@@ -30,6 +31,15 @@ fn ready(state: &mut AppState) -> OperationId {
     id
 }
 
+fn body() -> Arc<crate::model::MessageBody> {
+    Arc::new(crate::model::MessageBody {
+        text: "Complete body".into(),
+        html: None,
+        attachments: Vec::new(),
+        used_fallback: false,
+    })
+}
+
 #[test]
 fn startup_is_disconnected_then_restore_is_an_effect() {
     let mut state = AppState::new();
@@ -50,6 +60,182 @@ fn complete_sync_replaces_mailbox_and_searches_loaded_messages() {
     assert_eq!(state.visible_message_ids(), vec![MessageId::gmail(1, 2)]);
     state.dispatch(Action::SetSearch("missing".into()));
     assert_eq!(state.snapshot().status, ViewStatus::NoSearchResults);
+}
+
+#[test]
+fn render_snapshot_omits_rows_when_list_revision_is_unchanged() {
+    let mut state = AppState::new();
+    ready(&mut state);
+
+    let snapshot = state.snapshot_for_render(false);
+
+    assert!(snapshot.visible_messages.is_empty());
+    assert_eq!(snapshot.status, ViewStatus::Ready);
+    assert!(snapshot.selected_message.is_some());
+}
+
+#[test]
+fn summary_sync_does_not_fetch_until_deliberate_open() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    assert!(matches!(state.snapshot().reader, ReaderState::Closed));
+    let list_revision = state.snapshot().list_revision;
+    let id = MessageId::gmail(1, 1);
+    let update = state.dispatch(Action::SelectMessage(id.clone()));
+    let (request_id, generation) = match &update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            message_id,
+            ..
+        }) if message_id == &id => (*request_id, *generation),
+        other => panic!("unexpected effect: {other:?}"),
+    };
+    assert_eq!(state.snapshot().list_revision, list_revision + 1);
+    let body_revision = state.snapshot().reader_revision;
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id,
+        generation,
+        message_id: id.clone(),
+        body: body(),
+        usage: crate::model::CacheUsage {
+            body_bytes: 12,
+            body_count: 1,
+            available: true,
+            ..Default::default()
+        },
+        saved: true,
+    }));
+    let snapshot = state.snapshot();
+    assert!(matches!(snapshot.reader, ReaderState::Loaded { id: loaded, .. } if loaded == id));
+    assert_eq!(snapshot.list_revision, list_revision + 1);
+    assert!(snapshot.reader_revision > body_revision);
+    assert_eq!(snapshot.cache_usage.body_count, 1);
+}
+
+#[test]
+fn retention_increase_after_decrease_refreshes_again() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.cache_limit = 500;
+    state.mailbox.as_mut().unwrap().metadata.requested_limit = 500;
+
+    state.dispatch(Action::SetCacheLimit(50));
+    assert_eq!(state.snapshot().sync_metadata.unwrap().requested_limit, 50);
+
+    let update = state.dispatch(Action::SetCacheLimit(100));
+    assert!(
+        update
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
+    );
+    assert_eq!(state.snapshot().sync_metadata.unwrap().requested_limit, 100);
+}
+
+#[test]
+fn offline_session_classifies_missing_runtime_auth_as_offline() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let message_id = MessageId::gmail(1, 1);
+    let update = state.dispatch(Action::SelectMessage(message_id.clone()));
+    let (request_id, generation) = match update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    let refresh = state.dispatch(Action::Refresh);
+    let refresh_id = match refresh.effects[0] {
+        Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::Failed {
+        id: refresh_id,
+        failure: ServiceFailure {
+            kind: FailureKind::Network,
+            retryable: true,
+            preserve_mail: true,
+            cleanup_failed: false,
+            config_path: None,
+        },
+    }));
+    state.dispatch(Action::Worker(WorkerEvent::BodyFailed {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        failure: BodyFailure::AuthorizationRequired,
+    }));
+    assert!(matches!(
+        state.snapshot().reader,
+        ReaderState::Failed {
+            id,
+            failure: BodyFailure::Offline
+        } if id == message_id
+    ));
+}
+
+#[test]
+fn worker_failure_terminates_an_in_flight_reader_request() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    let revision = state.snapshot().reader_revision;
+
+    state.dispatch(Action::WorkerUnavailable);
+
+    let snapshot = state.snapshot();
+    assert!(matches!(
+        snapshot.reader,
+        ReaderState::Failed {
+            failure: BodyFailure::Offline,
+            ..
+        }
+    ));
+    assert!(snapshot.reader_revision > revision);
+}
+
+#[test]
+fn stale_body_results_and_post_clear_completions_are_ignored() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let first = MessageId::gmail(1, 1);
+    let first_update = state.dispatch(Action::SelectMessage(first.clone()));
+    let (first_request, old_generation) = match first_update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 2)));
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id: first_request,
+        generation: old_generation,
+        message_id: first.clone(),
+        body: body(),
+        usage: Default::default(),
+        saved: true,
+    }));
+    assert!(!matches!(state.snapshot().reader, ReaderState::Loaded { id, .. } if id == first));
+
+    let clear = state.dispatch(Action::ConfirmClearCache);
+    assert!(matches!(
+        clear.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::ClearBodyCache { .. })]
+    ));
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id: first_request,
+        generation: old_generation,
+        message_id: first,
+        body: body(),
+        usage: Default::default(),
+        saved: true,
+    }));
+    assert!(matches!(state.snapshot().reader, ReaderState::Closed));
 }
 #[test]
 fn stale_events_never_mutate_state() {
@@ -88,7 +274,7 @@ fn disconnect_only_clears_after_success() {
     ready(&mut state);
     let update = state.dispatch(Action::ConfirmDisconnect);
     let id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Disconnect { id }) => id,
+        Effect::SendWorker(WorkerCommand::Disconnect { id, .. }) => id,
         _ => panic!(),
     };
     state.dispatch(Action::Worker(WorkerEvent::Failed {
@@ -104,12 +290,72 @@ fn disconnect_only_clears_after_success() {
     assert!(state.snapshot().account.is_some());
     let update = state.dispatch(Action::Retry);
     let id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Disconnect { id }) => id,
+        Effect::SendWorker(WorkerCommand::Disconnect { id, .. }) => id,
         _ => panic!(),
     };
     state.dispatch(Action::Worker(WorkerEvent::Disconnected { id }));
     assert!(state.snapshot().account.is_none());
     assert_eq!(state.snapshot().status, ViewStatus::Disconnected);
+}
+
+#[test]
+fn failed_disconnect_retry_keeps_worker_and_reducer_generations_aligned() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let first = state.dispatch(Action::ConfirmDisconnect);
+    let (first_id, first_generation) = match first.effects[0] {
+        Effect::SendWorker(WorkerCommand::Disconnect { id, generation }) => (id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::Failed {
+        id: first_id,
+        failure: ServiceFailure {
+            kind: FailureKind::DisconnectFailed,
+            retryable: true,
+            preserve_mail: true,
+            cleanup_failed: true,
+            config_path: None,
+        },
+    }));
+
+    let open = state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    assert!(matches!(
+        open.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::FetchBody { generation, account_email, .. })]
+            if *generation == first_generation && account_email == "person@example.com"
+    ));
+
+    let retry = state.dispatch(Action::Retry);
+    let second_generation = match retry.effects[0] {
+        Effect::SendWorker(WorkerCommand::Disconnect { generation, .. }) => generation,
+        _ => panic!(),
+    };
+    assert_eq!(second_generation, first_generation.wrapping_add(1));
+}
+
+#[test]
+fn account_switch_drops_old_mailbox_and_reader_before_body_requests() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    let connect = state.dispatch(Action::Connect);
+    let id = match connect.effects[0] {
+        Effect::SendWorker(WorkerCommand::Connect { id }) => id,
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountPersisted {
+        id,
+        account: AccountIdentity {
+            provider: MailProvider::Gmail,
+            email: "other@example.com".into(),
+        },
+    }));
+
+    let snapshot = state.snapshot();
+    assert!(snapshot.visible_messages.is_empty());
+    assert!(snapshot.selected_message.is_none());
+    assert!(matches!(snapshot.reader, ReaderState::Closed));
+    assert_eq!(snapshot.account.unwrap().email, "other@example.com");
 }
 #[test]
 fn filters_and_navigation_are_safe() {
@@ -241,7 +487,7 @@ fn failed_disconnect_is_degraded_and_keeps_reader_content() {
     ready(&mut state);
     let update = state.dispatch(Action::ConfirmDisconnect);
     let id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Disconnect { id }) => id,
+        Effect::SendWorker(WorkerCommand::Disconnect { id, .. }) => id,
         _ => panic!(),
     };
     state.dispatch(Action::Worker(WorkerEvent::Failed {

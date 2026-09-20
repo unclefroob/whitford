@@ -1,4 +1,7 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use adw::prelude::*;
 use gtk::glib::value::ToValue;
@@ -23,18 +26,19 @@ pub(super) fn build(
         .css_classes(["whitford-message-list"])
         .build();
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search loaded messages")
+        .placeholder_text("Search sender or subject")
         .hexpand(true)
         .css_classes(["whitford-search"])
         .build();
     search.update_property(&[
-        gtk::accessible::Property::Label("Search loaded messages"),
+        gtk::accessible::Property::Label("Search sender or subject"),
         gtk::accessible::Property::KeyShortcuts("Control+F"),
     ]);
 
     let list_menu = sidebar_button();
     let reader_menu = sidebar_button();
-    let (folder_pane, sync_title, sync_detail, cache_limit) = build_folder_pane(&folders);
+    let (folder_pane, sync_title, sync_detail, cache_limit, cache_usage) =
+        build_folder_pane(&folders);
     let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &search, &list_menu);
     let (reader_page, reader, reader_banner) = build_reader_page(&reader_menu);
@@ -96,6 +100,9 @@ pub(super) fn build(
         sync_title,
         sync_detail,
         cache_limit,
+        cache_usage,
+        last_list_revision: Rc::new(Cell::new(u64::MAX)),
+        last_reader_revision: Rc::new(Cell::new(u64::MAX)),
         filter_buttons,
         worker,
         authorization,
@@ -133,7 +140,9 @@ pub(super) fn connect_signals(ui: &Ui) {
     });
 }
 
-fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Label, gtk::DropDown) {
+fn build_folder_pane(
+    folders: &gtk::ListBox,
+) -> (gtk::Box, gtk::Label, gtk::Label, gtk::DropDown, gtk::Label) {
     let pane = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["whitford-folder-pane"])
@@ -152,7 +161,7 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .css_classes(["title-3"])
         .build();
     let address = gtk::Label::builder()
-        .label("Read-only · newest 50 messages")
+        .label("Read-only · lightweight summaries")
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
@@ -232,7 +241,7 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         "Number of messages to keep locally",
     )]);
     let cache_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
+        .orientation(gtk::Orientation::Vertical)
         .spacing(8)
         .margin_start(24)
         .margin_end(24)
@@ -240,12 +249,33 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .build();
     cache_row.append(
         &gtk::Label::builder()
-            .label("Keep locally")
+            .label("Keep summaries")
             .xalign(0.0)
             .hexpand(true)
             .build(),
     );
     cache_row.append(&cache_limit);
+    let cache_usage = gtk::Label::builder()
+        .label("No downloaded messages")
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    let clear_cache = gtk::Button::builder()
+        .label("Clear Cache")
+        .has_frame(false)
+        .halign(gtk::Align::Start)
+        .action_name("win.clear-cache")
+        .build();
+    let cache_actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(4)
+        .build();
+    cache_actions.append(&cache_usage);
+    cache_actions.append(&clear_cache);
     let sync = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_start(24)
@@ -275,8 +305,9 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
     pane.append(&recovery_actions);
     pane.append(&scroll);
     pane.append(&cache_row);
+    pane.append(&cache_actions);
     pane.append(&sync);
-    (pane, sync_title, sync_detail, cache_limit)
+    (pane, sync_title, sync_detail, cache_limit, cache_usage)
 }
 
 fn build_message_page(
