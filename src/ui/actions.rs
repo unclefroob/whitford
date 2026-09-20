@@ -54,7 +54,6 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
         }
     });
     ui.window.add_action(&label);
-    add_disabled(ui, "download");
     add(ui, "toggle-folders", |ui| {
         ui.outer.set_show_sidebar(!ui.outer.shows_sidebar())
     });
@@ -75,12 +74,6 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     ] {
         application.set_accels_for_action(action, accelerators);
     }
-}
-
-fn add_disabled(ui: &Ui, name: &str) {
-    let action = gio::SimpleAction::new(name, None);
-    action.set_enabled(false);
-    ui.window.add_action(&action);
 }
 
 fn add(ui: &Ui, name: &str, handler: impl Fn(&Ui) + 'static) {

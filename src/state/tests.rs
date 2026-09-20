@@ -323,6 +323,113 @@ fn folder_effect(update: Update) -> (FolderRequestId, u64, FolderId) {
     }
 }
 
+fn received_attachment(path: Vec<u32>, name: &str) -> crate::model::Attachment {
+    crate::model::Attachment {
+        name: name.into(),
+        media_type: Some("application/pdf".into()),
+        octets: Some(12),
+        part: crate::model::MimePartDescriptor {
+            path,
+            encoding: crate::model::TransferEncoding::Base64,
+            encoded_octets: 12,
+        },
+    }
+}
+
+fn loaded_with_attachments(state: &mut AppState, attachments: Vec<crate::model::Attachment>) {
+    ready(state);
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let mut loaded = (*body()).clone();
+    loaded.attachments = attachments;
+    state.reader = ReaderState::Loaded {
+        id: MessageId::gmail(1),
+        body: Arc::new(loaded),
+    };
+}
+
+#[test]
+fn attachment_jobs_are_bounded_progress_without_rebuilding_reader_and_complete_durably() {
+    let first = received_attachment(vec![2], "first.pdf");
+    let second = received_attachment(vec![3], "second.pdf");
+    let third = received_attachment(vec![4], "third.pdf");
+    let mut state = AppState::new();
+    loaded_with_attachments(
+        &mut state,
+        vec![first.clone(), second.clone(), third.clone()],
+    );
+
+    let open = state.dispatch(Action::OpenAttachment(first));
+    let (job_id, generation) = match open.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::DownloadAttachment {
+                job_id,
+                generation,
+                destination: AttachmentDestination::Open,
+                ..
+            }),
+        ] => (*job_id, *generation),
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    let revision = state.reader_revision;
+    state.dispatch(Action::Worker(WorkerEvent::AttachmentProgress {
+        job_id,
+        generation,
+        transferred: 6,
+        total: 12,
+    }));
+    assert_eq!(state.reader_revision, revision);
+    assert_eq!(state.snapshot().attachment_downloads[0].transferred, 6);
+
+    let save = state.dispatch(Action::SaveAttachment {
+        attachment: second,
+        destination: "/tmp/second.pdf".into(),
+    });
+    assert!(matches!(
+        save.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::DownloadAttachment {
+            destination: AttachmentDestination::SaveAs(_),
+            ..
+        })]
+    ));
+    let bounded = state.dispatch(Action::OpenAttachment(third));
+    assert_eq!(
+        bounded.feedback,
+        Some("Wait for an attachment download to finish")
+    );
+    assert!(bounded.effects.is_empty());
+
+    let complete = state.dispatch(Action::Worker(WorkerEvent::AttachmentCompleted {
+        job_id,
+        generation,
+        path: "/tmp/private-cache-file.pdf".into(),
+        open: true,
+    }));
+    assert!(matches!(
+        complete.effects.as_slice(),
+        [Effect::LaunchAttachment(path)] if path.ends_with("private-cache-file.pdf")
+    ));
+    assert_eq!(state.snapshot().attachment_downloads.len(), 1);
+}
+
+#[test]
+fn cancelling_attachment_removes_ui_state_and_aborts_the_exact_job() {
+    let attachment = received_attachment(vec![2], "report.pdf");
+    let mut state = AppState::new();
+    loaded_with_attachments(&mut state, vec![attachment.clone()]);
+    let start = state.dispatch(Action::OpenAttachment(attachment));
+    let job_id = match start.effects.as_slice() {
+        [Effect::SendWorker(WorkerCommand::DownloadAttachment { job_id, .. })] => *job_id,
+        _ => panic!(),
+    };
+    let cancel = state.dispatch(Action::CancelAttachment(job_id));
+    assert!(matches!(
+        cancel.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::CancelAttachment { job_id: current, .. })]
+            if *current == job_id
+    ));
+    assert!(state.snapshot().attachment_downloads.is_empty());
+}
+
 #[test]
 fn folder_navigation_shows_cache_then_replaces_it_with_fresh_mail() {
     let mut state = AppState::new();

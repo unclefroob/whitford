@@ -1,6 +1,7 @@
 use crate::model::{
-    AccountIdentity, CacheUsage, FolderCatalog, FolderId, MailProvider, MailboxSnapshot,
-    MessageBody, MessageId, MessageMutation, MessageSummary, ReconciledMessageState, SyncMetadata,
+    AccountIdentity, Attachment, CacheUsage, FolderCatalog, FolderId, MailProvider,
+    MailboxSnapshot, MessageBody, MessageId, MessageMutation, MessageSummary,
+    ReconciledMessageState, SyncMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,11 +17,12 @@ use std::{
 pub const RETENTION_OPTIONS: [usize; 4] = [50, 100, 250, 500];
 pub const DEFAULT_RETENTION: usize = 100;
 pub const BODY_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+pub const ATTACHMENT_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CACHED_FOLDER_VIEWS: usize = 8;
 pub const MAX_SUMMARIES_PER_FOLDER: usize = 500;
 const MAX_CACHE_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAILBOX_VERSION: u8 = 3;
-const BODY_VERSION: u8 = 4;
+const BODY_VERSION: u8 = 5;
 const MANIFEST_VERSION: u8 = 3;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -229,6 +231,189 @@ pub fn clear_bodies() -> io::Result<u64> {
     clear_bodies_at(&cache_root())
 }
 
+pub struct AtomicAttachment {
+    file: Option<fs::File>,
+    temporary: PathBuf,
+    destination: PathBuf,
+    committed: bool,
+}
+
+impl AtomicAttachment {
+    pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("attachment output already finished"))?
+            .write_all(bytes)
+    }
+
+    pub fn finish(mut self) -> io::Result<PathBuf> {
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("attachment output already finished"))?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.temporary, &self.destination)?;
+        self.committed = true;
+        if let Some(parent) = self.destination.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(self.destination.clone())
+    }
+}
+
+impl Drop for AtomicAttachment {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+pub enum OpenAttachmentTarget {
+    Cached(PathBuf),
+    Download(AtomicAttachment),
+}
+
+pub fn prepare_open_attachment(
+    account_email: &str,
+    id: &MessageId,
+    attachment: &Attachment,
+) -> io::Result<OpenAttachmentTarget> {
+    prepare_open_attachment_at(&cache_root(), account_email, id, attachment)
+}
+
+fn prepare_open_attachment_at(
+    root: &Path,
+    account_email: &str,
+    id: &MessageId,
+    attachment: &Attachment,
+) -> io::Result<OpenAttachmentTarget> {
+    validate_account_email(account_email)?;
+    if !attachment.is_downloadable() || id.gmail_value().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid attachment descriptor",
+        ));
+    }
+    ensure_private_dir(&root.join("whitford"))?;
+    ensure_private_dir(&attachments_path(root))?;
+    let destination =
+        attachments_path(root).join(attachment_file_name(account_email, id, attachment)?);
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsafe attachment cache entry",
+            ));
+        }
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+        return Ok(OpenAttachmentTarget::Cached(destination));
+    }
+    Ok(OpenAttachmentTarget::Download(atomic_attachment(
+        destination,
+    )?))
+}
+
+pub fn prepare_save_attachment(destination: &Path) -> io::Result<AtomicAttachment> {
+    if !destination.is_absolute()
+        || destination
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe attachment destination",
+        ));
+    }
+    let name = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if canonical_parent != parent {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "symlinked attachment destination",
+        ));
+    }
+    let destination = canonical_parent.join(name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe existing destination",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    atomic_attachment(destination)
+}
+
+pub fn cleanup_attachment_partials() -> io::Result<()> {
+    let path = attachments_path(&cache_root());
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".whitford-attachment-") && name.ends_with(".part") {
+            remove_file_if_exists(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn prune_attachment_cache(protected: &Path) -> io::Result<()> {
+    prune_attachment_cache_at(&cache_root(), protected, ATTACHMENT_CACHE_BUDGET_BYTES)
+}
+
+fn prune_attachment_cache_at(cache: &Path, protected: &Path, budget: u64) -> io::Result<()> {
+    let entries = match fs::read_dir(attachments_path(cache)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            remove_file_if_exists(&entry.path())?;
+        } else if metadata.is_file() {
+            files.push((
+                entry.path(),
+                metadata.len(),
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+            ));
+        }
+    }
+    let mut total = files
+        .iter()
+        .fold(0_u64, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
+    files.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+    for (path, bytes, _) in files {
+        if total <= budget {
+            break;
+        }
+        if path != protected {
+            remove_file_if_exists(&path)?;
+            total = total.saturating_sub(bytes);
+        }
+    }
+    Ok(())
+}
+
 pub fn usage() -> io::Result<CacheUsage> {
     usage_at(&cache_root())
 }
@@ -432,6 +617,7 @@ fn replace_folder_and_save_at(
     // lose reusable cache data, but can never pair one account's index with another's bodies.
     if account_changed {
         remove_dir_if_exists(&bodies_path(cache))?;
+        remove_dir_if_exists(&attachments_path(cache))?;
     }
     write_private_json(&mailbox_path(cache), &stored)?;
     // Older locator-derived summaries and bodies cannot be safely promoted to
@@ -530,9 +716,11 @@ fn save_body_at(
 
 fn clear_bodies_at(cache: &Path) -> io::Result<u64> {
     let before = directory_size(&bodies_path(cache))?
-        .saturating_add(directory_size(&legacy_bodies_path(cache))?);
+        .saturating_add(directory_size(&legacy_bodies_path(cache))?)
+        .saturating_add(directory_size(&attachments_path(cache))?);
     remove_dir_if_exists(&bodies_path(cache))?;
     remove_dir_if_exists(&legacy_bodies_path(cache))?;
+    remove_dir_if_exists(&attachments_path(cache))?;
     ensure_bodies_dir(cache)?;
     write_manifest(cache, &empty_manifest())?;
     Ok(before.saturating_sub(directory_size(&bodies_path(cache))?))
@@ -555,6 +743,9 @@ fn clear_all_mail_at(cache: &Path) -> io::Result<()> {
     if let Err(error) = remove_dir_if_exists(&legacy_bodies_path(cache)) {
         first_error.get_or_insert(error);
     }
+    if let Err(error) = remove_dir_if_exists(&attachments_path(cache)) {
+        first_error.get_or_insert(error);
+    }
     first_error.map_or(Ok(()), Err)
 }
 
@@ -575,6 +766,7 @@ fn usage_at(cache: &Path) -> io::Result<CacheUsage> {
             }
         }
     }
+    body_bytes = body_bytes.saturating_add(directory_size(&attachments_path(cache))?);
     Ok(CacheUsage {
         total_bytes: summary_bytes.saturating_add(body_bytes),
         summary_bytes,
@@ -821,6 +1013,10 @@ fn legacy_bodies_path(cache: &Path) -> PathBuf {
     cache.join("whitford/bodies-v1")
 }
 
+fn attachments_path(cache: &Path) -> PathBuf {
+    cache.join("whitford/attachments-v1")
+}
+
 fn manifest_path(cache: &Path) -> PathBuf {
     bodies_path(cache).join("manifest.json")
 }
@@ -894,6 +1090,70 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     result
 }
 
+fn attachment_file_name(
+    account_email: &str,
+    id: &MessageId,
+    attachment: &Attachment,
+) -> io::Result<String> {
+    let gmail_id = id
+        .gmail_value()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Gmail message ID"))?;
+    if !attachment.part.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid attachment part",
+        ));
+    }
+    let part = attachment
+        .part
+        .path
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("-");
+    let extension = Path::new(&attachment.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 10
+                && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(|value| format!(".{}", value.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let account_key = account_email
+        .bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    Ok(format!(
+        "acct-{account_key:016x}-gm-{gmail_id}-part-{part}{extension}"
+    ))
+}
+
+fn atomic_attachment(destination: PathBuf) -> io::Result<AtomicAttachment> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("missing attachment parent"))?;
+    let serial = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".whitford-attachment-{}-{serial}.part",
+        std::process::id()
+    ));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    Ok(AtomicAttachment {
+        file: Some(file),
+        temporary,
+        destination,
+        committed: false,
+    })
+}
+
 fn file_size_if_exists(path: &Path) -> io::Result<u64> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
@@ -936,7 +1196,8 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AttachmentState, FolderId};
+    use crate::model::{AttachmentState, FolderId, MimePartDescriptor, TransferEncoding};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -1011,6 +1272,110 @@ mod tests {
             provider: MailProvider::Gmail,
             email: EMAIL.into(),
         }
+    }
+
+    fn received_attachment(name: &str) -> Attachment {
+        Attachment {
+            name: name.into(),
+            media_type: Some("application/pdf".into()),
+            octets: Some(12),
+            part: MimePartDescriptor {
+                path: vec![2, 3],
+                encoding: TransferEncoding::Base64,
+                encoded_octets: 12,
+            },
+        }
+    }
+
+    #[test]
+    fn attachment_cache_uses_private_opaque_atomic_files() {
+        let root = TestRoot::new();
+        let attachment = received_attachment("../../private report.PDF");
+        let OpenAttachmentTarget::Download(mut output) =
+            prepare_open_attachment_at(&root.0, EMAIL, &MessageId::gmail(42), &attachment).unwrap()
+        else {
+            panic!("unexpected cache hit")
+        };
+        assert!(
+            !output
+                .destination
+                .to_string_lossy()
+                .contains("private report")
+        );
+        assert_eq!(
+            fs::metadata(output.temporary.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&output.temporary)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        output.write_all(b"durable bytes").unwrap();
+        let path = output.finish().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"durable bytes");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(matches!(
+            prepare_open_attachment_at(&root.0, EMAIL, &MessageId::gmail(42), &attachment)
+                .unwrap(),
+            OpenAttachmentTarget::Cached(cached) if cached == path
+        ));
+        clear_bodies_at(&root.0).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelled_atomic_save_preserves_destination_and_removes_partial() {
+        let root = TestRoot::new();
+        let destination = root.0.join("report.pdf");
+        fs::write(&destination, b"existing").unwrap();
+        let mut output = prepare_save_attachment(&destination).unwrap();
+        let temporary = output.temporary.clone();
+        output.write_all(b"replacement").unwrap();
+        drop(output);
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn save_as_rejects_symlinked_paths_and_targets() {
+        let root = TestRoot::new();
+        let real = root.0.join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.0.join("alias");
+        symlink(&real, &alias).unwrap();
+        assert!(prepare_save_attachment(&alias.join("file.pdf")).is_err());
+        let target = real.join("target.pdf");
+        let outside = root.0.join("outside.pdf");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &target).unwrap();
+        assert!(prepare_save_attachment(&target).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn attachment_cache_pruning_is_bounded_and_preserves_current_file() {
+        let root = TestRoot::new();
+        let directory = attachments_path(&root.0);
+        ensure_private_dir(&directory).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(directory.join(name), b"12345").unwrap();
+        }
+        let protected = directory.join("c");
+        prune_attachment_cache_at(&root.0, &protected, 8).unwrap();
+        assert!(!directory.join("a").exists());
+        assert!(!directory.join("b").exists());
+        assert!(protected.exists());
     }
 
     #[test]

@@ -581,6 +581,10 @@ References: <root@example.com> <middle@example.com>\r\n\
 Subject: Thread update\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\r\nOriginal"
                 .to_vec(),
+            header: Vec::new(),
+            plain: None,
+            html: None,
+            attachments: Vec::new(),
         });
 
         assert_eq!(

@@ -14,7 +14,9 @@ use crate::{
 use futures_util::FutureExt;
 
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub const MAX_CONTENT_JOBS: usize = 2;
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     sync::{
@@ -51,6 +53,26 @@ pub struct DraftOperationId(pub u64);
 pub struct MutationRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FolderRequestId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AttachmentJobId(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttachmentDestination {
+    Open,
+    SaveAs(std::path::PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentFailure {
+    Offline,
+    AuthorizationRequired,
+    TooLarge,
+    UnsupportedEncoding,
+    Filesystem,
+    Protocol,
+    TimedOut,
+    Busy,
+}
 
 fn folder_debug_kind(id: &FolderId) -> &'static str {
     match id {
@@ -205,6 +227,19 @@ pub enum WorkerCommand {
         message_id: MessageId,
         locator: MessageLocator,
     },
+    DownloadAttachment {
+        job_id: AttachmentJobId,
+        generation: u64,
+        account_email: String,
+        message_id: MessageId,
+        locator: MessageLocator,
+        attachment: Box<crate::model::Attachment>,
+        destination: AttachmentDestination,
+    },
+    CancelAttachment {
+        job_id: AttachmentJobId,
+        generation: u64,
+    },
     ClearBodyCache {
         operation_id: CacheOperationId,
         generation: u64,
@@ -302,6 +337,28 @@ impl fmt::Debug for WorkerCommand {
             } => f
                 .debug_struct("FetchBody")
                 .field("request_id", request_id)
+                .field("generation", generation)
+                .finish(),
+            Self::DownloadAttachment {
+                job_id,
+                generation,
+                destination,
+                ..
+            } => f
+                .debug_struct("DownloadAttachment")
+                .field("job_id", job_id)
+                .field("generation", generation)
+                .field(
+                    "destination",
+                    &match destination {
+                        AttachmentDestination::Open => "open",
+                        AttachmentDestination::SaveAs(_) => "save-as",
+                    },
+                )
+                .finish(),
+            Self::CancelAttachment { job_id, generation } => f
+                .debug_struct("CancelAttachment")
+                .field("job_id", job_id)
                 .field("generation", generation)
                 .finish(),
             Self::ClearBodyCache {
@@ -440,6 +497,27 @@ pub enum WorkerEvent {
         generation: u64,
         message_id: MessageId,
         failure: BodyFailure,
+    },
+    AttachmentProgress {
+        job_id: AttachmentJobId,
+        generation: u64,
+        transferred: u64,
+        total: u64,
+    },
+    AttachmentCompleted {
+        job_id: AttachmentJobId,
+        generation: u64,
+        path: std::path::PathBuf,
+        open: bool,
+    },
+    AttachmentFailed {
+        job_id: AttachmentJobId,
+        generation: u64,
+        failure: AttachmentFailure,
+    },
+    AttachmentCancelled {
+        job_id: AttachmentJobId,
+        generation: u64,
     },
     CacheCleared {
         operation_id: CacheOperationId,
@@ -614,6 +692,44 @@ impl fmt::Debug for WorkerEvent {
                 .field("generation", generation)
                 .field("failure", failure)
                 .finish(),
+            Self::AttachmentProgress {
+                job_id,
+                generation,
+                transferred,
+                total,
+            } => f
+                .debug_struct("AttachmentProgress")
+                .field("job_id", job_id)
+                .field("generation", generation)
+                .field("transferred", transferred)
+                .field("total", total)
+                .finish(),
+            Self::AttachmentCompleted {
+                job_id,
+                generation,
+                open,
+                ..
+            } => f
+                .debug_struct("AttachmentCompleted")
+                .field("job_id", job_id)
+                .field("generation", generation)
+                .field("open", open)
+                .finish(),
+            Self::AttachmentFailed {
+                job_id,
+                generation,
+                failure,
+            } => f
+                .debug_struct("AttachmentFailed")
+                .field("job_id", job_id)
+                .field("generation", generation)
+                .field("failure", failure)
+                .finish(),
+            Self::AttachmentCancelled { job_id, generation } => f
+                .debug_struct("AttachmentCancelled")
+                .field("job_id", job_id)
+                .field("generation", generation)
+                .finish(),
             Self::CacheCleared {
                 operation_id,
                 generation,
@@ -776,9 +892,11 @@ async fn controller(
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let folder_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let content_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTENT_JOBS));
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
     let mut folder_task: Option<JoinHandle<()>> = None;
+    let mut attachment_tasks = HashMap::<AttachmentJobId, JoinHandle<()>>::new();
     let (draft_tx, draft_rx) = mpsc::unbounded_channel();
     let draft_events = events.clone();
     let draft_task = tokio::spawn(draft_io_actor(draft_rx, draft_events));
@@ -791,6 +909,7 @@ async fn controller(
         cache_generation.clone(),
         metadata_lane.clone(),
     ));
+    let _ = cache_blocking(cache_io.clone(), cache::cleanup_attachment_partials).await;
     loop {
         let command = if let Some(current) = active.as_mut() {
             tokio::select! {
@@ -839,6 +958,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            for (_, task) in attachment_tasks.drain() {
+                task.abort();
+                let _ = task.await;
+            }
             break;
         };
         if let WorkerCommand::SetCacheLimit { limit } = &command {
@@ -851,6 +974,78 @@ async fn controller(
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
+            continue;
+        }
+        attachment_tasks.retain(|_, task| !task.is_finished());
+        if let WorkerCommand::CancelAttachment { job_id, generation } = &command {
+            if let Some(task) = attachment_tasks.remove(job_id) {
+                task.abort();
+                let _ = task.await;
+            }
+            let _ = events.send(WorkerEvent::AttachmentCancelled {
+                job_id: *job_id,
+                generation: *generation,
+            });
+            continue;
+        }
+        if let WorkerCommand::DownloadAttachment {
+            job_id,
+            generation,
+            account_email,
+            message_id,
+            locator,
+            attachment,
+            destination,
+        } = &command
+        {
+            if attachment_tasks.len() >= MAX_CONTENT_JOBS {
+                let _ = events.send(WorkerEvent::AttachmentFailed {
+                    job_id: *job_id,
+                    generation: *generation,
+                    failure: AttachmentFailure::Busy,
+                });
+                continue;
+            }
+            let request = AttachmentLoadRequest {
+                job_id: *job_id,
+                generation: *generation,
+                account_email: account_email.clone(),
+                message_id: message_id.clone(),
+                locator: locator.clone(),
+                attachment: (**attachment).clone(),
+                destination: destination.clone(),
+            };
+            let tx = events.clone();
+            let task_auth = auth.clone();
+            let task_generation = cache_generation.clone();
+            let slots = content_slots.clone();
+            let failed_job_id = *job_id;
+            let failed_generation = *generation;
+            attachment_tasks.insert(
+                *job_id,
+                tokio::spawn(async move {
+                    let Ok(_slot) = slots.acquire_owned().await else {
+                        return;
+                    };
+                    let gate = task_generation.clone();
+                    let failed_tx = tx.clone();
+                    let result = std::panic::AssertUnwindSafe(download_attachment(
+                        request,
+                        tx,
+                        task_auth,
+                        task_generation,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    if result.is_err() && gate.load(Ordering::Acquire) == failed_generation {
+                        let _ = failed_tx.send(WorkerEvent::AttachmentFailed {
+                            job_id: failed_job_id,
+                            generation: failed_generation,
+                            failure: AttachmentFailure::Protocol,
+                        });
+                    }
+                }),
+            );
             continue;
         }
         if let WorkerCommand::FetchFolder {
@@ -1138,7 +1333,11 @@ async fn controller(
             let cache_generation = cache_generation.clone();
             let body_cache_generation = cache_generation.clone();
             let cache_io = cache_io.clone();
+            let slots = content_slots.clone();
             body_task = Some(tokio::spawn(async move {
+                let Ok(_slot) = slots.acquire_owned().await else {
+                    return;
+                };
                 let result = std::panic::AssertUnwindSafe(fetch_body(
                     BodyLoadRequest {
                         request_id,
@@ -1178,6 +1377,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            for (_, task) in attachment_tasks.drain() {
+                task.abort();
+                let _ = task.await;
+            }
             let cleared = cache_blocking(cache_io.clone(), || {
                 let reclaimed = cache::clear_bodies()?;
                 let usage = cache::usage().unwrap_or_default();
@@ -1214,6 +1417,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            for (_, task) in attachment_tasks.drain() {
+                task.abort();
+                let _ = task.await;
+            }
             auth.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
@@ -1227,6 +1434,10 @@ async fn controller(
                 let _ = task.await;
             }
             if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            for (_, task) in attachment_tasks.drain() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1375,6 +1586,8 @@ async fn controller(
             | WorkerCommand::SetCacheLimit { .. }
             | WorkerCommand::FetchFolder { .. }
             | WorkerCommand::FetchBody { .. }
+            | WorkerCommand::DownloadAttachment { .. }
+            | WorkerCommand::CancelAttachment { .. }
             | WorkerCommand::ClearBodyCache { .. }
             | WorkerCommand::SendMessage { .. }
             | WorkerCommand::LoadDrafts { .. }
@@ -1868,6 +2081,16 @@ struct FolderLoadRequest {
     catalog: FolderCatalog,
 }
 
+struct AttachmentLoadRequest {
+    job_id: AttachmentJobId,
+    generation: u64,
+    account_email: String,
+    message_id: MessageId,
+    locator: MessageLocator,
+    attachment: crate::model::Attachment,
+    destination: AttachmentDestination,
+}
+
 async fn guard_smtp_send<F>(send: F) -> Result<(), smtp::SmtpError>
 where
     F: Future<Output = Result<(), smtp::SmtpError>>,
@@ -1972,6 +2195,8 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         WorkerCommand::SetCacheLimit { .. }
         | WorkerCommand::FetchFolder { .. }
         | WorkerCommand::FetchBody { .. }
+        | WorkerCommand::DownloadAttachment { .. }
+        | WorkerCommand::CancelAttachment { .. }
         | WorkerCommand::ClearBodyCache { .. }
         | WorkerCommand::SendMessage { .. }
         | WorkerCommand::LoadDrafts { .. }
@@ -2436,6 +2661,148 @@ async fn fetch_folder_view(
     }
 }
 
+async fn download_attachment(
+    request: AttachmentLoadRequest,
+    tx: mpsc::UnboundedSender<WorkerEvent>,
+    auth: Arc<Mutex<Option<RuntimeAuth>>>,
+    generation_gate: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let AttachmentLoadRequest {
+        job_id,
+        generation,
+        account_email,
+        message_id,
+        locator,
+        attachment,
+        destination,
+    } = request;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let (mut output, open) = match destination {
+        AttachmentDestination::Open => {
+            match cache::prepare_open_attachment(&account_email, &message_id, &attachment) {
+                Ok(cache::OpenAttachmentTarget::Cached(path)) => {
+                    let _ = cache::prune_attachment_cache(&path);
+                    let _ = tx.send(WorkerEvent::AttachmentCompleted {
+                        job_id,
+                        generation,
+                        path,
+                        open: true,
+                    });
+                    return;
+                }
+                Ok(cache::OpenAttachmentTarget::Download(output)) => (output, true),
+                Err(_) => {
+                    let _ = tx.send(WorkerEvent::AttachmentFailed {
+                        job_id,
+                        generation,
+                        failure: AttachmentFailure::Filesystem,
+                    });
+                    return;
+                }
+            }
+        }
+        AttachmentDestination::SaveAs(path) => match cache::prepare_save_attachment(&path) {
+            Ok(output) => (output, false),
+            Err(_) => {
+                let _ = tx.send(WorkerEvent::AttachmentFailed {
+                    job_id,
+                    generation,
+                    failure: AttachmentFailure::Filesystem,
+                });
+                return;
+            }
+        },
+    };
+    let credentials = auth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|value| value.email.eq_ignore_ascii_case(&account_email))
+        .map(|value| Zeroizing::new(value.access_token.as_str().to_owned()));
+    let Some(access_token) = credentials else {
+        let _ = tx.send(WorkerEvent::AttachmentFailed {
+            job_id,
+            generation,
+            failure: AttachmentFailure::AuthorizationRequired,
+        });
+        return;
+    };
+    let progress_tx = tx.clone();
+    let result = gmail::fetch_attachment(
+        &account_email,
+        access_token.as_str(),
+        &message_id,
+        &locator,
+        &attachment,
+        |bytes| output.write_all(bytes),
+        |transferred, total| {
+            if generation_gate.load(Ordering::Acquire) == generation {
+                let _ = progress_tx.send(WorkerEvent::AttachmentProgress {
+                    job_id,
+                    generation,
+                    transferred,
+                    total,
+                });
+            }
+        },
+    )
+    .await;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    if let Err(error) = result {
+        let _ = tx.send(WorkerEvent::AttachmentFailed {
+            job_id,
+            generation,
+            failure: map_attachment_failure(error),
+        });
+        return;
+    }
+    match output.finish() {
+        Ok(path) => {
+            if open {
+                let _ = cache::prune_attachment_cache(&path);
+            }
+            let _ = tx.send(WorkerEvent::AttachmentCompleted {
+                job_id,
+                generation,
+                path,
+                open,
+            });
+            if open && let Ok(usage) = cache::usage() {
+                let _ = tx.send(WorkerEvent::CacheUsageChanged { usage });
+            }
+        }
+        Err(_) => {
+            let _ = tx.send(WorkerEvent::AttachmentFailed {
+                job_id,
+                generation,
+                failure: AttachmentFailure::Filesystem,
+            });
+        }
+    }
+}
+
+fn map_attachment_failure(error: gmail::AttachmentFetchError) -> AttachmentFailure {
+    match error {
+        gmail::AttachmentFetchError::TooLarge => AttachmentFailure::TooLarge,
+        gmail::AttachmentFetchError::InvalidEncoding => AttachmentFailure::UnsupportedEncoding,
+        gmail::AttachmentFetchError::WriteFailed => AttachmentFailure::Filesystem,
+        gmail::AttachmentFetchError::Gmail(gmail::GmailError::Offline) => {
+            AttachmentFailure::Offline
+        }
+        gmail::AttachmentFetchError::Gmail(gmail::GmailError::AuthenticationFailed) => {
+            AttachmentFailure::AuthorizationRequired
+        }
+        gmail::AttachmentFetchError::Gmail(gmail::GmailError::TimedOut) => {
+            AttachmentFailure::TimedOut
+        }
+        gmail::AttachmentFetchError::Gmail(_) => AttachmentFailure::Protocol,
+    }
+}
+
 async fn fetch_body(
     request: BodyLoadRequest,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -2730,6 +3097,36 @@ mod tests {
         assert_eq!(command_id(&folder_command), None);
         assert!(!folder_debug.contains("folder-canary@example.com"));
         assert!(!folder_debug.contains("Secret label"));
+        let attachment_command = WorkerCommand::DownloadAttachment {
+            job_id: AttachmentJobId(2),
+            generation: 1,
+            account_email: "attachment-canary@example.com".into(),
+            message_id: MessageId::gmail(42),
+            locator: MessageLocator {
+                folder_id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
+            attachment: Box::new(crate::model::Attachment {
+                name: "secret-report.pdf".into(),
+                media_type: Some("application/pdf".into()),
+                octets: Some(12),
+                part: crate::model::MimePartDescriptor {
+                    path: vec![2],
+                    encoding: crate::model::TransferEncoding::Base64,
+                    encoded_octets: 12,
+                },
+            }),
+            destination: AttachmentDestination::SaveAs(
+                "/private/location/secret-report.pdf".into(),
+            ),
+        };
+        let attachment_debug = format!("{attachment_command:?}");
+        assert_eq!(command_id(&attachment_command), None);
+        assert!(!attachment_debug.contains("attachment-canary"));
+        assert!(!attachment_debug.contains("secret-report"));
+        assert!(!attachment_debug.contains("/private"));
         let draft = crate::composer::new_message(
             "draft-canary".into(),
             "canary@example.com",

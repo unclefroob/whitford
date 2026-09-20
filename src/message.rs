@@ -1,6 +1,8 @@
 use crate::{
-    gmail::{RawMessageBody, RawMessageSummary},
-    model::{Attachment, MessageBody, MessageSummary, ReplyAddress, ReplyContext},
+    gmail::{RawMessageBody, RawMessageSummary, RawTextPart},
+    model::{
+        Attachment, MessageBody, MessageSummary, ReplyAddress, ReplyContext, TransferEncoding,
+    },
 };
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
 use unicode_segmentation::UnicodeSegmentation;
@@ -68,6 +70,9 @@ pub fn map_summaries(mut records: Vec<RawMessageSummary>) -> (Vec<MessageSummary
 }
 
 pub fn map_body(raw: RawMessageBody) -> MessageBody {
+    if raw.raw.is_empty() {
+        return map_section_body(raw);
+    }
     let parsed = MessageParser::default().parse(&raw.raw);
     let mut used_fallback = parsed.is_none();
     let (text, html, attachments, reply_context) = if let Some(parsed) = parsed {
@@ -113,6 +118,7 @@ pub fn map_body(raw: RawMessageBody) -> MessageBody {
                     name: cap(name, 255, 1_024),
                     media_type,
                     octets,
+                    part: Default::default(),
                 }
             })
             .collect();
@@ -140,6 +146,88 @@ pub fn map_body(raw: RawMessageBody) -> MessageBody {
         attachments,
         reply_context,
         used_fallback,
+    }
+}
+
+fn map_section_body(raw: RawMessageBody) -> MessageBody {
+    let header = MessageParser::default().parse_headers(&raw.header);
+    let mut used_fallback = header.is_none();
+    let reply_context = header
+        .as_ref()
+        .map_or_else(ReplyContext::default, |parsed| ReplyContext {
+            from: addresses(parsed.from()),
+            reply_to: addresses(parsed.reply_to()),
+            to: addresses(parsed.to()),
+            cc: addresses(parsed.cc()),
+            message_id: bounded_message_id(parsed.message_id()),
+            references: message_ids(parsed.references()),
+            sent_at_unix: parsed.date().map(|date| date.to_timestamp()),
+        });
+    let html = raw.html.as_ref().and_then(decode_text_part);
+    let plain = raw.plain.as_ref().and_then(decode_text_part);
+    let text = html
+        .as_deref()
+        .map(html_to_readable_text)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            plain
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            used_fallback = true;
+            "No readable message body.".into()
+        });
+    if raw.html.is_some() && html.is_none() || raw.plain.is_some() && plain.is_none() {
+        used_fallback = true;
+    }
+    MessageBody {
+        text: normalize(&text),
+        html,
+        attachments: raw.attachments,
+        reply_context,
+        used_fallback,
+    }
+}
+
+fn decode_text_part(part: &RawTextPart) -> Option<String> {
+    let transfer = match part.descriptor.encoding {
+        TransferEncoding::SevenBit => "7bit",
+        TransferEncoding::EightBit => "8bit",
+        TransferEncoding::Binary => "binary",
+        TransferEncoding::Base64 => "base64",
+        TransferEncoding::QuotedPrintable => "quoted-printable",
+        TransferEncoding::Unsupported => return None,
+    };
+    let charset = part
+        .charset
+        .as_deref()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+        .unwrap_or("utf-8");
+    let mut synthetic = format!(
+        "Content-Type: {}; charset={}\r\nContent-Transfer-Encoding: {}\r\n\r\n",
+        part.media_type, charset, transfer
+    )
+    .into_bytes();
+    synthetic.extend_from_slice(&part.raw);
+    let parsed = MessageParser::default().parse(&synthetic)?;
+    if part.media_type.eq_ignore_ascii_case("text/html") {
+        parsed.html_part(0).and_then(|value| match &value.body {
+            PartType::Html(value) => Some(value.clone().into_owned()),
+            _ => None,
+        })
+    } else {
+        parsed
+            .body_text(0)
+            .map(|value| value.into_owned())
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -327,7 +415,54 @@ mod tests {
                 uid: 9,
             },
             raw: bytes.to_vec(),
+            header: Vec::new(),
+            plain: None,
+            html: None,
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn section_body_decodes_complete_text_without_attachment_payloads() {
+        let suffix = "visible".repeat(20_000);
+        let html = format!("<p>Hello {}</p>", suffix);
+        let attachment = Attachment {
+            name: "large.pdf".into(),
+            media_type: Some("application/pdf".into()),
+            octets: Some(90_000_000),
+            part: crate::model::MimePartDescriptor {
+                path: vec![2],
+                encoding: TransferEncoding::Base64,
+                encoded_octets: 90_000_000,
+            },
+        };
+        let value = map_body(RawMessageBody {
+            id: crate::model::MessageId::gmail(99),
+            locator: crate::model::MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
+            raw: Vec::new(),
+            header: b"From: Sender <sender@example.com>\r\nMessage-ID: <id@example.com>\r\n\r\n"
+                .to_vec(),
+            plain: None,
+            html: Some(RawTextPart {
+                descriptor: crate::model::MimePartDescriptor {
+                    path: vec![1],
+                    encoding: TransferEncoding::SevenBit,
+                    encoded_octets: html.len() as u64,
+                },
+                media_type: "text/html".into(),
+                charset: Some("utf-8".into()),
+                raw: html.into_bytes(),
+            }),
+            attachments: vec![attachment.clone()],
+        });
+        assert!(value.text.contains(&suffix));
+        assert_eq!(value.attachments, vec![attachment]);
+        assert_eq!(value.reply_context.from[0].email, "sender@example.com");
     }
 
     #[test]

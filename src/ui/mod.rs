@@ -8,6 +8,7 @@ mod widgets;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::{Rc, Weak},
 };
 
@@ -63,6 +64,8 @@ pub struct Ui {
     pub(crate) composer_attachment_fingerprint: Rc<Cell<u64>>,
     pub(crate) last_list_revision: Rc<Cell<u64>>,
     pub(crate) last_reader_revision: Rc<Cell<u64>>,
+    pub(crate) attachment_progress:
+        Rc<RefCell<HashMap<crate::worker::AttachmentJobId, gtk::ProgressBar>>>,
     pub(crate) filter_buttons: Vec<(MessageFilter, gtk::Button)>,
     pub(crate) worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     pub(crate) authorization: Rc<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
@@ -111,6 +114,7 @@ pub(crate) struct WeakUi {
     composer_attachment_fingerprint: Weak<Cell<u64>>,
     last_list_revision: Weak<Cell<u64>>,
     last_reader_revision: Weak<Cell<u64>>,
+    attachment_progress: Weak<RefCell<HashMap<crate::worker::AttachmentJobId, gtk::ProgressBar>>>,
     filter_buttons: Vec<(MessageFilter, gtk::glib::WeakRef<gtk::Button>)>,
     worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     authorization: Weak<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
@@ -188,6 +192,7 @@ impl Ui {
             composer_attachment_fingerprint: Rc::downgrade(&self.composer_attachment_fingerprint),
             last_list_revision: Rc::downgrade(&self.last_list_revision),
             last_reader_revision: Rc::downgrade(&self.last_reader_revision),
+            attachment_progress: Rc::downgrade(&self.attachment_progress),
             filter_buttons: self
                 .filter_buttons
                 .iter()
@@ -278,6 +283,25 @@ impl Ui {
         ));
     }
     fn handle_worker_event(&self, event: WorkerEvent) {
+        if let WorkerEvent::AttachmentProgress {
+            job_id,
+            transferred,
+            total,
+            ..
+        } = &event
+            && let Some(progress) = self.attachment_progress.borrow().get(job_id)
+        {
+            progress.set_fraction(if *total == 0 {
+                0.0
+            } else {
+                (*transferred as f64 / *total as f64).clamp(0.0, 1.0)
+            });
+            progress.set_text(Some(&format!(
+                "{} of {}",
+                format_bytes(*transferred),
+                format_bytes(*total)
+            )));
+        }
         let event = match event {
             WorkerEvent::AuthorizationRequired { id, url, deadline } => {
                 let copy = AuthorizationUrl::new(url.expose().to_owned());
@@ -334,6 +358,22 @@ impl Ui {
                     }
                 });
             }
+            Effect::LaunchAttachment(path) => {
+                let uri = gtk::gio::File::for_path(path).uri();
+                let weak = self.downgrade();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    if gtk::gio::AppInfo::launch_default_for_uri_future(
+                        &uri,
+                        None::<&gtk::gio::AppLaunchContext>,
+                    )
+                    .await
+                    .is_err()
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.toast("No application could open this attachment");
+                    }
+                });
+            }
             Effect::PresentDisconnectConfirmation => {
                 let dialog = adw::AlertDialog::builder().heading("Disconnect Gmail?").body("This removes this account’s local drafts, staged attachments, signature settings, downloaded mail cache, and saved authorization from Secret Service. Revoke Google access separately in your Google Account.").build();
                 dialog.add_response("cancel", "Cancel");
@@ -354,8 +394,8 @@ impl Ui {
             }
             Effect::PresentClearCacheConfirmation => {
                 let dialog = adw::AlertDialog::builder()
-                    .heading("Clear downloaded messages?")
-                    .body("This removes opened message bodies saved for offline reading. Message summaries, your Gmail authorization, and the Keep summaries setting remain.")
+                    .heading("Clear downloaded mail?")
+                    .body("This removes opened message bodies and attachment files saved locally. Message summaries, your Gmail authorization, and the Keep summaries setting remain.")
                     .build();
                 dialog.add_response("cancel", "Cancel");
                 dialog.add_response("clear", "Clear Cache");
@@ -447,6 +487,7 @@ impl WeakUi {
             composer_attachment_fingerprint: self.composer_attachment_fingerprint.upgrade()?,
             last_list_revision: self.last_list_revision.upgrade()?,
             last_reader_revision: self.last_reader_revision.upgrade()?,
+            attachment_progress: self.attachment_progress.upgrade()?,
             filter_buttons: self
                 .filter_buttons
                 .iter()
@@ -479,4 +520,14 @@ fn parse_recipients(value: &str) -> Vec<crate::composer::Recipient> {
             })
         })
         .collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }

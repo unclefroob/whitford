@@ -7,9 +7,10 @@ use crate::{
     },
     smtp,
     worker::{
-        BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
-        FolderRequestId, MutationRequestId, OperationId, SendFailure, SendRequestId,
-        ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+        AttachmentDestination, AttachmentFailure, AttachmentJobId, BodyFailure, BodyRequestId,
+        CacheOperationId, DraftOperationId, FailureKind, FolderRequestId, MutationRequestId,
+        OperationId, SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand,
+        WorkerEvent, WorkerPhase,
     },
 };
 use std::{
@@ -59,6 +60,8 @@ pub struct AppState {
     reader_revision: u64,
     next_mutation_request: u64,
     pending_mutations: HashMap<(MessageId, MutationDimension), PendingMutation>,
+    next_attachment_job: u64,
+    attachment_jobs: HashMap<AttachmentJobId, AttachmentDownload>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +194,12 @@ pub enum Action {
     ToggleLabel(String),
     SetCacheLimit(usize),
     RetryBody,
+    OpenAttachment(crate::model::Attachment),
+    SaveAttachment {
+        attachment: crate::model::Attachment,
+        destination: std::path::PathBuf,
+    },
+    CancelAttachment(AttachmentJobId),
     RetryDraftRestore,
     BeginNewMessage,
     BeginReply,
@@ -245,6 +254,7 @@ pub enum Effect {
     PresentDisconnectConfirmation,
     PresentClearCacheConfirmation,
     PresentUncertainResendConfirmation,
+    LaunchAttachment(std::path::PathBuf),
     CloseApplicationWindow,
 }
 #[derive(Default, Debug)]
@@ -286,6 +296,18 @@ pub struct ViewSnapshot {
     pub reader_revision: u64,
     pub can_mutate: bool,
     pub label_options: Vec<(String, String, bool)>,
+    pub attachment_downloads: Vec<AttachmentDownload>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentDownload {
+    pub job_id: AttachmentJobId,
+    pub message_id: MessageId,
+    pub part_path: Vec<u32>,
+    pub name: String,
+    pub transferred: u64,
+    pub total: u64,
+    pub open: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedDraftSummary {
@@ -380,6 +402,8 @@ impl AppState {
             reader_revision: 1,
             next_mutation_request: 1,
             pending_mutations: HashMap::new(),
+            next_attachment_job: 1,
+            attachment_jobs: HashMap::new(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -456,6 +480,7 @@ impl AppState {
                 self.active_operation = None;
                 self.recovery = None;
                 self.pending_mutations.clear();
+                self.attachment_jobs.clear();
                 if let ReaderState::Loading { id, .. } = &self.reader {
                     self.reader = ReaderState::Failed {
                         id: id.clone(),
@@ -538,6 +563,14 @@ impl AppState {
             }
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::RetryBody => self.retry_body(),
+            Action::OpenAttachment(attachment) => {
+                self.start_attachment(attachment, AttachmentDestination::Open)
+            }
+            Action::SaveAttachment {
+                attachment,
+                destination,
+            } => self.start_attachment(attachment, AttachmentDestination::SaveAs(destination)),
+            Action::CancelAttachment(job_id) => self.cancel_attachment(job_id),
             Action::RetryDraftRestore => self.retry_draft_restore(),
             Action::BeginNewMessage => self.begin_compose(ComposeStart::New),
             Action::BeginReply => self.begin_reply(),
@@ -635,6 +668,7 @@ impl AppState {
         self.folder_loading = false;
         self.selected_folder_id = FolderId::Inbox;
         self.pending_mutations.clear();
+        self.attachment_jobs.clear();
         self.send_generation = self.send_generation.wrapping_add(1);
         self.reset_draft_session();
         self.mailbox = None;
@@ -664,6 +698,64 @@ impl AppState {
     }
     fn worker_event(&mut self, event: WorkerEvent) -> Update {
         match event {
+            WorkerEvent::AttachmentProgress {
+                job_id,
+                generation,
+                transferred,
+                total,
+            } => {
+                if generation == self.cache_generation
+                    && let Some(job) = self.attachment_jobs.get_mut(&job_id)
+                {
+                    job.transferred = transferred.min(total);
+                    job.total = total;
+                }
+                Update::default()
+            }
+            WorkerEvent::AttachmentCompleted {
+                job_id,
+                generation,
+                path,
+                open,
+            } => {
+                if generation != self.cache_generation
+                    || self.attachment_jobs.remove(&job_id).is_none()
+                {
+                    return Update::default();
+                }
+                self.bump_reader();
+                Update {
+                    feedback: (!open).then_some("Attachment saved"),
+                    effects: open
+                        .then_some(Effect::LaunchAttachment(path))
+                        .into_iter()
+                        .collect(),
+                }
+            }
+            WorkerEvent::AttachmentFailed {
+                job_id,
+                generation,
+                failure,
+            } => {
+                if generation != self.cache_generation
+                    || self.attachment_jobs.remove(&job_id).is_none()
+                {
+                    return Update::default();
+                }
+                self.bump_reader();
+                Update {
+                    feedback: Some(attachment_failure_feedback(failure)),
+                    ..Default::default()
+                }
+            }
+            WorkerEvent::AttachmentCancelled { job_id, generation } => {
+                if generation == self.cache_generation
+                    && self.attachment_jobs.remove(&job_id).is_some()
+                {
+                    self.bump_reader();
+                }
+                Update::default()
+            }
             WorkerEvent::FolderCacheLoaded {
                 request_id,
                 generation,
@@ -751,7 +843,7 @@ impl AppState {
                     self.reader = ReaderState::Closed;
                     self.bump_reader();
                     return Update {
-                        feedback: Some("Downloaded message bodies cleared"),
+                        feedback: Some("Downloaded message bodies and attachments cleared"),
                         ..Default::default()
                     };
                 }
@@ -1091,6 +1183,10 @@ impl AppState {
             | WorkerEvent::Failed { id, .. } => *id,
             WorkerEvent::BodyLoaded { .. }
             | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::AttachmentProgress { .. }
+            | WorkerEvent::AttachmentCompleted { .. }
+            | WorkerEvent::AttachmentFailed { .. }
+            | WorkerEvent::AttachmentCancelled { .. }
             | WorkerEvent::FolderCacheLoaded { .. }
             | WorkerEvent::FolderLoaded { .. }
             | WorkerEvent::FolderFailed { .. }
@@ -1247,6 +1343,7 @@ impl AppState {
             }
             WorkerEvent::Disconnected { .. } => {
                 self.pending_mutations.clear();
+                self.attachment_jobs.clear();
                 self.account = None;
                 self.selected_folder_id = FolderId::Inbox;
                 self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
@@ -1308,6 +1405,10 @@ impl AppState {
             }
             WorkerEvent::BodyLoaded { .. }
             | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::AttachmentProgress { .. }
+            | WorkerEvent::AttachmentCompleted { .. }
+            | WorkerEvent::AttachmentFailed { .. }
+            | WorkerEvent::AttachmentCancelled { .. }
             | WorkerEvent::FolderCacheLoaded { .. }
             | WorkerEvent::FolderLoaded { .. }
             | WorkerEvent::FolderFailed { .. }
@@ -1405,6 +1506,11 @@ impl AppState {
                         .collect()
                 })
                 .unwrap_or_default(),
+            attachment_downloads: {
+                let mut jobs = self.attachment_jobs.values().cloned().collect::<Vec<_>>();
+                jobs.sort_by_key(|job| job.job_id.0);
+                jobs
+            },
             folders: self
                 .mailbox
                 .as_ref()
@@ -2029,6 +2135,94 @@ impl AppState {
             self.open_selected()
         } else {
             Update::default()
+        }
+    }
+    fn start_attachment(
+        &mut self,
+        requested: crate::model::Attachment,
+        destination: AttachmentDestination,
+    ) -> Update {
+        if self.attachment_jobs.len() >= crate::worker::MAX_CONTENT_JOBS {
+            return Update {
+                feedback: Some("Wait for an attachment download to finish"),
+                ..Default::default()
+            };
+        }
+        let Some(account_email) = self.account.as_ref().map(|value| value.email.clone()) else {
+            return Update::default();
+        };
+        let Some(message) = self.selected_message().cloned() else {
+            return Update::default();
+        };
+        let attachment = match &self.reader {
+            ReaderState::Loaded { id, body } if id == &message.id => body
+                .attachments
+                .iter()
+                .find(|attachment| {
+                    attachment.part.path == requested.part.path
+                        && attachment.part == requested.part
+                        && attachment.name == requested.name
+                })
+                .cloned(),
+            _ => None,
+        };
+        let Some(attachment) = attachment.filter(crate::model::Attachment::is_downloadable) else {
+            return Update {
+                feedback: Some("This attachment needs the message to be refreshed"),
+                ..Default::default()
+            };
+        };
+        if self
+            .attachment_jobs
+            .values()
+            .any(|job| job.message_id == message.id && job.part_path == attachment.part.path)
+        {
+            return Update {
+                feedback: Some("That attachment is already downloading"),
+                ..Default::default()
+            };
+        }
+        let job_id = AttachmentJobId(self.next_attachment_job);
+        self.next_attachment_job = self.next_attachment_job.wrapping_add(1).max(1);
+        let open = matches!(destination, AttachmentDestination::Open);
+        self.attachment_jobs.insert(
+            job_id,
+            AttachmentDownload {
+                job_id,
+                message_id: message.id.clone(),
+                part_path: attachment.part.path.clone(),
+                name: attachment.name.clone(),
+                transferred: 0,
+                total: attachment.part.encoded_octets,
+                open,
+            },
+        );
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::DownloadAttachment {
+                job_id,
+                generation: self.cache_generation,
+                account_email,
+                message_id: message.id,
+                locator: message.locator,
+                attachment: Box::new(attachment),
+                destination,
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn cancel_attachment(&mut self, job_id: AttachmentJobId) -> Update {
+        if self.attachment_jobs.remove(&job_id).is_none() {
+            return Update::default();
+        }
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::CancelAttachment {
+                job_id,
+                generation: self.cache_generation,
+            })],
+            feedback: Some("Attachment download cancelled"),
         }
     }
     fn begin_reply(&mut self) -> Update {
@@ -2684,6 +2878,7 @@ impl AppState {
     }
     fn clear_body_cache(&mut self) -> Update {
         self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.attachment_jobs.clear();
         let operation_id = CacheOperationId(self.next_body_request);
         self.next_body_request = self.next_body_request.wrapping_add(1).max(1);
         self.pending_cache_clear = Some(operation_id);
@@ -2726,6 +2921,23 @@ fn display_recipient(value: &Recipient) -> String {
             || value.email.clone(),
             |name| format!("{name} <{}>", value.email),
         )
+}
+
+fn attachment_failure_feedback(failure: AttachmentFailure) -> &'static str {
+    match failure {
+        AttachmentFailure::Offline => "Could not download the attachment while offline",
+        AttachmentFailure::AuthorizationRequired => {
+            "Refresh Gmail authorization to download attachments"
+        }
+        AttachmentFailure::TooLarge => "Attachments are limited to 100 MB",
+        AttachmentFailure::UnsupportedEncoding => {
+            "This attachment uses an unsupported mail encoding"
+        }
+        AttachmentFailure::Filesystem => "Could not save the attachment",
+        AttachmentFailure::Protocol => "Gmail returned an invalid attachment",
+        AttachmentFailure::TimedOut => "The attachment download timed out",
+        AttachmentFailure::Busy => "Two attachment downloads are already running",
+    }
 }
 fn compatibility_draft(compose: ComposeDraft) -> ComposeSession {
     let source_message_id = match &compose.kind {

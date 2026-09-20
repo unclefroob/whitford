@@ -128,6 +128,7 @@ pub(super) fn build(
         composer_attachment_fingerprint: Rc::new(Cell::new(u64::MAX)),
         last_list_revision: Rc::new(Cell::new(u64::MAX)),
         last_reader_revision: Rc::new(Cell::new(u64::MAX)),
+        attachment_progress: Rc::new(RefCell::new(std::collections::HashMap::new())),
         filter_buttons,
         worker,
         authorization,

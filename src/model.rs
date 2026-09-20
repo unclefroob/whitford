@@ -170,11 +170,54 @@ impl MessageLocator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TransferEncoding {
+    SevenBit,
+    EightBit,
+    Binary,
+    Base64,
+    QuotedPrintable,
+    #[default]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MimePartDescriptor {
+    pub path: Vec<u32>,
+    pub encoding: TransferEncoding,
+    pub encoded_octets: u64,
+}
+
+impl MimePartDescriptor {
+    pub fn is_valid(&self) -> bool {
+        !self.path.is_empty()
+            && self.path.len() <= 32
+            && self.path.iter().all(|value| *value > 0)
+            && self.encoding != TransferEncoding::Unsupported
+    }
+
+    pub fn section(&self) -> String {
+        self.path
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Attachment {
     pub name: String,
     pub media_type: Option<String>,
     pub octets: Option<u64>,
+    #[serde(default)]
+    pub part: MimePartDescriptor,
+}
+
+impl Attachment {
+    pub fn is_downloadable(&self) -> bool {
+        self.part.is_valid()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -372,6 +415,7 @@ pub fn fixture_messages() -> Vec<MessageSummary> {
                     name: "notes.pdf".into(),
                     media_type: Some("application/pdf".into()),
                     octets: Some(10),
+                    part: MimePartDescriptor::default(),
                 }]
             } else {
                 Vec::new()

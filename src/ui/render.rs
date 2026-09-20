@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     config,
+    model::Attachment,
     state::{
         Action, ComposerState, DraftCatalogState, MessageFilter, ReaderState, SessionState,
         ViewSnapshot, ViewStatus,
@@ -459,6 +460,7 @@ fn should_render_mail(status: ViewStatus, has_messages: bool) -> bool {
 
 fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
     clear_box(&ui.reader);
+    ui.attachment_progress.borrow_mut().clear();
     if matches!(&snapshot.reader, ReaderState::Closed) {
         ui.reader.append(&status_panel(ViewStatus::Ready));
         return;
@@ -623,7 +625,8 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
                 );
             }
             for attachment in &body.attachments {
-                ui.reader.append(&attachment_card(attachment));
+                ui.reader
+                    .append(&received_attachment_card(ui, snapshot, attachment));
             }
         }
         _ => {
@@ -659,6 +662,110 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         ));
     }
     ui.reader.append(&replies);
+}
+
+fn received_attachment_card(ui: &Ui, snapshot: &ViewSnapshot, attachment: &Attachment) -> gtk::Box {
+    let card = attachment_card(attachment);
+    let job = snapshot.attachment_downloads.iter().find(|job| {
+        snapshot
+            .selected_message
+            .as_ref()
+            .is_some_and(|message| message.id == job.message_id)
+            && job.part_path == attachment.part.path
+    });
+    if let Some(job) = job {
+        let progress = gtk::ProgressBar::builder()
+            .show_text(true)
+            .hexpand(false)
+            .width_request(180)
+            .build();
+        progress.set_fraction(if job.total == 0 {
+            0.0
+        } else {
+            (job.transferred as f64 / job.total as f64).clamp(0.0, 1.0)
+        });
+        progress.set_text(Some(&format!(
+            "{} of {}",
+            format_bytes(job.transferred),
+            format_bytes(job.total)
+        )));
+        ui.attachment_progress
+            .borrow_mut()
+            .insert(job.job_id, progress.clone());
+        card.append(&progress);
+        let cancel = gtk::Button::builder()
+            .label("Cancel")
+            .css_classes(["flat"])
+            .build();
+        let weak = ui.downgrade();
+        let job_id = job.job_id;
+        cancel.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dispatch(Action::CancelAttachment(job_id));
+            }
+        });
+        card.append(&cancel);
+        return card;
+    }
+    let open = gtk::Button::builder().label("Open").build();
+    let save = gtk::Button::builder().label("Save As…").build();
+    let available = attachment.is_downloadable();
+    open.set_sensitive(available);
+    save.set_sensitive(available);
+    if !available {
+        open.set_tooltip_text(Some("Refresh this message to load attachment details"));
+        save.set_tooltip_text(Some("Refresh this message to load attachment details"));
+    }
+    let weak = ui.downgrade();
+    let open_attachment = attachment.clone();
+    open.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.dispatch(Action::OpenAttachment(open_attachment.clone()));
+        }
+    });
+    let weak = ui.downgrade();
+    let save_attachment = attachment.clone();
+    save.connect_clicked(move |_| {
+        let Some(ui) = weak.upgrade() else { return };
+        let dialog = gtk::FileDialog::builder().title("Save attachment").build();
+        dialog.set_initial_name(Some(&safe_suggested_name(&save_attachment.name)));
+        let weak = ui.downgrade();
+        let attachment = save_attachment.clone();
+        dialog.save(
+            Some(&ui.window),
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                let Ok(file) = result else { return };
+                let Some(path) = file.path() else { return };
+                if let Some(ui) = weak.upgrade() {
+                    ui.dispatch(Action::SaveAttachment {
+                        attachment: attachment.clone(),
+                        destination: path,
+                    });
+                }
+            },
+        );
+    });
+    card.append(&open);
+    card.append(&save);
+    card
+}
+
+fn safe_suggested_name(value: &str) -> String {
+    let name = std::path::Path::new(value)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let name = name
+        .chars()
+        .filter(|character| !character.is_control() && *character != '/')
+        .take(255)
+        .collect::<String>();
+    if name.is_empty() || matches!(name.as_str(), "." | "..") {
+        "attachment".into()
+    } else {
+        name
+    }
 }
 
 fn render_filters(ui: &Ui, active: MessageFilter) {
@@ -1196,5 +1303,12 @@ mod tests {
         let copy = send_failure_text(SendFailure::DeliveryUncertain);
         assert!(copy.contains("may have succeeded"));
         assert!(copy.contains("Check Sent"));
+    }
+
+    #[test]
+    fn attachment_save_suggestion_never_contains_a_path() {
+        assert_eq!(safe_suggested_name("../../secret/report.pdf"), "report.pdf");
+        assert_eq!(safe_suggested_name(".."), "attachment");
+        assert_eq!(safe_suggested_name("bad\nname.txt"), "badname.txt");
     }
 }
