@@ -10,17 +10,19 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
     let mut used_fallback = parsed.is_none();
     let (sender, email, subject, received_at) = if let Some(parsed) = parsed {
         let from = parsed.from().and_then(|addresses| addresses.first());
-        let sender = from
-            .and_then(|address| address.name.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                used_fallback = true;
-                "Unknown sender"
-            });
         let email = from
             .and_then(|address| address.address.as_deref())
             .filter(|value| !value.trim().is_empty())
             .map(|value| cap(value, 320, 320));
+        let sender = from
+            .and_then(|address| address.name.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| cap(value, 160, 640))
+            .or_else(|| email.clone())
+            .unwrap_or_else(|| {
+                used_fallback = true;
+                "Unknown sender".into()
+            });
         let subject = parsed
             .subject()
             .filter(|value| !value.trim().is_empty())
@@ -29,7 +31,7 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
                 "(No subject)"
             });
         (
-            cap(sender, 160, 640),
+            sender,
             email,
             cap(subject, 512, 2_048),
             parsed.date().map(|date| date.to_timestamp()),
@@ -284,6 +286,16 @@ Content-Type: text/html; charset=utf-8
         let body = map_body(body(&[0xff, 0, 1]));
         assert_eq!(body.text, "No readable message body.");
         assert!(body.used_fallback);
+    }
+
+    #[test]
+    fn email_address_is_a_complete_sender_when_display_name_is_absent() {
+        let message = map_summary(summary(
+            b"From: no-reply@example.com\r\nSubject: Maintenance complete\r\n\r\n",
+        ));
+        assert_eq!(message.sender, "no-reply@example.com");
+        assert_eq!(message.email.as_deref(), Some("no-reply@example.com"));
+        assert!(!message.used_fallback);
     }
 
     #[test]

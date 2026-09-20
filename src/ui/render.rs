@@ -474,7 +474,11 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
         _ => {}
     }
     if let Some(detail) = partial_sync_detail(snapshot) {
-        banners.push(("Some messages are incomplete".to_owned(), detail, None));
+        banners.push((
+            "Some message details are unavailable".to_owned(),
+            detail,
+            None,
+        ));
     }
     for (title, detail, action) in banners {
         ui.list_banner
@@ -505,18 +509,18 @@ fn partial_sync_detail(snapshot: &ViewSnapshot) -> Option<String> {
     let mut details = Vec::new();
     if metadata.fallback_count > 0 {
         details.push(format!(
-            "{} {} shown with fallback content",
+            "{} {} missing a usable sender or subject",
             metadata.fallback_count,
             if metadata.fallback_count == 1 {
-                "message was"
+                "message is"
             } else {
-                "messages were"
+                "messages are"
             }
         ));
     }
     if metadata.skipped_count > 0 {
         details.push(format!(
-            "{} {} skipped because Gmail did not return usable content",
+            "{} {} not listed because Gmail did not return a usable header",
             metadata.skipped_count,
             if metadata.skipped_count == 1 {
                 "message was"
@@ -865,7 +869,7 @@ mod tests {
             },
         }));
         let detail = partial_sync_detail(&state.snapshot()).unwrap();
-        assert!(detail.contains("2 messages were skipped"));
+        assert!(detail.contains("2 messages were not listed"));
         assert!(!detail.contains("fallback"));
     }
 }
