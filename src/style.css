@@ -1,0 +1,185 @@
+@define-color waymail_bg #10171d;
+@define-color waymail_surface #151e24;
+@define-color waymail_surface_2 #1b272f;
+@define-color waymail_border alpha(#a9c1ce, 0.20);
+@define-color waymail_text #f2f7fa;
+@define-color waymail_muted #aabac4;
+@define-color waymail_accent #35c7ee;
+
+.waymail-window,
+.waymail-window window,
+.waymail-window headerbar {
+  background-color: @waymail_bg;
+  color: @waymail_text;
+}
+
+.waymail-window headerbar {
+  min-height: 56px;
+  border-bottom: 1px solid @waymail_border;
+  box-shadow: none;
+}
+
+.waymail-folder-pane {
+  background-color: #11191f;
+  border-right: 1px solid @waymail_border;
+}
+
+.waymail-compose {
+  min-height: 44px;
+  border-radius: 9px;
+  background: linear-gradient(90deg, #138bb2, #219eba);
+  color: white;
+}
+
+.waymail-folder-list,
+.waymail-message-list,
+.waymail-reader {
+  background-color: @waymail_surface;
+}
+
+.waymail-folder-row,
+.waymail-message-row {
+  border-radius: 0;
+  border: 0;
+  background: transparent;
+  color: @waymail_text;
+  padding: 0;
+}
+
+.waymail-folder-row {
+  margin: 2px 10px;
+  border-radius: 8px;
+}
+
+.waymail-folder-row:hover,
+.waymail-folder-row.selected {
+  background-color: alpha(@waymail_accent, 0.14);
+}
+
+.waymail-folder-row.selected {
+  color: #eaffff;
+}
+
+.waymail-count {
+  min-width: 24px;
+  min-height: 22px;
+  border-radius: 6px;
+  background-color: alpha(@waymail_accent, 0.22);
+  color: #dffaff;
+  font-weight: 700;
+}
+
+.waymail-message-list {
+  border-right: 1px solid @waymail_border;
+}
+
+.waymail-message-row {
+  border-bottom: 1px solid @waymail_border;
+  border-left: 3px solid transparent;
+}
+
+.waymail-message-row:hover {
+  background-color: alpha(white, 0.035);
+}
+
+.waymail-message-row.selected {
+  border-left-color: @waymail_accent;
+  background-color: alpha(@waymail_accent, 0.14);
+}
+
+.waymail-message-row.unread {
+  background-color: alpha(@waymail_accent, 0.045);
+}
+
+.waymail-message-row.selected.unread {
+  background-color: alpha(@waymail_accent, 0.14);
+}
+
+.waymail-avatar {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 999px;
+  background: linear-gradient(145deg, #40525d, #26343d);
+  color: #e6f5fa;
+}
+
+.waymail-avatar.large {
+  min-width: 50px;
+  min-height: 50px;
+  border: 1px solid @waymail_accent;
+}
+
+.waymail-search {
+  min-height: 38px;
+  border-radius: 8px;
+  border: 1px solid @waymail_border;
+  background-color: alpha(white, 0.025);
+}
+
+.waymail-filter {
+  min-height: 36px;
+  padding: 0 2px 6px;
+  border-radius: 0;
+  color: @waymail_muted;
+  background: transparent;
+}
+
+.waymail-filter-active {
+  color: @waymail_text;
+  font-weight: 700;
+  border-bottom: 2px solid @waymail_accent;
+}
+
+.waymail-window button.circular {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.waymail-reader {
+  color: @waymail_text;
+}
+
+.waymail-body {
+  font-size: 1.08em;
+  line-height: 1.45;
+}
+
+.waymail-attachment {
+  min-height: 54px;
+  padding: 12px 16px;
+  border: 1px solid @waymail_border;
+  border-radius: 9px;
+  background-color: @waymail_surface_2;
+}
+
+.waymail-reader-action {
+  min-height: 42px;
+  padding: 0 18px;
+  border: 1px solid @waymail_border;
+  border-radius: 8px;
+  background-color: @waymail_surface_2;
+}
+
+.waymail-reader-action:first-child {
+  color: @waymail_accent;
+  background-color: alpha(@waymail_accent, 0.10);
+}
+
+.waymail-online {
+  color: #8de39c;
+}
+
+.waymail-status {
+  padding: 28px;
+  color: @waymail_muted;
+}
+
+.dim-label {
+  color: @waymail_muted;
+}
+
+button:focus-visible,
+entry:focus-visible {
+  outline: 2px solid @waymail_accent;
+  outline-offset: -2px;
+}
