@@ -110,3 +110,19 @@ Residual manual-only checks remain native Wayland close during an indeterminate 
 - `git diff --check`: PASS
 
 Live authorization, Gmail INBOX loading, and saved-token restart restoration are now verified. Manual refresh timing, failure/recovery cases, disconnect cleanup, malformed live mail, responsive edge states, and Flatpak remain open acceptance items.
+
+### Full HTML reader repair
+
+- Replaced the GTK plain-text body label with WebKitGTK HTML rendering backed by an ephemeral network session.
+- Disabled JavaScript, embedded navigation, permission requests, downloads, persistent web storage, media, WebRTC, and remote images by default; links open externally only after a user gesture and remote images require a per-message opt-in.
+- Removed the IMAP byte-range request, reader body caps, truncated state, and truncation banner. Whitford now requests the complete message with `BODY.PEEK[]` and renders its complete HTML or plain-text body.
+- Corrected MIME selection so only a real `text/html` part creates a WebKit reader; plain-text messages retain the lightweight GTK label.
+
+### Verification after full-reader repair
+
+- `cargo fmt --check`: PASS
+- `cargo test`: PASS — 69 passed, 0 failed
+- `cargo clippy --all-targets -- -D warnings`: PASS
+- `cargo build --release`: PASS
+- `git diff --check`: PASS
+- Native installed release: launched, Gmail authorization restored, INBOX sync completed, and WebKit content process started.

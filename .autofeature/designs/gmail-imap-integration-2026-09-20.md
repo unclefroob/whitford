@@ -36,7 +36,7 @@ As a Whitford user, I want to connect my Gmail account and see my real inbox so 
 - Multiple accounts or non-Gmail providers.
 - Full mailbox/folder synchronization, offline cache/database, attachment downloading, and push/IDLE updates.
 - Google production verification and public credential distribution; this remains a local testing client.
-- HTML rendering; the MVP displays sanitized plain text only.
+- Persistent remote-content permission; HTML rendering uses a locked-down ephemeral WebKit session and requires a per-message opt-in for remote images.
 
 ## Context
 
@@ -181,7 +181,7 @@ The proposed slice can turn Whitford into a credible Gmail developer preview, bu
 
 The minimum useful slice is one sequential account pipeline: resolve and validate one local Google desktop-client JSON file; restore one refresh token or run one PKCE loopback authorization; obtain an access token and verified email identity; read the newest 50 INBOX messages through read-only IMAP; map bounded MIME bytes to owned display values; render them in the existing shell; allow manual refresh; and delete the refresh token on confirmed disconnect. Anything that does not make that path secure, honest, recoverable, or testable is deferred.
 
-The following are deliberately not prerequisites: a database/cache, pagination, background polling/IDLE, additional folders, attachment payloads, HTML rendering, SMTP, or any server mutation. The application may retain the last successful result only in memory during the current process so a transient refresh failure can show stale mail with an offline banner. A cold start has no mail until Gmail responds.
+The following are deliberately not prerequisites: a database/cache, pagination, background polling/IDLE, additional folders, attachment actions, SMTP, or any server mutation. The application may retain the last successful result only in memory during the current process so a transient refresh failure can show stale mail with an offline banner. A cold start has no mail until Gmail responds.
 
 #### Complexity and module-boundary challenge
 
@@ -250,7 +250,7 @@ The startup path sends `Restore`. No stored token yields disconnected onboarding
 - `OAuthClientConfig`: validated `client_id`, optional desktop client secret, exact HTTPS Google authorization/token endpoints, and allowed loopback redirect form. Parsing rejects non-`installed` JSON, the wrong `project_id` (`whitford-email` for this developer-preview build), empty IDs, non-Google hosts, insecure endpoints, and oversized files. It implements a redacted `Debug` or no `Debug`.
 - `AccountIdentity`: verified email returned by Google's HTTPS userinfo endpoint plus stable provider (`Gmail`). No access/refresh token and no unverified ID-token parsing enters the domain model.
 - `MailboxSnapshot`: `Vec<Message>`, `SyncMetadata { completed_at, loaded_count, requested_limit: 50, fallback_count, skipped_count }`, and the single `Inbox` folder. Empty is a valid successful snapshot.
-- `RawFetchedMessage`: UID, UIDVALIDITY, flags, optional internal date, and at most 64 KiB of `BODY.PEEK[]` bytes. It exists only between the Gmail adapter and pure message mapper and is dropped immediately after mapping.
+- `RawFetchedMessage`: UID, UIDVALIDITY, flags, optional internal date, and the complete `BODY.PEEK[]` response. It exists only between the Gmail adapter and pure message mapper and is dropped immediately after mapping.
 - `MessageId`: owned opaque `gmail:{uidvalidity}:{uid}` value; never use array position or a possibly missing `Message-ID` header as identity.
 - `WorkerCommand`: `Restore`, `Connect`, `Refresh`, `Disconnect`, `Cancel`, `ReopenAuthorization`, and `Shutdown`, with every user-visible operation carrying a monotonically increasing `OperationId` issued by the reducer.
 - `WorkerEvent`: phase changes, authorization URL/deadline, successful identity/snapshot, no stored account, successful disconnect, and `Failure { kind, retryable, preserve_mail }`. Events contain static/sanitized user copy and typed categories, never raw library errors, URLs containing state/code, tokens, callback queries, or raw message bytes.
@@ -290,7 +290,7 @@ No main-thread callback may call filesystem, D-Bus, DNS, HTTP, TLS, IMAP, MIME p
 - Store one refresh token in the default Freedesktop Secret Service collection under fixed application/provider attributes so replacement remains single-account. The label may identify Whitford/Gmail, but logs may not expose item labels, attributes, or email. No plaintext, file, environment-variable, settings, or in-memory-across-restart fallback is allowed.
 - On refresh `invalid_grant`, attempt to remove the saved token and suppress automatic retry loops. Confirmed removal requires Connect; failed removal requires Disconnect cleanup first. Retain already loaded messages only for the current session. Network/5xx failures must not delete a valid token.
 - Fetch the account email from Google's userinfo endpoint over verified TLS using the memory-only access token; require a non-empty verified email before building XOAUTH2.
-- Gmail access is hard-coded to `imap.gmail.com:993`; TLS hostname and trust-chain validation are mandatory. Authenticate with XOAUTH2, then `EXAMINE INBOX` (not `SELECT`), sequence-fetch UIDs for only the newest at-most-50 messages, and issue one batched `UID FETCH` using `BODY.PEEK[]<0.65536>`. Do not issue unbounded search, `STORE`, `COPY`, `MOVE`, `EXPUNGE`, or non-PEEK body fetches.
+- Gmail access is hard-coded to `imap.gmail.com:993`; TLS hostname and trust-chain validation are mandatory. Authenticate with XOAUTH2, then `EXAMINE INBOX` (not `SELECT`), sequence-fetch UIDs for only the newest at-most-50 messages, and issue one batched `UID FETCH` using complete `BODY.PEEK[]`. Do not issue unbounded search, `STORE`, `COPY`, `MOVE`, `EXPUNGE`, or non-PEEK body fetches.
 - Map and sort the returned batch once; missing/malformed individual messages receive deterministic safe fallbacks or are counted as skipped. One malformed message must not discard the other 49. Raw MIME, token, and protocol objects never reach `AppState`.
 
 #### Product-review requirements folded into the architecture
@@ -310,7 +310,7 @@ No main-thread callback may call filesystem, D-Bus, DNS, HTTP, TLS, IMAP, MIME p
 - Keep OAuth URL/callback parsing, XDG path resolution, config validation, XOAUTH2 encoding, MIME mapping, fallback construction, reducer transitions, freshness copy, and UID selection pure. I/O adapters should be thin.
 - Reuse one HTTP client with redirects disabled and finite connect/request timeouts. Reuse the same redaction/error conversion helpers across token and userinfo calls. Do not duplicate status/error copy across `render.rs` and `widgets.rs`; project it once from `ViewSnapshot`.
 - Prefer enums over booleans for session/phase/failure state. Remove obsolete `Surface` demo state and fixture-only archive paths rather than maintaining mutually inconsistent modes in production. Keep deterministic fixtures under `#[cfg(test)]` as builders for reducer tests.
-- Ensure owned strings are capped on Unicode scalar/grapheme-safe boundaries before entering widgets: sender/subject/header limits, 280-character preview, and approximately 32 KiB plain-text reader body. When both MIME alternatives exist, derive readable text from the HTML alternative so generated plain-text tracking destinations do not overwhelm the message; fall back to `text/plain` when the HTML alternative has no readable content. Whitford must never pass HTML markup to a GTK label intentionally.
+- Cap sender/subject/header fields and the 280-character list preview on Unicode-safe boundaries, but preserve the complete reader body. Real `text/html` parts render in a locked-down WebKit view; `text/plain` remains a GTK label. When both alternatives exist, derive searchable/preview text from HTML so generated plain-text tracking destinations do not overwhelm the list.
 - Use custom/redacted `Debug` implementations or omit `Debug` for token/config/auth-attempt containers. Wrap secret strings/buffers in zeroizing containers, while recognizing this is defense in depth rather than a guarantee against all allocator copies.
 
 ### Step 3 — Unit Test Plan
@@ -349,7 +349,7 @@ Tests remain display-independent and run with `cargo test`. Real Google, Secret 
 
 - Happy: XOAUTH2 bytes have the required control-A framing; unordered UIDs choose the newest 50; a batched response maps UID, UIDVALIDITY, unread/starred flags, and bounded bytes.
 - Nil: absent UID or UIDVALIDITY is skipped and counted; no search results returns an empty successful mailbox.
-- Empty/boundary: exactly 0/1/50/51 UIDs, duplicate UIDs, missing body, partial fetch, 64 KiB truncation, out-of-order responses, and Gmail challenge text are handled deterministically.
+- Empty/boundary: exactly 0/1/50/51 UIDs, duplicate UIDs, missing body, out-of-order responses, and Gmail challenge text are handled deterministically.
 - Error: DNS/TCP/TLS/hostname/authentication/EXAMINE/SEARCH/FETCH/stream timeout/logout failure map to stable categories. Logout failure after a successful complete fetch is logged as sanitized cleanup context and does not erase valid results.
 
 `map_message` and text/fallback helpers: `src/message.rs`
@@ -448,7 +448,7 @@ No implementation step is complete until all four cells for its data flow have b
 
 ### Step 4 — Performance Review
 
-- Bound work at every layer: one account, one mailbox, newest 50 UIDs, one batched fetch, 64 KiB maximum fetched prefix per message, approximately 32 KiB display body, 280-character preview, bounded headers/fields, and finite callback/HTTP/IMAP timeouts.
+- Bound work at every layer where it does not alter user-visible message content: one account, one mailbox, newest 50 UIDs, one batched fetch, 280-character preview, bounded headers/fields, and finite callback/HTTP/IMAP timeouts. Reader bodies are complete.
 - Use UID SEARCH plus one UID FETCH set; do not put an IMAP round trip inside a message loop. Sorting at most 50 records is `O(n log n)` and filtering/search remains `O(n)`. Deduplicate UIDs with a set before fetch/mapping.
 - Parse/map off the GTK thread and commit a complete `MailboxSnapshot` atomically. Never stream partial rows into widgets. Drop raw fetch/MIME buffers immediately after mapping and do not retain token responses or access tokens beyond the current operation.
 - One foreground worker operation avoids duplicate refresh/sync traffic. Refresh while already syncing either disables the action or supersedes/coalesces the prior generation; it never queues unbounded work.
@@ -516,7 +516,7 @@ No implementation step is complete until all four cells for its data flow have b
 - SMTP, compose/send/reply, drafts, archive/delete, read/unread, star, label, and folder mutations: require server-backed commands, conflict/error semantics, and dedicated acceptance coverage.
 - Additional Gmail folders, labels, multiple accounts, and non-Gmail providers: would change identity, secret-keying, navigation, and sync architecture.
 - IDLE/push, periodic background refresh, notifications, and retry daemons: avoid hidden traffic and lifecycle complexity until one-shot sync is proven.
-- Full-message/attachment downloading, remote images, and HTML/WebKit rendering: remain disabled; only bounded sanitized plaintext and attachment metadata are displayed.
+- Attachment actions remain disabled. Complete messages are retrieved, HTML renders in an ephemeral locked-down WebKit session, and remote images remain blocked until the user opts in for that message.
 - Public OAuth credentials and Google production verification: this build remains an explicitly documented bring-your-own-client developer preview.
 - Google-side token revocation as part of local Disconnect: local secret removal is implemented and clearly distinguished; documentation links to Google Account access revocation.
 
@@ -584,7 +584,6 @@ pub(crate) struct Message {
     unread: bool,
     starred: bool,
     attachments: Vec<Attachment>,
-    truncated: bool,
     used_fallback: bool,
 }
 pub(crate) struct SyncMetadata {
@@ -609,7 +608,6 @@ struct RawFetchedMessage {
     internal_date_unix: Option<i64>,
     rfc822_size: Option<u32>,
     raw: Vec<u8>,             // <= 65_536 bytes
-    truncated: bool,
 }
 struct MessageFlags { seen: bool, flagged: bool }
 ```
@@ -716,14 +714,14 @@ Each sync performs this sequence under explicit phase timeouts: TCP connect; rus
 Require `Mailbox::uid_validity`. Use the `EXAMINE` message count to address only the newest at-most-50 sequence numbers, sort/deduplicate and bound the returned UIDs, and build a comma-separated numeric UID set from integers only. If the mailbox is empty, return an empty successful snapshot without either FETCH. Count expunges, missing UIDs, duplicates, unilateral results, and unusable body records as skipped. The only body fetch query is:
 
 ```text
-(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[]<0.65536>)
+(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])
 ```
 
 Collect the `uid_fetch` stream to completion before committing. Accept only requested UIDs, ignore duplicate/unilateral fetches deterministically, require each record's UID and body, and reject a body over 65,536 bytes. Any stream/protocol error discards the candidate batch and preserves the previous snapshot; a malformed individual completed record is fallback/skipped without losing its peers. `BODY.PEEK` plus `EXAMINE` are both mandatory. There is no code path or command constant for `SELECT`, `STORE`, `COPY`, `MOVE`, `EXPUNGE`, APPEND, or non-PEEK body access.
 
-Map `\Seen` to `unread = false`, `\Flagged` to `starred = true`, and combine `uid_validity`/UID into the opaque ID. `truncated` is true when `RFC822.SIZE` exceeds returned bytes. Sort final messages by UID descending. Immediately map each `Fetch` into owned `RawFetchedMessage`, finish/drop the fetch stream and session, then parse/map the raw records; no `Fetch` borrow crosses the adapter.
+Map `\Seen` to `unread = false`, `\Flagged` to `starred = true`, and combine `uid_validity`/UID into the opaque ID. Sort final messages by UID descending. Immediately map each `Fetch` into owned `RawFetchedMessage`, finish/drop the fetch stream and session, then parse/map the raw records; no `Fetch` borrow crosses the adapter.
 
-`message.rs` parses the bounded raw bytes with `MessageParser`. Prefer readable text derived from the first HTML alternative, which preserves link labels without exposing tracking destinations; fall back to the first usable `text/plain` body, then `No readable message body.` Never pass `body_html()` directly to GTK. Normalize NUL/control characters and whitespace, cap sender to 160 graphemes, address to 320, subject to 512, preview to 280, reader text to both 32 KiB and 16,384 graphemes, attachment names to 255, and attachment metadata to 20 entries. Truncation is UTF-8/grapheme safe. Missing sender/subject/date/body use stable copy (`Unknown sender`, `(No subject)`, no timestamp, and the body fallback). MIME attachment payloads and parser objects are dropped; only bounded name/type/declared-size metadata is copied.
+`message.rs` parses the complete raw bytes with `MessageParser`. Prefer readable text derived from the first HTML alternative for previews, which preserves link labels without exposing tracking destinations; fall back to the first usable `text/plain` body, then `No readable message body.` Preserve the complete real HTML or plain-text reader body. Normalize NUL/control characters in plain text, cap sender to 160 graphemes, address to 320, subject to 512, preview to 280, attachment names to 255, and attachment metadata to 20 entries. Missing sender/subject/date/body use stable copy (`Unknown sender`, `(No subject)`, no timestamp, and the body fallback). MIME parser objects are dropped after mapping.
 
 ### Reducer, UI effects, and read-only guards
 
@@ -770,7 +768,7 @@ Known dependency/platform risks are explicit:
 - `secret-service` uses direct session D-Bus and can prompt; Flatpak therefore needs exactly `--talk-name=org.freedesktop.secrets`. There is no plaintext or portal-secret fallback. Native/manual tests need an actual provider, not merely the crate.
 - Flatpak needs `--share=network` both for Google/Gmail and for the host browser to reach the loopback listener. GIO OpenURI uses the portal without another broad bus permission. Do not add host/home/config filesystem access.
 - Use ring rather than rustls's default aws-lc provider to avoid an extra CMake-heavy provider in native/Flatpak builds. HTTP and IMAP still have separate client configurations but one rustls implementation and one compiled root set.
-- The 64-KiB prefix can truncate a late MIME body. Mark the message truncated and show bounded fallback copy; do not silently refetch the full message in this slice.
+- Complete `BODY.PEEK[]` avoids reader truncation. A later efficiency pass should fetch structure/list metadata first and complete body parts on open so attachments are not transferred eagerly.
 
 Primary API references used to lock this design are the `async-imap` 0.11.3 `Client`/`Session` APIs, `oauth2` 5.0's stateful reqwest and redirect guidance, `secret-service` 5.2's async collection/item APIs, GIO's async default-URI launcher, Google's desktop loopback/PKCE and Gmail XOAUTH2 documentation, and the Freedesktop Secret Service attribute/locking specification.
 

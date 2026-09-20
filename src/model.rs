@@ -57,10 +57,10 @@ pub struct Message {
     pub preview: Option<String>,
     pub received_at_unix: Option<i64>,
     pub body: String,
+    pub html_body: Option<String>,
     pub unread: bool,
     pub starred: bool,
     pub attachments: Vec<Attachment>,
-    pub truncated: bool,
     pub used_fallback: bool,
 }
 
@@ -124,6 +124,7 @@ pub fn fixture_messages() -> Vec<Message> {
         preview: Some("A bounded preview".into()),
         received_at_unix: Some(1_700_000_000 + i64::from(uid)),
         body: "A safe plain-text body.".into(),
+        html_body: None,
         unread,
         starred: false,
         attachments: if attachment {
@@ -135,7 +136,6 @@ pub fn fixture_messages() -> Vec<Message> {
         } else {
             Vec::new()
         },
-        truncated: false,
         used_fallback: false,
     })
     .collect()

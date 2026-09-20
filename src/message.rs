@@ -5,89 +5,92 @@ use crate::{
 use mail_parser::{MessageParser, MimeHeaders, PartType};
 use unicode_segmentation::UnicodeSegmentation;
 
-const BODY_BYTES: usize = 32 * 1024;
-const BODY_GRAPHEMES: usize = 16_384;
-
 pub fn map_message(raw: RawFetchedMessage) -> Message {
     let parsed = MessageParser::default().parse(&raw.raw);
     let mut used_fallback = parsed.is_none();
-    let (sender, email, subject, body, received_at, attachments) = if let Some(parsed) = parsed {
-        let from = parsed.from().and_then(|addresses| addresses.first());
-        let sender = from
-            .and_then(|address| address.name.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("Unknown sender");
-        let email = from
-            .and_then(|address| address.address.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| cap(value, 320, 320));
-        let subject = parsed
-            .subject()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                used_fallback = true;
-                "(No subject)"
-            });
-        let body = parsed
-            .body_html(0)
-            .map(|html| html_to_readable_text(&html))
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                parsed
-                    .body_text(0)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|value| value.into_owned())
-            })
-            .unwrap_or_else(|| {
-                used_fallback = true;
-                "No readable message body.".into()
-            });
-        let attachments = parsed
-            .attachments()
-            .take(20)
-            .map(|part| {
-                let name = part
-                    .attachment_name()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("Unnamed attachment");
-                let media_type = part.content_type().map(|kind| {
-                    format!(
-                        "{}/{}",
-                        kind.ctype(),
-                        kind.subtype().unwrap_or("octet-stream")
-                    )
+    let (sender, email, subject, body, html_body, received_at, attachments) =
+        if let Some(parsed) = parsed {
+            let from = parsed.from().and_then(|addresses| addresses.first());
+            let sender = from
+                .and_then(|address| address.name.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Unknown sender");
+            let email = from
+                .and_then(|address| address.address.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| cap(value, 320, 320));
+            let subject = parsed
+                .subject()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    used_fallback = true;
+                    "(No subject)"
                 });
-                let octets = match &part.body {
-                    PartType::Binary(value) | PartType::InlineBinary(value) => {
-                        Some(value.len() as u64)
+            let html_body = parsed.html_part(0).and_then(|part| match &part.body {
+                PartType::Html(html) if !html.trim().is_empty() => Some(html.clone().into_owned()),
+                _ => None,
+            });
+            let html_text = html_body.as_deref().map(html_to_readable_text);
+            let body = html_text
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    parsed
+                        .body_text(0)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| value.into_owned())
+                })
+                .unwrap_or_else(|| {
+                    used_fallback = true;
+                    "No readable message body.".into()
+                });
+            let attachments = parsed
+                .attachments()
+                .take(20)
+                .map(|part| {
+                    let name = part
+                        .attachment_name()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("Unnamed attachment");
+                    let media_type = part.content_type().map(|kind| {
+                        format!(
+                            "{}/{}",
+                            kind.ctype(),
+                            kind.subtype().unwrap_or("octet-stream")
+                        )
+                    });
+                    let octets = match &part.body {
+                        PartType::Binary(value) | PartType::InlineBinary(value) => {
+                            Some(value.len() as u64)
+                        }
+                        _ => None,
+                    };
+                    Attachment {
+                        name: cap(name, 255, 255),
+                        media_type,
+                        octets,
                     }
-                    _ => None,
-                };
-                Attachment {
-                    name: cap(name, 255, 255),
-                    media_type,
-                    octets,
-                }
-            })
-            .collect();
-        (
-            cap(sender, 160, 160),
-            email,
-            cap(subject, 512, 512),
-            cap(&normalize(&body), BODY_GRAPHEMES, BODY_BYTES),
-            parsed.date().map(|date| date.to_timestamp()),
-            attachments,
-        )
-    } else {
-        (
-            "Unknown sender".into(),
-            None,
-            "(No subject)".into(),
-            "No readable message body.".into(),
-            raw.internal_date_unix,
-            Vec::new(),
-        )
-    };
+                })
+                .collect();
+            (
+                cap(sender, 160, 160),
+                email,
+                cap(subject, 512, 512),
+                normalize(&body),
+                html_body,
+                parsed.date().map(|date| date.to_timestamp()),
+                attachments,
+            )
+        } else {
+            (
+                "Unknown sender".into(),
+                None,
+                "(No subject)".into(),
+                "No readable message body.".into(),
+                None,
+                raw.internal_date_unix,
+                Vec::new(),
+            )
+        };
     let initials = initials(&sender);
     let preview_text = cap(
         body.split_whitespace()
@@ -107,10 +110,10 @@ pub fn map_message(raw: RawFetchedMessage) -> Message {
         preview: (!preview_text.is_empty()).then_some(preview_text),
         received_at_unix: received_at.or(raw.internal_date_unix),
         body,
+        html_body,
         unread: !raw.flags.seen,
         starred: raw.flags.flagged,
         attachments,
-        truncated: raw.truncated,
         used_fallback,
     }
 }
@@ -224,7 +227,6 @@ mod tests {
             internal_date_unix: None,
             rfc822_size: Some(bytes.len() as u32),
             raw: bytes.to_vec(),
-            truncated: false,
         }
     }
     #[test]
@@ -233,6 +235,7 @@ mod tests {
         assert_eq!(message.id, MessageId::gmail(7, 9));
         assert_eq!(message.sender, "Mara Chen");
         assert_eq!(message.body, "Safe body");
+        assert!(message.html_body.is_none());
         assert!(message.unread && message.starred);
     }
     #[test]
@@ -241,6 +244,7 @@ mod tests {
         assert!(!message.body.contains("<b>"));
         assert!(!message.body.contains("<script>"));
         assert!(!message.body.contains("bad()"));
+        assert!(message.html_body.is_some());
     }
     #[test]
     fn multipart_prefers_readable_html_without_tracking_destinations() {
@@ -266,6 +270,12 @@ Content-Type: text/html; charset=utf-8
         assert!(message.body.contains("Kitchen & Cooking | Bathroom"));
         assert!(!message.body.contains("email.example.com"));
         assert!(!message.body.contains("tracking-destination"));
+        assert!(
+            message
+                .html_body
+                .as_deref()
+                .is_some_and(|html| html.contains("<a href="))
+        );
     }
     #[test]
     fn malformed_and_missing_fields_have_bounded_fallbacks() {
@@ -274,7 +284,7 @@ Content-Type: text/html; charset=utf-8
         assert_eq!(message.subject, "(No subject)");
         assert!(message.used_fallback);
         let huge = "🙂".repeat(20_000);
-        assert!(cap(&huge, 16_384, BODY_BYTES).len() <= BODY_BYTES);
+        assert!(cap(&huge, 16_384, 32 * 1024).len() <= 32 * 1024);
     }
     #[test]
     fn unicode_headers_rtl_and_grapheme_caps_are_safe() {

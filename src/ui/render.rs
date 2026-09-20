@@ -160,9 +160,12 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
     ));
     ui.reader.append(&title_line);
 
-    if message.used_fallback || message.truncated {
-        let (title, detail) = message_content_notice(message.used_fallback, message.truncated);
-        ui.reader.append(&notice_banner(title, detail, None));
+    if message.used_fallback {
+        ui.reader.append(&notice_banner(
+            "Fallback content",
+            "Whitford could not extract the preferred message body, so this reader shows a safe fallback.",
+            None,
+        ));
     }
 
     let sender_line = gtk::Box::builder()
@@ -211,17 +214,21 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         "win.reply",
     ));
     ui.reader.append(&sender_line);
-    ui.reader.append(
-        &gtk::Label::builder()
-            .label(&message.body)
-            .xalign(0.0)
-            .yalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .selectable(true)
-            .css_classes(["whitford-body"])
-            .build(),
-    );
+    if let Some(html) = &message.html_body {
+        ui.reader.append(&super::email_view::message_body(html));
+    } else {
+        ui.reader.append(
+            &gtk::Label::builder()
+                .label(&message.body)
+                .xalign(0.0)
+                .yalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .selectable(true)
+                .css_classes(["whitford-body"])
+                .build(),
+        );
+    }
     for attachment in &message.attachments {
         ui.reader.append(&attachment_card(attachment));
     }
@@ -418,24 +425,6 @@ fn partial_sync_detail(snapshot: &ViewSnapshot) -> Option<String> {
         ));
     }
     (!details.is_empty()).then(|| format!("{}.", details.join("; ")))
-}
-
-fn message_content_notice(used_fallback: bool, truncated: bool) -> (&'static str, &'static str) {
-    match (used_fallback, truncated) {
-        (true, true) => (
-            "Fallback, truncated content",
-            "Whitford could not extract the preferred plain-text part and only loaded a bounded portion of this message.",
-        ),
-        (true, false) => (
-            "Fallback content",
-            "Whitford could not extract the preferred plain-text part, so this reader shows a safe fallback.",
-        ),
-        (false, true) => (
-            "Message content truncated",
-            "Only a bounded portion of this message was loaded for the developer preview.",
-        ),
-        (false, false) => ("", ""),
-    }
 }
 
 fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
@@ -777,19 +766,5 @@ mod tests {
         let detail = partial_sync_detail(&state.snapshot()).unwrap();
         assert!(detail.contains("2 messages were skipped"));
         assert!(!detail.contains("fallback"));
-    }
-
-    #[test]
-    fn reader_notice_distinguishes_fallback_and_truncation() {
-        assert_eq!(message_content_notice(false, false), ("", ""));
-        assert_eq!(message_content_notice(true, false).0, "Fallback content");
-        assert_eq!(
-            message_content_notice(false, true).0,
-            "Message content truncated"
-        );
-        assert_eq!(
-            message_content_notice(true, true).0,
-            "Fallback, truncated content"
-        );
     }
 }

@@ -24,6 +24,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi"] }
 unicode-segmentation = "1.13.3"
 url = "2.5.8"
+webkit6 = { version = "0.6.1", features = ["v2_52"] }
 webpki-roots = "1.0.9"
 zeroize = "1.9.0"
 

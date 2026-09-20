@@ -1,11 +1,12 @@
 # Whitford
 
-Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores only the refresh token in Freedesktop Secret Service, and displays a bounded snapshot of the newest 50 INBOX messages. Sending, archive, delete, labels, read/star changes, additional folders, downloads, and offline disk storage are deliberately unavailable.
+Whitford is a native, read-only Gmail developer preview for Wayland. It authorizes one Gmail account in the system browser, stores only the refresh token in Freedesktop Secret Service, and displays a bounded snapshot of the newest 50 INBOX messages. HTML mail is rendered with WebKitGTK in an ephemeral session with JavaScript, embedded navigation, downloads, and remote images disabled by default; remote images can be enabled explicitly for one message. Sending, archive, delete, labels, read/star changes, additional folders, downloads, and offline disk storage are deliberately unavailable.
 
 ## Requirements
 
 - Rust 1.98 or newer
 - GTK 4.22 and libadwaita 1.9 development files
+- WebKitGTK 6.0 development files
 - A Wayland session
 - A session-bus Secret Service provider such as GNOME Keyring, KWallet, or KeePassXC
 - Network access to Google OAuth, userinfo, and `imap.gmail.com:993`
@@ -13,7 +14,7 @@ Whitford is a native, read-only Gmail developer preview for Wayland. It authoriz
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel rust gtk4 libadwaita pkgconf gnome-keyring
+sudo pacman -S --needed base-devel rust gtk4 libadwaita webkitgtk-6.0 pkgconf gnome-keyring
 ```
 
 ## Google developer-preview setup
@@ -86,13 +87,13 @@ Use a non-production test mailbox and record each result without copying credent
 
 1. Move `google-oauth.json` aside, start the native app, and confirm onboarding names the missing file, resolved path, project/API/test-user requirements, broad scope, and read-only limitation. Restore it with the `install -Dm600` command above.
 2. Run `GDK_BACKEND=wayland cargo run`, connect, complete consent, and confirm the verified account plus newest-50 metadata appear.
-3. Open a plain-text message and an HTML-only or multipart message. Confirm safe text, attachment metadata, and any fallback/truncation notice are honest.
+3. Open a plain-text message and an HTML-only or multipart message. Confirm the complete body renders, HTML typography and layout appear inside the reader, remote images start blocked, **Load images** affects only that message, external links open only after a click, and attachment/fallback copy remains honest.
 4. Restart Whitford and confirm Secret Service restores the authorization without another browser prompt.
 5. Choose **Refresh** and confirm the displayed last-successful-sync time changes. At narrow width (about 600 px), confirm status/recovery banners remain visible above both the list and reader.
 6. Temporarily disconnect the network, choose **Refresh**, and confirm retained mail stays visible under an offline/stale banner with the real last sync and **Retry**. Restore the network and retry.
 7. Revoke Whitford from [Google Account third-party connections](https://myaccount.google.com/connections), refresh, and confirm stale mail remains visible with **Reconnect** rather than a retry loop.
 8. During a new authorization, exercise **Cancel** and **Reopen Browser**. Confirm an old or timed-out browser callback cannot change the current session.
-9. With a suitable test mailbox, confirm empty INBOX and malformed/truncated messages show bounded, human-readable states and zero fallback/skipped counters are hidden.
+9. With a suitable test mailbox, confirm empty INBOX and malformed messages show human-readable states and zero fallback/skipped counters are hidden.
 10. Choose **Disconnect**, verify the confirmation copy, and confirm success clears mail. A forced/unavailable Secret Service cleanup must retain stale mail and offer **Retry cleanup**; do not claim this case passed unless it was actually reproduced.
 11. Inspect logs and confirm they contain no client credential, OAuth URL/query/state/code/token, email identity, UID, sender, subject, body, attachment name, or search text.
 

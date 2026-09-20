@@ -144,6 +144,20 @@
   line-height: 1.45;
 }
 
+.whitford-email-view {
+  min-height: 620px;
+  border: 1px solid @whitford_border;
+  border-radius: 10px;
+  background-color: white;
+}
+
+.whitford-remote-content {
+  padding: 10px 14px;
+  border: 1px solid @whitford_border;
+  border-radius: 9px;
+  background-color: @whitford_surface_2;
+}
+
 .whitford-attachment {
   min-height: 54px;
   padding: 12px 16px;

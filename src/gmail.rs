@@ -12,8 +12,7 @@ use tokio_rustls::{
 pub const IMAP_HOST: &str = "imap.gmail.com";
 pub const IMAP_PORT: u16 = 993;
 pub const MESSAGE_LIMIT: usize = 50;
-pub const RAW_MESSAGE_LIMIT: usize = 65_536;
-pub const FETCH_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[]<0.65536>)";
+pub const FETCH_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MessageFlags {
@@ -29,7 +28,6 @@ pub struct RawFetchedMessage {
     pub internal_date_unix: Option<i64>,
     pub rfc822_size: Option<u32>,
     pub raw: Vec<u8>,
-    pub truncated: bool,
 }
 
 #[derive(Debug)]
@@ -122,14 +120,14 @@ fn read_only_command_plan(sequence: &str, uids: &str) -> Vec<String> {
     ]
 }
 
-pub fn bounded_raw(
+pub fn build_raw_message(
     uid_validity: u32,
     uid: u32,
     flags: MessageFlags,
     rfc822_size: Option<u32>,
     raw: &[u8],
 ) -> Result<RawFetchedMessage, GmailError> {
-    if uid == 0 || raw.len() > RAW_MESSAGE_LIMIT {
+    if uid == 0 {
         return Err(GmailError::Protocol);
     }
     Ok(RawFetchedMessage {
@@ -138,7 +136,6 @@ pub fn bounded_raw(
         flags,
         internal_date_unix: None,
         rfc822_size,
-        truncated: rfc822_size.is_some_and(|size| size as usize > raw.len()),
         raw: raw.to_vec(),
     })
 }
@@ -275,7 +272,8 @@ fn classify_fetches(
             skipped_count += 1;
             continue;
         };
-        let Ok(mut mapped) = bounded_raw(uid_validity, uid, candidate.flags, candidate.size, &body)
+        let Ok(mut mapped) =
+            build_raw_message(uid_validity, uid, candidate.flags, candidate.size, &body)
         else {
             skipped_count += 1;
             continue;
@@ -324,35 +322,16 @@ mod tests {
         assert_eq!(skipped, 1);
     }
     #[test]
-    fn no_uids_skips_fetch_and_oversize_is_rejected() {
+    fn no_uids_skips_fetch_and_zero_uid_is_rejected() {
         assert_eq!(uid_sequence_set(&[]), None);
-        assert!(
-            bounded_raw(
-                1,
-                1,
-                MessageFlags::default(),
-                None,
-                &vec![0; RAW_MESSAGE_LIMIT + 1]
-            )
-            .is_err()
-        );
+        assert!(build_raw_message(1, 0, MessageFlags::default(), None, b"x").is_err());
     }
     #[test]
     fn uid_boundaries_and_read_only_command_plan_are_exact() {
         for count in [0, 1, 49, 50, 51] {
             assert_eq!(select_newest_uids(1..=count).len(), count.min(50) as usize);
         }
-        assert!(
-            bounded_raw(
-                1,
-                1,
-                MessageFlags::default(),
-                None,
-                &vec![0; RAW_MESSAGE_LIMIT]
-            )
-            .is_ok()
-        );
-        assert!(bounded_raw(1, 0, MessageFlags::default(), None, b"x").is_err());
+        assert!(build_raw_message(1, 1, MessageFlags::default(), None, b"complete").is_ok());
         let plan = read_only_command_plan("51:100", "101,102");
         let transcript = plan.join("\n");
         for required in [
@@ -376,9 +355,11 @@ mod tests {
         ] {
             assert!(!transcript.contains(forbidden));
         }
+        assert!(FETCH_QUERY.contains("BODY.PEEK[]"));
+        assert!(!FETCH_QUERY.contains("<0."));
     }
     #[test]
-    fn fetch_classification_counts_unrequested_duplicate_bodyless_and_oversize() {
+    fn fetch_classification_counts_unrequested_duplicate_and_bodyless() {
         let requested = BTreeSet::from([1, 2]);
         let candidate = |uid, body: Option<Vec<u8>>| FetchCandidate {
             uid,
@@ -400,13 +381,6 @@ mod tests {
         );
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.skipped_count, 4);
-        let partial = classify_fetches(
-            7,
-            &BTreeSet::from([2]),
-            vec![candidate(Some(2), Some(vec![0; RAW_MESSAGE_LIMIT + 1]))],
-        );
-        assert_eq!(partial.records.len(), 0);
-        assert_eq!(partial.skipped_count, 1);
         let raced = classify_fetches(
             7,
             &BTreeSet::from([1, 2]),

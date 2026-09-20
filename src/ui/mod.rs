@@ -1,5 +1,6 @@
 mod actions;
 mod build;
+mod email_view;
 mod render;
 mod time;
 mod widgets;
