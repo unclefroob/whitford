@@ -9,16 +9,16 @@ use crate::state::{Action, AppState, MessageFilter};
 pub(super) fn build(application: &adw::Application, state: Rc<RefCell<AppState>>) -> Ui {
     let folders = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["waymail-folder-list"])
+        .css_classes(["whitford-folder-list"])
         .build();
     let messages = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["waymail-message-list"])
+        .css_classes(["whitford-message-list"])
         .build();
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search mail")
         .hexpand(true)
-        .css_classes(["waymail-search"])
+        .css_classes(["whitford-search"])
         .build();
     search.update_property(&[
         gtk::accessible::Property::Label("Search mail"),
@@ -55,11 +55,11 @@ pub(super) fn build(application: &adw::Application, state: Rc<RefCell<AppState>>
     toast_overlay.set_child(Some(&outer));
     let window = adw::ApplicationWindow::builder()
         .application(application)
-        .title("Waymail")
+        .title("Whitford")
         .default_width(1440)
         .default_height(900)
         .content(&toast_overlay)
-        .css_classes(["waymail-window"])
+        .css_classes(["whitford-window"])
         .build();
     window.set_size_request(600, 560);
     add_breakpoints(
@@ -111,7 +111,7 @@ pub(super) fn connect_signals(ui: &Ui) {
 fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Label) {
     let pane = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .css_classes(["waymail-folder-pane"])
+        .css_classes(["whitford-folder-pane"])
         .build();
     let account = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -142,7 +142,7 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .margin_start(16)
         .margin_end(16)
         .margin_bottom(18)
-        .css_classes(["suggested-action", "waymail-compose"])
+        .css_classes(["suggested-action", "whitford-compose"])
         .build();
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -158,7 +158,7 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
     let sync_title = gtk::Label::builder()
         .label("●  All caught up")
         .xalign(0.0)
-        .css_classes(["waymail-online"])
+        .css_classes(["whitford-online"])
         .build();
     let sync_detail = gtk::Label::builder()
         .label("Last sync: 2 minutes ago")
@@ -219,7 +219,7 @@ fn build_message_page(
         let button = gtk::Button::builder()
             .label(text)
             .has_frame(false)
-            .css_classes(["waymail-filter"])
+            .css_classes(["whitford-filter"])
             .build();
         button.update_property(&[gtk::accessible::Property::Label(&format!(
             "Show {text} messages"
@@ -276,7 +276,7 @@ fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box) {
         .margin_end(32)
         .margin_top(24)
         .margin_bottom(32)
-        .css_classes(["waymail-reader"])
+        .css_classes(["whitford-reader"])
         .build();
     toolbar.set_content(Some(
         &gtk::ScrolledWindow::builder()

@@ -1,18 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>dev.waymail.Waymail</id>
-  <name>Waymail</name>
+  <id>dev.whitford.Whitford</id>
+  <name>Whitford</name>
   <summary>A focused native mail shell for Wayland</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <description>
-    <p>Waymail is a keyboard-friendly, adaptive desktop mail shell built with GTK and libadwaita.</p>
+    <p>Whitford is a keyboard-friendly, adaptive desktop mail shell built with GTK and libadwaita.</p>
     <p>This preview uses local fixtures and does not yet connect to mail accounts.</p>
   </description>
-  <launchable type="desktop-id">dev.waymail.Waymail.desktop</launchable>
-  <developer id="dev.waymail"><name>Waymail contributors</name></developer>
+  <launchable type="desktop-id">dev.whitford.Whitford.desktop</launchable>
+  <developer id="dev.whitford"><name>Whitford contributors</name></developer>
   <content_rating type="oars-1.1"/>
-  <provides><binary>waymail</binary></provides>
+  <provides><binary>whitford</binary></provides>
   <categories><category>Network</category><category>Email</category></categories>
   <releases><release version="0.1.0" date="2026-09-20"/></releases>
 </component>

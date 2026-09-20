@@ -1,8 +1,8 @@
 use adw::prelude::*;
 use gtk::gdk;
-use waymail::ui;
+use whitford::ui;
 
-const APP_ID: &str = "dev.waymail.Waymail";
+const APP_ID: &str = "dev.whitford.Whitford";
 
 fn main() -> gtk::glib::ExitCode {
     let application = adw::Application::builder().application_id(APP_ID).build();

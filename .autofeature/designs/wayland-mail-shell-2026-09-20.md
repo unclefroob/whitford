@@ -23,7 +23,7 @@ As a design-conscious Wayland user, I want a fast and attractive desktop inbox s
 - The generated mockup has been copied into the repository as the visual contract.
 
 ## Assumptions
-- `waymail` is a working project/app ID name, not a final brand decision.
+- `whitford` is a working project/app ID name, not a final brand decision.
 - Dark mode is the only polished theme in this milestone.
 - Local fixture data is authoritative; persistence and live network behavior are explicitly deferred.
 - Custom styling should feel at home on Wayland without relying on a GNOME Shell workflow.
@@ -141,7 +141,7 @@ Skipped at the user's direction to think less and build the MVP faster. The prec
 | `src/ui.rs` | Build the adaptive widget tree, own a lightweight `Ui` handle plus shared `Rc<RefCell<AppState>>`, dispatch commands, perform targeted render passes, announce feedback, and connect accessibility/tooltips | Domain decision logic, protocol placeholders, persistence |
 | `src/state/tests.rs` | Black-box-style unit tests against the `state` module's public-to-crate behavior and fixture IDs | GTK/display-dependent assertions |
 
-Use the provisional application ID `dev.waymail.Waymail` consistently in code and metadata until branding is decided. Keep `Ui` as a plain struct of necessary widget handles, not a GTK subclass. Domain IDs are stable values rather than list offsets. Optional display fields remain `Option<T>` and presentation supplies explicit fallbacks (initials placeholder, hidden preview/timestamp/attachment details), never `unwrap()`.
+Use the provisional application ID `dev.whitford.Whitford` consistently in code and metadata until branding is decided. Keep `Ui` as a plain struct of necessary widget handles, not a GTK subclass. Domain IDs are stable values rather than list offsets. Optional display fields remain `Option<T>` and presentation supplies explicit fallbacks (initials placeholder, hidden preview/timestamp/attachment details), never `unwrap()`.
 
 #### GTK state and data flow
 
@@ -181,7 +181,7 @@ GTK signal / SimpleAction -> Action -> AppState::dispatch (pure transition)
 
 - Keep domain terminology consistent: `FolderId`, `MessageId`, `selected_folder_id`, `selected_message_id`, `search_query`, `visible_messages`, `normalize_selection`; avoid generic `data`, `item`, or `handle_event` names where the mail concept is known.
 - Centralize transitions in `AppState::dispatch`; mouse and keyboard commands must use the same actions. Centralize widget refresh in small `render_folders`, `render_messages`, `render_reader`, and `render_status` helpers.
-- Keep CSS selectors feature-scoped (`.waymail-window`, `.folder-pane`, `.message-row`, `.reader-pane`) and define repeated colors, radii, and spacing at the top of the embedded stylesheet where GTK CSS permits. Do not reproduce styling inline in Rust.
+- Keep CSS selectors feature-scoped (`.whitford-window`, `.folder-pane`, `.message-row`, `.reader-pane`) and define repeated colors, radii, and spacing at the top of the embedded stylesheet where GTK CSS permits. Do not reproduce styling inline in Rust.
 - Use `Result` only for genuinely fallible startup boundaries and `Option` for absent domain data. Avoid `unwrap`, `expect`, broad error swallowing, and speculative error enums for pure no-op commands.
 - Target fewer than 300 lines per Rust module. If `ui.rs` approaches that threshold, split only its render helpers into `src/ui/render.rs`; do not pre-create that module.
 - Accessibility is part of widget construction: meaningful accessible labels for icon-only buttons, visible tooltips, logical tab order, keyboard focus indication, and text labels that are not encoded only by color.
@@ -309,9 +309,9 @@ Every runtime data flow above has defined handling and a test. GTK presentation 
 - `src/ui.rs`: adaptive GTK/libadwaita composition, signals/actions, rendering helpers, accessibility, and toasts.
 - `src/style.css`: embedded dark visual tokens and component-scoped styles matching the approved mockup.
 - `README.md`: prerequisites, commands, architecture summary, shortcut table, limitations, and manual smoke matrix.
-- `data/dev.waymail.Waymail.desktop`: provisional desktop launcher metadata.
-- `data/dev.waymail.Waymail.metainfo.xml`: provisional AppStream metadata.
-- `build-aux/dev.waymail.Waymail.yml`: early Flatpak manifest, documented as unverified locally.
+- `data/dev.whitford.Whitford.desktop`: provisional desktop launcher metadata.
+- `data/dev.whitford.Whitford.metainfo.xml`: provisional AppStream metadata.
+- `build-aux/dev.whitford.Whitford.yml`: early Flatpak manifest, documented as unverified locally.
 
 No icon asset is invented in this milestone; metadata should use a safe generic mail icon or omit an app-specific icon until branding supplies one. Do not copy the mockup into runtime resources.
 
@@ -397,7 +397,7 @@ None. The approved scope, toolchain, and visual contract support this plan witho
 - Install window-scoped `gio::SimpleAction`s once (`win.compose`, `win.focus-search`, `win.folder-next`, `win.folder-previous`, `win.message-next`, `win.message-previous`, `win.archive`, `win.reply`, `win.back`, and the honest deferred commands). Register application accelerators with `set_accels_for_action`; all pointer buttons use `action_name` so there is one command path.
 - Use global accelerators only where they cannot corrupt text entry: `<Primary>n`, `<Primary>f`, `<Alt>Up/Down`, `<Primary>Up/Down`, `Delete`, `<Primary>r`, and `Escape`. If the mockup's bare `R/F` and mail-style `J/K` are retained, add them through a managed `gtk::ShortcutController` on the non-editable mail panes, not as application-wide accelerators; they must not fire while search has focus.
 - Use symbolic icon names with text where the mockup has text. Every icon-only button gets both a tooltip and `gtk::accessible::Property::Label`; page titles are meaningful because libadwaita uses them for the back button and screen reader. Preserve visible focus rings, minimum 40sp pointer targets, ellipsized single-line list metadata, wrapped reader body text, and cyan-plus-shape selection indication rather than color alone.
-- Scope CSS classes to Waymail and use `@define-color` tokens. Do not style GTK internals by fragile child-node position, hide focus outlines, or claim compositor transparency. `adw::ToastOverlay` wraps the complete adaptive content and reports deferred/no-op commands without logging fixture content.
+- Scope CSS classes to Whitford and use `@define-color` tokens. Do not style GTK internals by fragile child-node position, hide focus outlines, or claim compositor transparency. `adw::ToastOverlay` wraps the complete adaptive content and reports deferred/no-op commands without logging fixture content.
 
 ### Verification
 

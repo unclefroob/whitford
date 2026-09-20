@@ -1,6 +1,6 @@
-# Waymail
+# Whitford
 
-Waymail is a fast, fixture-driven native mail shell for Wayland. This milestone proves the adaptive three-pane interaction, keyboard workflow, visual language, and Rust/GTK build. It does not connect to a mail server or persist changes.
+Whitford is a fast, fixture-driven native mail shell for Wayland. This milestone proves the adaptive three-pane interaction, keyboard workflow, visual language, and Rust/GTK build. It does not connect to a mail server or persist changes.
 
 ## Requirements
 

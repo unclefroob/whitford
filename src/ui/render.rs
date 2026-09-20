@@ -25,7 +25,7 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
     for folder in &snapshot.folders {
         let row = gtk::Button::builder()
             .has_frame(false)
-            .css_classes(["waymail-folder-row"])
+            .css_classes(["whitford-folder-row"])
             .build();
         if folder.id == snapshot.selected_folder_id {
             row.add_css_class("selected");
@@ -56,7 +56,7 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
             content.append(
                 &gtk::Label::builder()
                     .label(count.to_string())
-                    .css_classes(["waymail-count"])
+                    .css_classes(["whitford-count"])
                     .build(),
             );
         }
@@ -154,7 +154,7 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             .label(message.initials.unwrap_or("?"))
             .width_chars(3)
             .height_request(50)
-            .css_classes(["waymail-avatar", "large"])
+            .css_classes(["whitford-avatar", "large"])
             .build(),
     );
     let sender_copy = gtk::Box::builder()
@@ -199,7 +199,7 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .selectable(true)
-            .css_classes(["waymail-body"])
+            .css_classes(["whitford-body"])
             .build(),
     );
     for attachment in &message.attachments {
@@ -233,9 +233,9 @@ fn render_filters(ui: &Ui, active: MessageFilter) {
     for (filter, button) in &ui.filter_buttons {
         let selected = *filter == active;
         if selected {
-            button.add_css_class("waymail-filter-active");
+            button.add_css_class("whitford-filter-active");
         } else {
-            button.remove_css_class("waymail-filter-active");
+            button.remove_css_class("whitford-filter-active");
         }
         button.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
     }
@@ -254,9 +254,9 @@ fn render_sync(ui: &Ui, surface: Surface) {
     ui.sync_title.set_text(title);
     ui.sync_detail.set_text(detail);
     if online {
-        ui.sync_title.add_css_class("waymail-online");
+        ui.sync_title.add_css_class("whitford-online");
     } else {
-        ui.sync_title.remove_css_class("waymail-online");
+        ui.sync_title.remove_css_class("whitford-online");
     }
 }
 

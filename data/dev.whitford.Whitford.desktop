@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Waymail
+Name=Whitford
 Comment=A focused native mail shell
-Exec=waymail
+Exec=whitford
 Icon=mail-unread-symbolic
 Terminal=false
 Categories=Network;Email;
 Keywords=mail;email;inbox;
 StartupNotify=true
-StartupWMClass=dev.waymail.Waymail
+StartupWMClass=dev.whitford.Whitford

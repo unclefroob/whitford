@@ -5,7 +5,7 @@ use crate::{model::Message, state::ViewStatus};
 pub(super) fn message_row(message: &Message, selected: bool) -> gtk::Button {
     let row = gtk::Button::builder()
         .has_frame(false)
-        .css_classes(["waymail-message-row"])
+        .css_classes(["whitford-message-row"])
         .build();
     if selected {
         row.add_css_class("selected");
@@ -26,7 +26,7 @@ pub(super) fn message_row(message: &Message, selected: bool) -> gtk::Button {
         .width_chars(3)
         .height_request(44)
         .valign(gtk::Align::Start)
-        .css_classes(["waymail-avatar"])
+        .css_classes(["whitford-avatar"])
         .build();
     let copy = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -120,7 +120,7 @@ pub(super) fn status_panel(status: ViewStatus) -> gtk::Box {
         .vexpand(true)
         .margin_top(48)
         .margin_bottom(48)
-        .css_classes(["waymail-status"])
+        .css_classes(["whitford-status"])
         .build();
     panel.append(&gtk::Image::builder().icon_name(icon).pixel_size(40).build());
     panel.append(
@@ -145,7 +145,7 @@ pub(super) fn attachment_card(name: &str, details: Option<&str>) -> gtk::Box {
         .orientation(gtk::Orientation::Horizontal)
         .spacing(14)
         .margin_top(8)
-        .css_classes(["waymail-attachment"])
+        .css_classes(["whitford-attachment"])
         .build();
     card.append(&gtk::Image::from_icon_name("x-office-document-symbolic"));
     let copy = gtk::Box::builder()
@@ -186,7 +186,7 @@ pub(super) fn text_action(icon: &str, label: &str, action: &str) -> gtk::Button 
         .label(label)
         .icon_name(icon)
         .action_name(action)
-        .css_classes(["waymail-reader-action"])
+        .css_classes(["whitford-reader-action"])
         .build()
 }
 

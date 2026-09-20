@@ -1,0 +1,20 @@
+app-id: dev.whitford.Whitford
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: whitford
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --device=dri
+modules:
+  - name: whitford
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --offline
+      - install -Dm755 target/release/whitford /app/bin/whitford
+      - install -Dm644 data/dev.whitford.Whitford.desktop /app/share/applications/dev.whitford.Whitford.desktop
+      - install -Dm644 data/dev.whitford.Whitford.metainfo.xml /app/share/metainfo/dev.whitford.Whitford.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
