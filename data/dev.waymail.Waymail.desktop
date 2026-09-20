@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Waymail
+Comment=A focused native mail shell
+Exec=waymail
+Icon=mail-unread-symbolic
+Terminal=false
+Categories=Network;Email;
+Keywords=mail;email;inbox;
+StartupNotify=true
+StartupWMClass=dev.waymail.Waymail
