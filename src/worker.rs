@@ -3,8 +3,8 @@ use crate::{
     composer::{ComposeDraft, DraftAttachment},
     config, drafts, gmail, message,
     model::{
-        AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, ReplyContext,
-        SyncMetadata,
+        AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, MessageLocator,
+        ReplyContext, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -186,6 +186,7 @@ pub enum WorkerCommand {
         generation: u64,
         account_email: String,
         message_id: MessageId,
+        locator: MessageLocator,
     },
     ClearBodyCache {
         operation_id: CacheOperationId,
@@ -994,6 +995,7 @@ async fn controller(
             generation,
             account_email,
             message_id,
+            locator,
         } = &command
         {
             if *generation != cache_generation.load(Ordering::Acquire) {
@@ -1008,6 +1010,7 @@ async fn controller(
             let generation = *generation;
             let account_email = account_email.clone();
             let message_id = message_id.clone();
+            let locator = locator.clone();
             let failure_message_id = message_id.clone();
             let auth = auth.clone();
             let cache_generation = cache_generation.clone();
@@ -1015,10 +1018,13 @@ async fn controller(
             let cache_io = cache_io.clone();
             body_task = Some(tokio::spawn(async move {
                 let result = std::panic::AssertUnwindSafe(fetch_body(
-                    request_id,
-                    generation,
-                    account_email,
-                    message_id,
+                    BodyLoadRequest {
+                        request_id,
+                        generation,
+                        account_email,
+                        message_id,
+                        locator,
+                    },
                     &tx,
                     &auth,
                     BodyCacheServices {
@@ -1592,6 +1598,14 @@ struct BodyCacheServices {
     io: Arc<Mutex<()>>,
 }
 
+struct BodyLoadRequest {
+    request_id: BodyRequestId,
+    generation: u64,
+    account_email: String,
+    message_id: MessageId,
+    locator: MessageLocator,
+}
+
 async fn guard_smtp_send<F>(send: F) -> Result<(), smtp::SmtpError>
 where
     F: Future<Output = Result<(), smtp::SmtpError>>,
@@ -1992,9 +2006,11 @@ async fn complete_sync(
     emit_phase(tx, id, WorkerPhase::FetchingInbox);
     let account_for_cache = account.clone();
     let result = cache_blocking(cache_io.clone(), move || {
+        let folder_catalog = fetched.folder_catalog;
         let (messages, fallback_count) = message::map_summaries(fetched.records);
         let requested_limit = cache::load_limit();
         let fresh = MailboxSnapshot {
+            folder_catalog,
             metadata: SyncMetadata {
                 completed_at: SystemTime::now(),
                 requested_limit,
@@ -2024,14 +2040,18 @@ async fn complete_sync(
 }
 
 async fn fetch_body(
-    request_id: BodyRequestId,
-    generation: u64,
-    account_email: String,
-    message_id: MessageId,
+    request: BodyLoadRequest,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     auth: &Arc<Mutex<Option<RuntimeAuth>>>,
     cache: BodyCacheServices,
 ) {
+    let BodyLoadRequest {
+        request_id,
+        generation,
+        account_email,
+        message_id,
+        locator,
+    } = request;
     let cache_generation = cache.generation;
     let cache_io = cache.io;
     let load_account = account_email.clone();
@@ -2059,7 +2079,7 @@ async fn fetch_body(
         }
         return;
     }
-    let Some((uid_validity, uid)) = message_id.gmail_parts() else {
+    if message_id.gmail_value().is_none() || !locator.is_valid() {
         send_body_failure(
             tx,
             request_id,
@@ -2068,7 +2088,7 @@ async fn fetch_body(
             BodyFailure::Protocol,
         );
         return;
-    };
+    }
     let credentials = auth
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2099,7 +2119,7 @@ async fn fetch_body(
         );
         return;
     }
-    let raw = match gmail::fetch_body(&email, access_token.as_str(), uid_validity, uid).await {
+    let raw = match gmail::fetch_body(&email, access_token.as_str(), &message_id, &locator).await {
         Ok(raw) => raw,
         Err(error) => {
             send_body_failure(
@@ -2288,7 +2308,13 @@ mod tests {
             request_id: BodyRequestId(4),
             generation: 1,
             account_email: "canary@example.com".into(),
-            message_id: MessageId::gmail(7, 9),
+            message_id: MessageId::gmail(9),
+            locator: MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
         };
         assert!(!format!("{body_command:?}").contains("canary@example.com"));
         let send_command = WorkerCommand::SendReply {
@@ -2435,6 +2461,7 @@ mod tests {
                     Ok(gmail::InboxFetch {
                         records: vec![],
                         skipped_count: 0,
+                        folder_catalog: crate::model::FolderCatalog::inbox_only(),
                     })
                 },
             )
@@ -2465,6 +2492,7 @@ mod tests {
                     Ok(gmail::InboxFetch {
                         records: vec![],
                         skipped_count: 0,
+                        folder_catalog: crate::model::FolderCatalog::inbox_only(),
                     })
                 },
             )

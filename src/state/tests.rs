@@ -19,6 +19,7 @@ fn ready(state: &mut AppState) -> OperationId {
         account: account(),
         snapshot: MailboxSnapshot {
             messages: fixture_messages(),
+            folder_catalog: crate::model::FolderCatalog::inbox_only(),
             metadata: SyncMetadata {
                 completed_at: SystemTime::UNIX_EPOCH,
                 requested_limit: 50,
@@ -53,7 +54,7 @@ fn reply_body() -> Arc<crate::model::MessageBody> {
 fn load_replyable(state: &mut AppState) {
     ready(state);
     finish_draft_restore(state, Vec::new());
-    let id = MessageId::gmail(1, 1);
+    let id = MessageId::gmail(1);
     let update = state.dispatch(Action::SelectMessage(id.clone()));
     let (request_id, generation) = match update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -97,7 +98,7 @@ fn finish_draft_restore(state: &mut AppState, drafts: Vec<crate::composer::Compo
 fn composing_waits_for_draft_restore_then_runs_the_queued_intent() {
     let mut state = AppState::new();
     ready(&mut state);
-    let id = MessageId::gmail(1, 1);
+    let id = MessageId::gmail(1);
     let update = state.dispatch(Action::SelectMessage(id.clone()));
     let (request_id, generation) = match update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -153,7 +154,7 @@ fn draft_restore_failure_blocks_writes_and_can_be_retried() {
     let stale = crate::composer::new_forward(
         "stale-draft".into(),
         "person@example.com",
-        MessageId::gmail(1, 1),
+        MessageId::gmail(1),
         "Stale",
         &Default::default(),
         "<p>stale</p>",
@@ -173,7 +174,7 @@ fn draft_restore_failure_blocks_writes_and_can_be_retried() {
 fn restored_drafts_resume_only_the_exact_message_and_compose_kind() {
     let mut state = AppState::new();
     ready(&mut state);
-    let id = MessageId::gmail(1, 1);
+    let id = MessageId::gmail(1);
     let update = state.dispatch(Action::SelectMessage(id.clone()));
     let (request_id, generation) = match update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -240,7 +241,7 @@ fn complete_sync_replaces_mailbox_and_searches_loaded_messages() {
     assert_eq!(state.snapshot().folders.len(), 1);
     assert_eq!(state.visible_message_ids().len(), 3);
     state.dispatch(Action::SetSearch("roadmap".into()));
-    assert_eq!(state.visible_message_ids(), vec![MessageId::gmail(1, 2)]);
+    assert_eq!(state.visible_message_ids(), vec![MessageId::gmail(2)]);
     state.dispatch(Action::SetSearch("missing".into()));
     assert_eq!(state.snapshot().status, ViewStatus::NoSearchResults);
 }
@@ -263,7 +264,7 @@ fn summary_sync_does_not_fetch_until_deliberate_open() {
     ready(&mut state);
     assert!(matches!(state.snapshot().reader, ReaderState::Closed));
     let list_revision = state.snapshot().list_revision;
-    let id = MessageId::gmail(1, 1);
+    let id = MessageId::gmail(1);
     let update = state.dispatch(Action::SelectMessage(id.clone()));
     let (request_id, generation) = match &update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -320,7 +321,7 @@ fn retention_increase_after_decrease_refreshes_again() {
 fn offline_session_classifies_missing_runtime_auth_as_offline() {
     let mut state = AppState::new();
     ready(&mut state);
-    let message_id = MessageId::gmail(1, 1);
+    let message_id = MessageId::gmail(1);
     let update = state.dispatch(Action::SelectMessage(message_id.clone()));
     let (request_id, generation) = match update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -364,7 +365,7 @@ fn offline_session_classifies_missing_runtime_auth_as_offline() {
 fn worker_failure_terminates_an_in_flight_reader_request() {
     let mut state = AppState::new();
     ready(&mut state);
-    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    state.dispatch(Action::SelectMessage(MessageId::gmail(1)));
     let revision = state.snapshot().reader_revision;
 
     state.dispatch(Action::WorkerUnavailable);
@@ -384,7 +385,7 @@ fn worker_failure_terminates_an_in_flight_reader_request() {
 fn stale_body_results_and_post_clear_completions_are_ignored() {
     let mut state = AppState::new();
     ready(&mut state);
-    let first = MessageId::gmail(1, 1);
+    let first = MessageId::gmail(1);
     let first_update = state.dispatch(Action::SelectMessage(first.clone()));
     let (first_request, old_generation) = match first_update.effects[0] {
         Effect::SendWorker(WorkerCommand::FetchBody {
@@ -394,7 +395,7 @@ fn stale_body_results_and_post_clear_completions_are_ignored() {
         }) => (request_id, generation),
         _ => panic!(),
     };
-    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 2)));
+    state.dispatch(Action::SelectMessage(MessageId::gmail(2)));
     state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
         request_id: first_request,
         generation: old_generation,
@@ -509,7 +510,7 @@ fn failed_disconnect_retry_keeps_worker_and_reducer_generations_aligned() {
         },
     }));
 
-    let open = state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    let open = state.dispatch(Action::SelectMessage(MessageId::gmail(1)));
     assert!(open.effects.is_empty());
     assert!(state.snapshot().visible_messages.is_empty());
 
@@ -533,7 +534,7 @@ fn failed_disconnect_retry_keeps_worker_and_reducer_generations_aligned() {
 fn account_switch_drops_old_mailbox_and_reader_before_body_requests() {
     let mut state = AppState::new();
     ready(&mut state);
-    state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
+    state.dispatch(Action::SelectMessage(MessageId::gmail(1)));
     let connect = state.dispatch(Action::Connect);
     let id = match connect.effects[0] {
         Effect::SendWorker(WorkerCommand::Connect { id }) => id,

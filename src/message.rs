@@ -1,8 +1,6 @@
 use crate::{
     gmail::{RawMessageBody, RawMessageSummary},
-    model::{
-        Attachment, FolderId, MessageBody, MessageId, MessageSummary, ReplyAddress, ReplyContext,
-    },
+    model::{Attachment, MessageBody, MessageSummary, ReplyAddress, ReplyContext},
 };
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
 use unicode_segmentation::UnicodeSegmentation;
@@ -43,8 +41,9 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
     };
     let initials = initials(&sender);
     MessageSummary {
-        id: MessageId::gmail(raw.uid_validity, raw.uid),
-        folder_id: FolderId::Inbox,
+        id: raw.id,
+        folder_id: raw.locator.folder_id.clone(),
+        locator: raw.locator,
         sender,
         email,
         initials,
@@ -58,7 +57,7 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
 }
 
 pub fn map_summaries(mut records: Vec<RawMessageSummary>) -> (Vec<MessageSummary>, usize) {
-    records.sort_by_key(|record| std::cmp::Reverse(record.uid));
+    records.sort_by_key(|record| std::cmp::Reverse(record.locator.uid));
     let messages: Vec<_> = records.into_iter().map(map_summary).collect();
     let fallbacks = messages
         .iter()
@@ -298,8 +297,13 @@ mod tests {
 
     fn summary(bytes: &[u8]) -> RawMessageSummary {
         RawMessageSummary {
-            uid_validity: 7,
-            uid: 9,
+            id: crate::model::MessageId::gmail(99),
+            locator: crate::model::MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
             flags: MessageFlags {
                 seen: false,
                 flagged: true,
@@ -313,8 +317,13 @@ mod tests {
 
     fn body(bytes: &[u8]) -> RawMessageBody {
         RawMessageBody {
-            uid_validity: 7,
-            uid: 9,
+            id: crate::model::MessageId::gmail(99),
+            locator: crate::model::MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
             raw: bytes.to_vec(),
         }
     }
@@ -322,7 +331,7 @@ mod tests {
     #[test]
     fn summary_maps_only_bounded_headers_and_stable_uid() {
         let message = map_summary(summary(b"From: =?UTF-8?Q?Mara_Chen?= <mara@example.com>\r\nSubject: Hello\r\nDate: Tue, 1 Jan 2019 00:00:00 +0000\r\n\r\nignored body"));
-        assert_eq!(message.id, MessageId::gmail(7, 9));
+        assert_eq!(message.id, crate::model::MessageId::gmail(99));
         assert_eq!(message.sender, "Mara Chen");
         assert_eq!(message.subject, "Hello");
         assert!(message.unread && message.starred);

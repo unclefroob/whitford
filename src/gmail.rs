@@ -1,5 +1,11 @@
-use crate::model::{Attachment, AttachmentState};
-use async_imap::imap_proto::types::{BodyContentCommon, BodyContentSinglePart, BodyStructure};
+use crate::model::{
+    Attachment, AttachmentState, FolderCatalog, FolderDescriptor, FolderId, FolderKind, MessageId,
+    MessageLocator,
+};
+use async_imap::{
+    imap_proto::types::{BodyContentCommon, BodyContentSinglePart, BodyStructure},
+    types::NameAttribute,
+};
 use futures_util::TryStreamExt;
 use std::collections::BTreeSet;
 use tokio::{
@@ -14,9 +20,9 @@ use tokio_rustls::{
 pub const IMAP_HOST: &str = "imap.gmail.com";
 pub const IMAP_PORT: u16 = 993;
 pub const RETENTION_OPTIONS: [usize; 4] = [50, 100, 250, 500];
-pub const SUMMARY_FETCH_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])";
+pub const SUMMARY_FETCH_QUERY: &str = "(UID X-GM-MSGID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])";
 /// Full-message fallback used only for one deliberately opened UID. Summary sync never uses it.
-pub const FULL_MESSAGE_BODY_FALLBACK_QUERY: &str = "(UID BODY.PEEK[])";
+pub const FULL_MESSAGE_BODY_FALLBACK_QUERY: &str = "(UID X-GM-MSGID BODY.PEEK[])";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_ATTACHMENTS: usize = 20;
 
@@ -28,8 +34,8 @@ pub struct MessageFlags {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawMessageSummary {
-    pub uid_validity: u32,
-    pub uid: u32,
+    pub id: MessageId,
+    pub locator: MessageLocator,
     pub flags: MessageFlags,
     pub internal_date_unix: Option<i64>,
     pub rfc822_size: Option<u32>,
@@ -39,8 +45,8 @@ pub struct RawMessageSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawMessageBody {
-    pub uid_validity: u32,
-    pub uid: u32,
+    pub id: MessageId,
+    pub locator: MessageLocator,
     pub raw: Vec<u8>,
 }
 
@@ -48,15 +54,25 @@ pub struct RawMessageBody {
 pub struct InboxFetch {
     pub records: Vec<RawMessageSummary>,
     pub skipped_count: usize,
+    pub folder_catalog: FolderCatalog,
 }
 
 struct SummaryCandidate {
     uid: Option<u32>,
+    x_gm_msgid: Option<u64>,
     flags: MessageFlags,
     internal_date_unix: Option<i64>,
     size: Option<u32>,
     header: Option<Vec<u8>>,
     attachment_state: AttachmentState,
+}
+
+struct ListedMailbox {
+    mailbox: String,
+    display_name: String,
+    kind: Option<FolderKind>,
+    selectable: bool,
+    ignored_special_use: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +258,82 @@ fn attachment_state(structure: Option<&BodyStructure<'_>>) -> AttachmentState {
     AttachmentState::Known(attachments)
 }
 
+fn folder_catalog(entries: impl IntoIterator<Item = ListedMailbox>) -> FolderCatalog {
+    let mut folders: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.selectable && !entry.ignored_special_use)
+        .map(|entry| {
+            let kind = entry.kind.unwrap_or_else(|| {
+                if entry.mailbox.eq_ignore_ascii_case("INBOX") {
+                    FolderKind::Inbox
+                } else {
+                    FolderKind::Label
+                }
+            });
+            let id = match kind {
+                FolderKind::Inbox => FolderId::Inbox,
+                FolderKind::Sent => FolderId::Sent,
+                FolderKind::AllMail => FolderId::AllMail,
+                FolderKind::Trash => FolderId::Trash,
+                FolderKind::Starred => FolderId::Starred,
+                FolderKind::Label => FolderId::Label(entry.mailbox.clone()),
+            };
+            FolderDescriptor {
+                id,
+                mailbox: entry.mailbox,
+                display_name: entry.display_name,
+                kind,
+            }
+        })
+        .collect();
+    if !folders.iter().any(|folder| folder.id == FolderId::Inbox) {
+        folders.push(FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            display_name: "Inbox".into(),
+            kind: FolderKind::Inbox,
+        });
+    }
+    FolderCatalog::bounded(folders)
+}
+
+fn list_entry(name: &async_imap::types::Name) -> ListedMailbox {
+    let attributes = name.attributes();
+    let kind = if name.name().eq_ignore_ascii_case("INBOX") {
+        Some(FolderKind::Inbox)
+    } else if attributes.contains(&NameAttribute::Sent) {
+        Some(FolderKind::Sent)
+    } else if attributes.contains(&NameAttribute::All) {
+        Some(FolderKind::AllMail)
+    } else if attributes.contains(&NameAttribute::Trash) {
+        Some(FolderKind::Trash)
+    } else if attributes.contains(&NameAttribute::Flagged) {
+        Some(FolderKind::Starred)
+    } else {
+        None
+    };
+    let ignored_special_use = attributes.iter().any(|attribute| match attribute {
+        NameAttribute::Archive | NameAttribute::Drafts | NameAttribute::Junk => true,
+        NameAttribute::Extension(value) => value.eq_ignore_ascii_case("\\Important"),
+        _ => false,
+    });
+    let display_name = match kind {
+        Some(FolderKind::Inbox) => "Inbox".into(),
+        Some(FolderKind::Sent) => "Sent".into(),
+        Some(FolderKind::AllMail) => "All Mail".into(),
+        Some(FolderKind::Trash) => "Trash".into(),
+        Some(FolderKind::Starred) => "Starred".into(),
+        _ => name.name().to_owned(),
+    };
+    ListedMailbox {
+        mailbox: name.name().to_owned(),
+        display_name,
+        kind,
+        selectable: !attributes.contains(&NameAttribute::NoSelect),
+        ignored_special_use,
+    }
+}
+
 struct Xoauth2(Vec<u8>);
 impl async_imap::Authenticator for Xoauth2 {
     type Response = Vec<u8>;
@@ -309,6 +401,26 @@ async fn fetch_inbox_inner(
         .authenticate("XOAUTH2", auth)
         .await
         .map_err(|_| GmailError::AuthenticationFailed)?;
+    let listed = {
+        let mut stream = session
+            .list(None, Some("*"))
+            .await
+            .map_err(|_| GmailError::Protocol)?;
+        let mut listed = Vec::with_capacity(crate::model::MAX_FOLDER_CATALOG_ENTRIES);
+        let mut special_count = 0_usize;
+        while let Some(name) = stream.try_next().await.map_err(|_| GmailError::Protocol)? {
+            let entry = list_entry(&name);
+            let retain_special = entry.kind.is_some() && special_count < 16;
+            if retain_special {
+                special_count += 1;
+            }
+            if retain_special || listed.len() < crate::model::MAX_FOLDER_CATALOG_ENTRIES {
+                listed.push(entry);
+            }
+        }
+        listed
+    };
+    let folder_catalog = folder_catalog(listed);
     let mailbox = session
         .examine("INBOX")
         .await
@@ -319,6 +431,7 @@ async fn fetch_inbox_inner(
         return Ok(InboxFetch {
             records: Vec::new(),
             skipped_count: 0,
+            folder_catalog,
         });
     };
     let expected =
@@ -340,6 +453,7 @@ async fn fetch_inbox_inner(
         return Ok(InboxFetch {
             records: Vec::new(),
             skipped_count: discovery_skipped,
+            folder_catalog,
         });
     };
     let fetches: Vec<_> = session
@@ -354,6 +468,7 @@ async fn fetch_inbox_inner(
         .into_iter()
         .map(|fetch| SummaryCandidate {
             uid: fetch.uid,
+            x_gm_msgid: fetch.gmail_msg_id().copied(),
             flags: MessageFlags {
                 seen: fetch
                     .flags()
@@ -371,18 +486,31 @@ async fn fetch_inbox_inner(
         })
         .collect();
     let _ = session.logout().await;
-    let mut result = classify_summaries(uid_validity, &requested, candidates);
+    let mut result = classify_summaries(
+        FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            display_name: "Inbox".into(),
+            kind: FolderKind::Inbox,
+        },
+        uid_validity,
+        &requested,
+        candidates,
+    );
     result.skipped_count = result.skipped_count.saturating_add(discovery_skipped);
+    result.folder_catalog = folder_catalog;
     Ok(result)
 }
 
 fn classify_summaries(
+    folder: FolderDescriptor,
     uid_validity: u32,
     requested: &BTreeSet<u32>,
     candidates: Vec<SummaryCandidate>,
 ) -> InboxFetch {
     let mut records = Vec::new();
-    let mut received = BTreeSet::new();
+    let mut received_uids = BTreeSet::new();
+    let mut received_ids = BTreeSet::new();
     let mut skipped_count = 0;
     for candidate in candidates {
         let Some(uid) = candidate
@@ -392,7 +520,15 @@ fn classify_summaries(
             skipped_count += 1;
             continue;
         };
-        if !received.insert(uid) {
+        if !received_uids.insert(uid) {
+            skipped_count += 1;
+            continue;
+        }
+        let Some(x_gm_msgid) = candidate.x_gm_msgid.filter(|value| *value != 0) else {
+            skipped_count += 1;
+            continue;
+        };
+        if !received_ids.insert(x_gm_msgid) {
             skipped_count += 1;
             continue;
         }
@@ -401,8 +537,13 @@ fn classify_summaries(
             continue;
         };
         records.push(RawMessageSummary {
-            uid_validity,
-            uid,
+            id: MessageId::gmail(x_gm_msgid),
+            locator: MessageLocator {
+                folder_id: folder.id.clone(),
+                mailbox: folder.mailbox.clone(),
+                uid_validity,
+                uid,
+            },
             flags: candidate.flags,
             internal_date_unix: candidate.internal_date_unix,
             rfc822_size: candidate.size,
@@ -410,36 +551,46 @@ fn classify_summaries(
             attachment_state: candidate.attachment_state,
         });
     }
-    skipped_count += requested.len().saturating_sub(received.len());
-    records.sort_by_key(|message| std::cmp::Reverse(message.uid));
+    skipped_count += requested.len().saturating_sub(received_uids.len());
+    records.sort_by_key(|message| std::cmp::Reverse(message.locator.uid));
     InboxFetch {
         records,
         skipped_count,
+        folder_catalog: FolderCatalog::bounded(vec![folder]),
     }
 }
 
 pub async fn fetch_body(
     email: &str,
     access_token: &str,
-    uid_validity: u32,
-    uid: u32,
+    id: &MessageId,
+    locator: &MessageLocator,
 ) -> Result<RawMessageBody, GmailError> {
-    if uid_validity == 0 || uid == 0 {
+    if id.gmail_value().is_none() || !locator.is_valid() {
         return Err(GmailError::Protocol);
     }
     timeout(
         Duration::from_secs(30),
-        fetch_body_inner(email, access_token, uid_validity, uid),
+        fetch_body_inner(email, access_token, id, locator),
     )
     .await
     .map_err(|_| GmailError::TimedOut)?
 }
 
+fn body_identity_matches(
+    expected_id: &MessageId,
+    locator: &MessageLocator,
+    fetched_uid: Option<u32>,
+    fetched_x_gm_msgid: Option<u64>,
+) -> bool {
+    fetched_uid == Some(locator.uid) && fetched_x_gm_msgid == expected_id.gmail_value()
+}
+
 async fn fetch_body_inner(
     email: &str,
     access_token: &str,
-    uid_validity: u32,
-    uid: u32,
+    id: &MessageId,
+    locator: &MessageLocator,
 ) -> Result<RawMessageBody, GmailError> {
     let client = tls_client().await?;
     let auth = Xoauth2(xoauth2_response(email, access_token)?);
@@ -448,16 +599,16 @@ async fn fetch_body_inner(
         .await
         .map_err(|_| GmailError::AuthenticationFailed)?;
     let mailbox = session
-        .examine("INBOX")
+        .examine(&locator.mailbox)
         .await
         .map_err(|_| GmailError::InboxUnavailable)?;
-    if mailbox.uid_validity != Some(uid_validity) {
+    if mailbox.uid_validity != Some(locator.uid_validity) {
         let _ = session.logout().await;
         return Err(GmailError::MailboxChanged);
     }
     let result = async {
         let fetches: Vec<_> = session
-            .uid_fetch(uid.to_string(), FULL_MESSAGE_BODY_FALLBACK_QUERY)
+            .uid_fetch(locator.uid.to_string(), FULL_MESSAGE_BODY_FALLBACK_QUERY)
             .await
             .map_err(|_| GmailError::Protocol)?
             .try_collect()
@@ -465,14 +616,18 @@ async fn fetch_body_inner(
             .map_err(|_| GmailError::Protocol)?;
         match fetches.as_slice() {
             [] => Err(GmailError::MessageMissing),
-            [fetch] if fetch.uid == Some(uid) => fetch
-                .body()
-                .map(|raw| RawMessageBody {
-                    uid_validity,
-                    uid,
-                    raw: raw.to_vec(),
-                })
-                .ok_or(GmailError::Protocol),
+            [fetch]
+                if body_identity_matches(id, locator, fetch.uid, fetch.gmail_msg_id().copied()) =>
+            {
+                fetch
+                    .body()
+                    .map(|raw| RawMessageBody {
+                        id: id.clone(),
+                        locator: locator.clone(),
+                        raw: raw.to_vec(),
+                    })
+                    .ok_or(GmailError::Protocol)
+            }
             _ => Err(GmailError::Protocol),
         }
     }
@@ -516,14 +671,52 @@ mod tests {
         assert_eq!(uid_sequence_set(&[0]), None);
     }
     #[test]
+    fn special_use_discovery_is_bounded_stable_and_skips_non_mail_views() {
+        let entry = |mailbox: &str, kind, selectable, ignored_special_use| ListedMailbox {
+            mailbox: mailbox.into(),
+            display_name: mailbox.into(),
+            kind,
+            selectable,
+            ignored_special_use,
+        };
+        let catalog = folder_catalog([
+            entry("[Gmail]/Sent Mail", Some(FolderKind::Sent), true, false),
+            entry("Projects/Rust", None, true, false),
+            entry("[Gmail]/Drafts", None, true, true),
+            entry("Container", None, false, false),
+            entry("INBOX", Some(FolderKind::Inbox), true, false),
+        ]);
+        assert_eq!(
+            catalog
+                .folders
+                .iter()
+                .map(|folder| folder.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                FolderId::Inbox,
+                FolderId::Sent,
+                FolderId::Label("Projects/Rust".into())
+            ]
+        );
+        assert_eq!(
+            catalog
+                .find(&FolderId::Sent)
+                .map(|folder| folder.mailbox.as_str()),
+            Some("[Gmail]/Sent Mail")
+        );
+    }
+    #[test]
     fn summary_and_body_queries_are_separated_and_read_only() {
         assert_eq!(
             SUMMARY_FETCH_QUERY,
-            "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
+            "(UID X-GM-MSGID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
         );
         assert!(!SUMMARY_FETCH_QUERY.contains("BODY.PEEK[]"));
         assert!(!SUMMARY_FETCH_QUERY.contains("BODY[TEXT]"));
-        assert_eq!(FULL_MESSAGE_BODY_FALLBACK_QUERY, "(UID BODY.PEEK[])");
+        assert_eq!(
+            FULL_MESSAGE_BODY_FALLBACK_QUERY,
+            "(UID X-GM-MSGID BODY.PEEK[])"
+        );
         assert!(!FULL_MESSAGE_BODY_FALLBACK_QUERY.contains("BODY[]"));
         for query in [SUMMARY_FETCH_QUERY, FULL_MESSAGE_BODY_FALLBACK_QUERY] {
             let upper = query.to_ascii_uppercase();
@@ -535,17 +728,40 @@ mod tests {
         }
     }
     #[test]
+    fn body_identity_requires_both_the_locator_uid_and_canonical_id() {
+        let id = MessageId::gmail(42);
+        let locator = MessageLocator {
+            folder_id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            uid_validity: 7,
+            uid: 9,
+        };
+        assert!(body_identity_matches(&id, &locator, Some(9), Some(42)));
+        assert!(!body_identity_matches(&id, &locator, Some(8), Some(42)));
+        assert!(!body_identity_matches(&id, &locator, Some(9), Some(41)));
+        assert!(!body_identity_matches(&id, &locator, Some(9), None));
+    }
+    #[test]
     fn summary_classification_rejects_bad_rows() {
-        let requested = BTreeSet::from([1, 2]);
+        let requested = BTreeSet::from([1, 2, 3]);
         let candidate = |uid, header| SummaryCandidate {
             uid,
+            x_gm_msgid: uid.map(u64::from),
             flags: MessageFlags::default(),
             internal_date_unix: None,
             size: None,
             header,
             attachment_state: AttachmentState::Unknown,
         };
+        let mut missing_canonical = candidate(Some(3), Some(b"valid header".to_vec()));
+        missing_canonical.x_gm_msgid = None;
         let result = classify_summaries(
+            FolderDescriptor {
+                id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                display_name: "Inbox".into(),
+                kind: FolderKind::Inbox,
+            },
             7,
             &requested,
             vec![
@@ -554,9 +770,13 @@ mod tests {
                 candidate(Some(9), Some(b"unrequested".to_vec())),
                 candidate(Some(2), None),
                 candidate(None, Some(b"missing uid".to_vec())),
+                missing_canonical,
             ],
         );
         assert_eq!(result.records.len(), 1);
-        assert_eq!(result.skipped_count, 4);
+        assert_eq!(result.skipped_count, 5);
+        assert_eq!(result.records[0].id, MessageId::gmail(1));
+        assert_eq!(result.records[0].locator.uid_validity, 7);
+        assert_eq!(result.records[0].locator.uid, 1);
     }
 }

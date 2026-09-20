@@ -520,7 +520,7 @@ mod tests {
         let draft = new_reply_all(
             "d".into(),
             "ME@example.com",
-            MessageId::gmail(1, 1),
+            MessageId::gmail(1),
             "Hi",
             &context,
             "<p>old</p>",
@@ -561,7 +561,7 @@ mod tests {
         let draft = new_forward(
             "d".into(),
             "me@example.com",
-            MessageId::gmail(1, 2),
+            MessageId::gmail(2),
             "Topic",
             &ReplyContext::default(),
             "<p>Hello <b>there</b></p>",

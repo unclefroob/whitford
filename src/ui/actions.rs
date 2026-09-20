@@ -97,7 +97,7 @@ fn move_folder(ui: &Ui, step: isize) {
     let next = current
         .saturating_add_signed(step)
         .min(snapshot.folders.len() - 1);
-    ui.dispatch(Action::SelectFolder(snapshot.folders[next].id));
+    ui.dispatch(Action::SelectFolder(snapshot.folders[next].id.clone()));
 }
 
 fn handle_back(ui: &Ui) {

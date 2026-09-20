@@ -2,8 +2,8 @@ use crate::{
     cache,
     composer::{self, ComposeDraft, Recipient},
     model::{
-        AccountIdentity, CacheUsage, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, MessageBody,
-        MessageId, MessageSummary,
+        AccountIdentity, CacheUsage, Folder, FolderId, MailboxSnapshot, MessageBody, MessageId,
+        MessageSummary, inbox_folder,
     },
     smtp,
     worker::{
@@ -1233,14 +1233,14 @@ impl AppState {
             _ => ViewStatus::Ready,
         };
         ViewSnapshot {
-            folders: vec![INBOX_FOLDER.clone()],
+            folders: vec![inbox_folder()],
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
             selected_folder_id: FolderId::Inbox,
             search_query: self.search_query.clone(),
             message_filter: self.message_filter,
             status,
-            folder_counts: vec![(FolderId::Inbox, self.folder_count(FolderId::Inbox))],
+            folder_counts: vec![(FolderId::Inbox, self.folder_count(&FolderId::Inbox))],
             session: self.session.clone(),
             account: self.account.clone(),
             sync_metadata: self
@@ -1311,7 +1311,7 @@ impl AppState {
             .map(|m| m.id.clone())
             .collect()
     }
-    pub fn folder_count(&self, _: FolderId) -> usize {
+    pub fn folder_count(&self, _: &FolderId) -> usize {
         self.mailbox
             .as_ref()
             .map_or(0, |m| m.messages.iter().filter(|m| m.unread).count())
@@ -1434,6 +1434,12 @@ impl AppState {
             self.bump_reader();
             return Update::default();
         };
+        let Some(locator) = self
+            .selected_message()
+            .map(|message| message.locator.clone())
+        else {
+            return Update::default();
+        };
         if matches!(&self.reader, ReaderState::Loaded { id: loaded, .. } if loaded == &id) {
             return Update::default();
         }
@@ -1455,6 +1461,7 @@ impl AppState {
                     .map(|account| account.email.clone())
                     .unwrap_or_default(),
                 message_id: id,
+                locator,
             })],
             ..Default::default()
         }

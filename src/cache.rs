@@ -1,6 +1,6 @@
 use crate::model::{
-    AccountIdentity, CacheUsage, MailProvider, MailboxSnapshot, MessageBody, MessageId,
-    MessageSummary, SyncMetadata,
+    AccountIdentity, CacheUsage, FolderCatalog, FolderId, MailProvider, MailboxSnapshot,
+    MessageBody, MessageId, MessageSummary, SyncMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,9 +16,12 @@ use std::{
 pub const RETENTION_OPTIONS: [usize; 4] = [50, 100, 250, 500];
 pub const DEFAULT_RETENTION: usize = 100;
 pub const BODY_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
-const MAILBOX_VERSION: u8 = 2;
-const BODY_VERSION: u8 = 3;
-const MANIFEST_VERSION: u8 = 2;
+pub const MAX_CACHED_FOLDER_VIEWS: usize = 8;
+pub const MAX_SUMMARIES_PER_FOLDER: usize = 500;
+const MAX_CACHE_JSON_BYTES: u64 = 128 * 1024 * 1024;
+const MAILBOX_VERSION: u8 = 3;
+const BODY_VERSION: u8 = 4;
+const MANIFEST_VERSION: u8 = 3;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize, Serialize)]
@@ -30,9 +33,17 @@ struct Preferences {
 struct StoredMailbox {
     version: u8,
     account_email: String,
+    folder_catalog: FolderCatalog,
+    views: Vec<StoredFolderView>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredFolderView {
+    folder_id: FolderId,
     completed_at_unix: u64,
     requested_limit: usize,
     skipped_count: usize,
+    last_accessed_unix: u64,
     messages: Vec<MessageSummary>,
 }
 
@@ -94,6 +105,14 @@ pub fn load_latest(limit: usize) -> io::Result<Option<(AccountIdentity, MailboxS
     load_latest_from(&cache_root(), limit)
 }
 
+pub fn load_folder(
+    account_email: &str,
+    folder_id: &FolderId,
+    limit: usize,
+) -> io::Result<Option<MailboxSnapshot>> {
+    load_folder_from(&cache_root(), account_email, folder_id, limit, now_unix())
+}
+
 /// Saves the server's authoritative newest-N membership. Old absent rows are not merged.
 pub fn replace_and_save(
     account: &AccountIdentity,
@@ -101,6 +120,15 @@ pub fn replace_and_save(
     limit: usize,
 ) -> io::Result<MailboxSnapshot> {
     replace_and_save_at(&cache_root(), account, fresh, limit)
+}
+
+pub fn replace_folder_and_save(
+    account: &AccountIdentity,
+    folder_id: FolderId,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<MailboxSnapshot> {
+    replace_folder_and_save_at(&cache_root(), account, folder_id, fresh, limit, now_unix())
 }
 
 pub fn load_body(account_email: &str, id: &MessageId) -> io::Result<Option<MessageBody>> {
@@ -130,7 +158,7 @@ pub fn usage() -> io::Result<CacheUsage> {
     usage_at(&cache_root())
 }
 
-/// Removes v1/v2 summaries and bodies, but never preferences or credentials.
+/// Removes every summary/body cache generation, but never preferences or credentials.
 pub fn clear_all_mail() -> io::Result<()> {
     clear_all_mail_at(&cache_root())
 }
@@ -157,21 +185,18 @@ fn save_limit_and_prune_at(config: &Path, cache: &Path, limit: usize) -> io::Res
         },
     )?;
     if let Some(mut stored) = read_json::<StoredMailbox>(&mailbox_path(cache))?
-        && stored.version == MAILBOX_VERSION
+        && valid_stored_mailbox(&stored)
     {
-        sort_summaries(&mut stored.messages);
-        stored.messages.truncate(limit);
-        stored.requested_limit = limit;
+        for view in &mut stored.views {
+            sort_summaries(&mut view.messages);
+            view.messages.truncate(limit.min(MAX_SUMMARIES_PER_FOLDER));
+            view.requested_limit = limit;
+        }
         write_private_json(&mailbox_path(cache), &stored)?;
-        let retained = stored
-            .messages
-            .iter()
-            .map(|message| message.id.clone())
-            .collect();
         reconcile_bodies(
             cache,
             &stored.account_email,
-            Some(&retained),
+            None,
             None,
             BODY_CACHE_BUDGET_BYTES,
         )?;
@@ -192,48 +217,105 @@ fn load_latest_from(
     let Some(mut stored) = stored else {
         return Ok(None);
     };
-    if stored.version != MAILBOX_VERSION || stored.account_email.trim().is_empty() {
+    if !valid_stored_mailbox(&stored) {
         return Ok(None);
     }
-    sort_summaries(&mut stored.messages);
-    stored.messages.truncate(limit);
+    let Some(view) = stored
+        .views
+        .iter_mut()
+        .find(|view| view.folder_id == FolderId::Inbox)
+    else {
+        return Ok(None);
+    };
+    sort_summaries(&mut view.messages);
+    view.messages.truncate(limit.min(MAX_SUMMARIES_PER_FOLDER));
     Ok(Some((
         AccountIdentity {
             provider: MailProvider::Gmail,
             email: stored.account_email.clone(),
         },
-        snapshot_from_stored(&stored),
+        snapshot_from_stored(&stored.folder_catalog, view),
     )))
+}
+
+fn load_folder_from(
+    cache: &Path,
+    account_email: &str,
+    folder_id: &FolderId,
+    limit: usize,
+    accessed_at: u64,
+) -> io::Result<Option<MailboxSnapshot>> {
+    validate_limit(limit)?;
+    validate_account_email(account_email)?;
+    let mut stored = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
+        Ok(Some(value)) if valid_stored_mailbox(&value) => value,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !stored.account_email.eq_ignore_ascii_case(account_email) {
+        return Ok(None);
+    }
+    let Some(index) = stored
+        .views
+        .iter()
+        .position(|view| &view.folder_id == folder_id)
+    else {
+        return Ok(None);
+    };
+    stored.views[index].last_accessed_unix = accessed_at;
+    let mut view = stored.views[index].clone();
+    sort_summaries(&mut view.messages);
+    view.messages.truncate(limit.min(MAX_SUMMARIES_PER_FOLDER));
+    let snapshot = snapshot_from_stored(&stored.folder_catalog, &view);
+    write_private_json(&mailbox_path(cache), &stored)?;
+    Ok(Some(snapshot))
 }
 
 fn replace_and_save_at(
     cache: &Path,
     account: &AccountIdentity,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<MailboxSnapshot> {
+    replace_folder_and_save_at(cache, account, FolderId::Inbox, fresh, limit, now_unix())
+}
+
+fn replace_folder_and_save_at(
+    cache: &Path,
+    account: &AccountIdentity,
+    folder_id: FolderId,
     mut fresh: MailboxSnapshot,
     limit: usize,
+    accessed_at: u64,
 ) -> io::Result<MailboxSnapshot> {
     validate_limit(limit)?;
     if account.email.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty account"));
     }
-    let account_changed = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
-        Ok(stored) => {
-            stored.is_some_and(|value| !value.account_email.eq_ignore_ascii_case(&account.email))
-        }
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => true,
+    let previous = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
+        Ok(Some(value)) if valid_stored_mailbox(&value) => Some(value),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
         Err(error) => return Err(error),
     };
+    let account_changed = previous
+        .as_ref()
+        .is_some_and(|value| !value.account_email.eq_ignore_ascii_case(&account.email));
     sort_summaries(&mut fresh.messages);
-    fresh.messages.truncate(limit);
+    fresh
+        .messages
+        .retain(|message| message.folder_id == folder_id);
+    fresh.messages.truncate(limit.min(MAX_SUMMARIES_PER_FOLDER));
+    fresh.metadata.requested_limit = limit;
     fresh.metadata.loaded_count = fresh.messages.len();
     fresh.metadata.fallback_count = fresh
         .messages
         .iter()
         .filter(|message| message.used_fallback)
         .count();
-    let stored = StoredMailbox {
-        version: MAILBOX_VERSION,
-        account_email: account.email.clone(),
+    let view = StoredFolderView {
+        folder_id: folder_id.clone(),
         completed_at_unix: fresh
             .metadata
             .completed_at
@@ -243,27 +325,46 @@ fn replace_and_save_at(
         requested_limit: fresh.metadata.requested_limit,
         skipped_count: fresh.metadata.skipped_count,
         messages: fresh.messages.clone(),
+        last_accessed_unix: accessed_at,
     };
+    let mut stored = previous
+        .filter(|value| value.account_email.eq_ignore_ascii_case(&account.email))
+        .unwrap_or_else(|| StoredMailbox {
+            version: MAILBOX_VERSION,
+            account_email: account.email.clone(),
+            folder_catalog: fresh.folder_catalog.clone(),
+            views: Vec::new(),
+        });
+    stored.folder_catalog = fresh.folder_catalog.clone();
+    stored.views.retain(|view| {
+        view.folder_id != folder_id && stored.folder_catalog.find(&view.folder_id).is_some()
+    });
+    stored.views.push(view);
+    stored.views.sort_by(|left, right| {
+        right
+            .last_accessed_unix
+            .cmp(&left.last_accessed_unix)
+            .then_with(|| folder_key(&left.folder_id).cmp(&folder_key(&right.folder_id)))
+    });
+    stored.views.truncate(MAX_CACHED_FOLDER_VIEWS);
+    if !valid_stored_mailbox(&stored) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid folder cache snapshot",
+        ));
+    }
     // Remove the previous account's bodies before publishing the new account index. A crash can
     // lose reusable cache data, but can never pair one account's index with another's bodies.
     if account_changed {
         remove_dir_if_exists(&bodies_path(cache))?;
     }
     write_private_json(&mailbox_path(cache), &stored)?;
-    // v1 is ignored on load and removed only after the durable v2 commit.
+    // Older locator-derived summaries and bodies cannot be safely promoted to
+    // canonical X-GM-MSGID identity. Remove them only after the durable v3 commit.
     let _ = remove_file_if_exists(&legacy_mailbox_path(cache));
-    let retained = fresh
-        .messages
-        .iter()
-        .map(|message| message.id.clone())
-        .collect();
-    reconcile_bodies(
-        cache,
-        &account.email,
-        Some(&retained),
-        None,
-        BODY_CACHE_BUDGET_BYTES,
-    )?;
+    let _ = remove_file_if_exists(&v2_mailbox_path(cache));
+    let _ = remove_dir_if_exists(&legacy_bodies_path(cache));
+    reconcile_bodies(cache, &account.email, None, None, BODY_CACHE_BUDGET_BYTES)?;
     Ok(fresh)
 }
 
@@ -348,35 +449,15 @@ fn save_body_at(
         last_accessed_unix: accessed_at,
     });
     write_manifest(cache, &manifest)?;
-    let retained = authoritative_ids(cache, account_email)?;
-    reconcile_bodies(cache, account_email, retained.as_ref(), Some(id), budget)?;
+    reconcile_bodies(cache, account_email, None, Some(id), budget)?;
     usage_at(cache)
 }
 
-fn authoritative_ids(cache: &Path, account_email: &str) -> io::Result<Option<HashSet<MessageId>>> {
-    match read_json::<StoredMailbox>(&mailbox_path(cache)) {
-        Ok(Some(stored))
-            if stored.version == MAILBOX_VERSION
-                && stored.account_email.eq_ignore_ascii_case(account_email) =>
-        {
-            Ok(Some(
-                stored
-                    .messages
-                    .into_iter()
-                    .map(|message| message.id)
-                    .collect(),
-            ))
-        }
-        Ok(Some(_)) => Ok(Some(HashSet::new())),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(Some(HashSet::new())),
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 fn clear_bodies_at(cache: &Path) -> io::Result<u64> {
-    let before = directory_size(&bodies_path(cache))?;
+    let before = directory_size(&bodies_path(cache))?
+        .saturating_add(directory_size(&legacy_bodies_path(cache))?);
     remove_dir_if_exists(&bodies_path(cache))?;
+    remove_dir_if_exists(&legacy_bodies_path(cache))?;
     ensure_bodies_dir(cache)?;
     write_manifest(cache, &empty_manifest())?;
     Ok(before.saturating_sub(directory_size(&bodies_path(cache))?))
@@ -384,12 +465,19 @@ fn clear_bodies_at(cache: &Path) -> io::Result<u64> {
 
 fn clear_all_mail_at(cache: &Path) -> io::Result<()> {
     let mut first_error = None;
-    for path in [mailbox_path(cache), legacy_mailbox_path(cache)] {
+    for path in [
+        mailbox_path(cache),
+        v2_mailbox_path(cache),
+        legacy_mailbox_path(cache),
+    ] {
         if let Err(error) = remove_file_if_exists(&path) {
             first_error.get_or_insert(error);
         }
     }
     if let Err(error) = remove_dir_if_exists(&bodies_path(cache)) {
+        first_error.get_or_insert(error);
+    }
+    if let Err(error) = remove_dir_if_exists(&legacy_bodies_path(cache)) {
         first_error.get_or_insert(error);
     }
     first_error.map_or(Ok(()), Err)
@@ -516,10 +604,10 @@ fn empty_manifest() -> BodyManifest {
 }
 
 fn body_file_name(id: &MessageId) -> io::Result<String> {
-    let (uid_validity, uid) = id
-        .gmail_parts()
+    let x_gm_msgid = id
+        .gmail_value()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Gmail message ID"))?;
-    Ok(format!("{uid_validity}-{uid}.json"))
+    Ok(format!("gm-{x_gm_msgid}.json"))
 }
 
 fn validate_account_email(account_email: &str) -> io::Result<()> {
@@ -537,8 +625,56 @@ fn sort_summaries(messages: &mut [MessageSummary]) {
     });
 }
 
-fn snapshot_from_stored(stored: &StoredMailbox) -> MailboxSnapshot {
+fn folder_key(id: &FolderId) -> String {
+    match id {
+        FolderId::Inbox => "0-inbox".into(),
+        FolderId::Starred => "1-starred".into(),
+        FolderId::Sent => "2-sent".into(),
+        FolderId::AllMail => "3-all".into(),
+        FolderId::Trash => "4-trash".into(),
+        FolderId::Label(mailbox) => format!("5-{mailbox}"),
+    }
+}
+
+fn valid_stored_mailbox(stored: &StoredMailbox) -> bool {
+    if stored.version != MAILBOX_VERSION
+        || stored.account_email.trim().is_empty()
+        || stored.account_email.len() > 320
+        || stored.account_email.chars().any(char::is_control)
+        || stored.views.len() > MAX_CACHED_FOLDER_VIEWS
+        || stored.folder_catalog.folders.len() > crate::model::MAX_FOLDER_CATALOG_ENTRIES
+        || stored
+            .folder_catalog
+            .folders
+            .iter()
+            .any(|folder| !folder.is_valid())
+    {
+        return false;
+    }
+    let mut folders = HashSet::new();
+    stored.views.iter().all(|view| {
+        let mut ids = HashSet::new();
+        is_valid_limit(view.requested_limit)
+            && view.messages.len() <= MAX_SUMMARIES_PER_FOLDER
+            && folders.insert(view.folder_id.clone())
+            && stored.folder_catalog.find(&view.folder_id).is_some()
+            && view.messages.iter().all(|message| {
+                message.id.gmail_value().is_some()
+                    && ids.insert(message.id.clone())
+                    && message.folder_id == view.folder_id
+                    && message.locator.folder_id == view.folder_id
+                    && message.locator.is_valid()
+                    && stored
+                        .folder_catalog
+                        .find(&view.folder_id)
+                        .is_some_and(|folder| folder.mailbox == message.locator.mailbox)
+            })
+    })
+}
+
+fn snapshot_from_stored(catalog: &FolderCatalog, stored: &StoredFolderView) -> MailboxSnapshot {
     MailboxSnapshot {
+        folder_catalog: catalog.clone(),
         metadata: SyncMetadata {
             completed_at: UNIX_EPOCH + std::time::Duration::from_secs(stored.completed_at_unix),
             requested_limit: stored.requested_limit,
@@ -585,6 +721,10 @@ fn preferences_path(config: &Path) -> PathBuf {
 }
 
 fn mailbox_path(cache: &Path) -> PathBuf {
+    cache.join("whitford/mailbox-v3.json")
+}
+
+fn v2_mailbox_path(cache: &Path) -> PathBuf {
     cache.join("whitford/mailbox-v2.json")
 }
 
@@ -593,6 +733,10 @@ fn legacy_mailbox_path(cache: &Path) -> PathBuf {
 }
 
 fn bodies_path(cache: &Path) -> PathBuf {
+    cache.join("whitford/bodies-v2")
+}
+
+fn legacy_bodies_path(cache: &Path) -> PathBuf {
     cache.join("whitford/bodies-v1")
 }
 
@@ -614,6 +758,17 @@ fn now_unix() -> u64 {
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_CACHE_JSON_BYTES => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache record exceeds size limit",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
@@ -725,8 +880,14 @@ mod tests {
 
     fn summary(uid: u32) -> MessageSummary {
         MessageSummary {
-            id: MessageId::gmail(7, uid),
+            id: MessageId::gmail(u64::from(uid)),
             folder_id: FolderId::Inbox,
+            locator: crate::model::MessageLocator {
+                folder_id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid,
+            },
             sender: format!("Sender {uid}"),
             email: None,
             initials: None,
@@ -742,6 +903,7 @@ mod tests {
     fn snapshot(ids: &[u32]) -> MailboxSnapshot {
         MailboxSnapshot {
             messages: ids.iter().copied().map(summary).collect(),
+            folder_catalog: crate::model::FolderCatalog::inbox_only(),
             metadata: SyncMetadata {
                 completed_at: UNIX_EPOCH + std::time::Duration::from_secs(100),
                 requested_limit: 50,
@@ -777,14 +939,16 @@ mod tests {
     }
 
     #[test]
-    fn v2_membership_is_authoritative_and_migrates_v1_after_save() {
+    fn v3_membership_is_authoritative_and_removes_legacy_indexes_after_save() {
         let root = TestRoot::new();
         write_private_json(&legacy_mailbox_path(&root.0), &serde_json::json!({})).unwrap();
+        write_private_json(&v2_mailbox_path(&root.0), &serde_json::json!({})).unwrap();
         replace_and_save_at(&root.0, &account(), snapshot(&[1, 2]), 50).unwrap();
         replace_and_save_at(&root.0, &account(), snapshot(&[3]), 50).unwrap();
         let (_, loaded) = load_latest_from(&root.0, 50).unwrap().unwrap();
         assert_eq!(loaded.messages, vec![summary(3)]);
         assert!(!legacy_mailbox_path(&root.0).exists());
+        assert!(!v2_mailbox_path(&root.0).exists());
     }
 
     #[test]
@@ -797,9 +961,19 @@ mod tests {
     }
 
     #[test]
+    fn oversized_cache_json_is_rejected_before_allocation() {
+        let root = TestRoot::new();
+        ensure_private_dir(&root.0.join("whitford")).unwrap();
+        let file = fs::File::create(mailbox_path(&root.0)).unwrap();
+        file.set_len(MAX_CACHE_JSON_BYTES + 1).unwrap();
+        let result = read_json::<StoredMailbox>(&mailbox_path(&root.0));
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidData));
+    }
+
+    #[test]
     fn body_round_trip_usage_and_modes() {
         let root = TestRoot::new();
-        let id = MessageId::gmail(7, 9);
+        let id = MessageId::gmail(9);
         let expected = body("");
         let usage = save_body_at(&root.0, EMAIL, &id, &expected, 10, u64::MAX).unwrap();
         assert_eq!(usage.body_count, 1);
@@ -824,7 +998,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            fs::metadata(bodies_path(&root.0).join("7-9.json"))
+            fs::metadata(bodies_path(&root.0).join("gm-9.json"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -836,9 +1010,9 @@ mod tests {
     #[test]
     fn previous_body_schema_is_removed_as_a_cache_miss() {
         let root = TestRoot::new();
-        let id = MessageId::gmail(7, 9);
+        let id = MessageId::gmail(9);
         save_body_at(&root.0, EMAIL, &id, &body("old"), 10, u64::MAX).unwrap();
-        let path = bodies_path(&root.0).join("7-9.json");
+        let path = bodies_path(&root.0).join("gm-9.json");
         let mut stored: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         stored["version"] = serde_json::json!(BODY_VERSION - 1);
@@ -863,10 +1037,10 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_and_keeps_oversize_current() {
         let root = TestRoot::new();
-        let first = MessageId::gmail(7, 1);
-        let second = MessageId::gmail(7, 2);
+        let first = MessageId::gmail(1);
+        let second = MessageId::gmail(2);
         save_body_at(&root.0, EMAIL, &first, &body(&"a".repeat(200)), 1, u64::MAX).unwrap();
-        let first_bytes = fs::metadata(bodies_path(&root.0).join("7-1.json"))
+        let first_bytes = fs::metadata(bodies_path(&root.0).join("gm-1.json"))
             .unwrap()
             .len();
         save_body_at(
@@ -880,28 +1054,37 @@ mod tests {
         .unwrap();
         assert!(load_body_at(&root.0, EMAIL, &first, 3).unwrap().is_none());
         assert!(load_body_at(&root.0, EMAIL, &second, 3).unwrap().is_some());
-        let third = MessageId::gmail(7, 3);
+        let third = MessageId::gmail(3);
         save_body_at(&root.0, EMAIL, &third, &body(&"x".repeat(1000)), 4, 1).unwrap();
         assert!(load_body_at(&root.0, EMAIL, &third, 5).unwrap().is_some());
     }
 
     #[test]
-    fn authoritative_summaries_prune_orphaned_bodies() {
+    fn canonical_bodies_survive_folder_membership_and_locator_changes() {
         let root = TestRoot::new();
-        let kept = MessageId::gmail(7, 1);
-        let orphan = MessageId::gmail(7, 2);
+        let kept = MessageId::gmail(1);
+        let orphan = MessageId::gmail(2);
         save_body_at(&root.0, EMAIL, &kept, &body("keep"), 1, u64::MAX).unwrap();
-        save_body_at(&root.0, EMAIL, &orphan, &body("drop"), 2, u64::MAX).unwrap();
-        replace_and_save_at(&root.0, &account(), snapshot(&[1]), 50).unwrap();
+        save_body_at(&root.0, EMAIL, &orphan, &body("reuse"), 2, u64::MAX).unwrap();
+        let mut remapped = snapshot(&[1]);
+        remapped.messages[0].locator.uid_validity = 99;
+        remapped.messages[0].locator.uid = 500;
+        replace_and_save_at(&root.0, &account(), remapped, 50).unwrap();
         assert!(load_body_at(&root.0, EMAIL, &kept, 3).unwrap().is_some());
-        assert!(load_body_at(&root.0, EMAIL, &orphan, 3).unwrap().is_none());
+        assert_eq!(
+            load_body_at(&root.0, EMAIL, &orphan, 3).unwrap(),
+            Some(body("reuse"))
+        );
+        let loaded = load_latest_from(&root.0, 50).unwrap().unwrap().1;
+        assert_eq!(loaded.messages[0].locator.uid_validity, 99);
+        assert_eq!(loaded.messages[0].locator.uid, 500);
     }
 
     #[test]
     fn account_change_drops_even_colliding_body_ids() {
         let root = TestRoot::new();
         replace_and_save_at(&root.0, &account(), snapshot(&[1]), 50).unwrap();
-        let id = MessageId::gmail(7, 1);
+        let id = MessageId::gmail(1);
         save_body_at(&root.0, EMAIL, &id, &body("private"), 1, u64::MAX).unwrap();
         let other = AccountIdentity {
             provider: MailProvider::Gmail,
@@ -918,7 +1101,7 @@ mod tests {
     #[test]
     fn account_tag_rejects_colliding_body_after_interrupted_account_switch() {
         let root = TestRoot::new();
-        let id = MessageId::gmail(7, 1);
+        let id = MessageId::gmail(1);
         save_body_at(&root.0, EMAIL, &id, &body("account a secret"), 1, u64::MAX).unwrap();
 
         // Simulate a process dying after a new account index was published but before legacy body
@@ -933,10 +1116,15 @@ mod tests {
             &StoredMailbox {
                 version: MAILBOX_VERSION,
                 account_email: other.email.clone(),
-                completed_at_unix: 100,
-                requested_limit: 50,
-                skipped_count: 0,
-                messages: fresh.messages,
+                folder_catalog: fresh.folder_catalog,
+                views: vec![StoredFolderView {
+                    folder_id: FolderId::Inbox,
+                    completed_at_unix: 100,
+                    requested_limit: 50,
+                    skipped_count: 0,
+                    last_accessed_unix: 100,
+                    messages: fresh.messages,
+                }],
             },
         )
         .unwrap();
@@ -949,12 +1137,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_decrease_prunes_summaries_and_body_files() {
+    fn retention_decrease_prunes_summaries_but_keeps_canonical_lru_bodies() {
         let root = TestRoot::new();
         let config = TestRoot::new();
         let ids = (1..=60).collect::<Vec<_>>();
         replace_and_save_at(&root.0, &account(), snapshot(&ids), 100).unwrap();
-        let old = MessageId::gmail(7, 1);
+        let old = MessageId::gmail(1);
         save_body_at(&root.0, EMAIL, &old, &body("old"), 1, u64::MAX).unwrap();
         save_limit_and_prune_at(&config.0, &root.0, 50).unwrap();
         assert_eq!(
@@ -975,7 +1163,7 @@ mod tests {
                 .len(),
             50
         );
-        assert!(load_body_at(&root.0, EMAIL, &old, 2).unwrap().is_none());
+        assert!(load_body_at(&root.0, EMAIL, &old, 2).unwrap().is_some());
     }
 
     #[test]
@@ -987,7 +1175,7 @@ mod tests {
         save_body_at(
             &root.0,
             EMAIL,
-            &MessageId::gmail(7, 1),
+            &MessageId::gmail(1),
             &body("cached"),
             1,
             u64::MAX,
@@ -1003,11 +1191,14 @@ mod tests {
     fn clear_all_removes_all_mail_formats() {
         let root = TestRoot::new();
         write_private_json(&legacy_mailbox_path(&root.0), &serde_json::json!({})).unwrap();
+        write_private_json(&v2_mailbox_path(&root.0), &serde_json::json!({})).unwrap();
         write_private_json(&mailbox_path(&root.0), &serde_json::json!({})).unwrap();
+        fs::create_dir_all(legacy_bodies_path(&root.0)).unwrap();
+        fs::write(legacy_bodies_path(&root.0).join("old.json"), b"old").unwrap();
         save_body_at(
             &root.0,
             EMAIL,
-            &MessageId::gmail(1, 1),
+            &MessageId::gmail(1),
             &body("x"),
             1,
             u64::MAX,
@@ -1015,7 +1206,128 @@ mod tests {
         .unwrap();
         clear_all_mail_at(&root.0).unwrap();
         assert!(!legacy_mailbox_path(&root.0).exists());
+        assert!(!v2_mailbox_path(&root.0).exists());
         assert!(!mailbox_path(&root.0).exists());
         assert!(!bodies_path(&root.0).exists());
+        assert!(!legacy_bodies_path(&root.0).exists());
+    }
+
+    #[test]
+    fn folder_cache_caps_each_view_and_keeps_only_eight_recent_views() {
+        let root = TestRoot::new();
+        let descriptors = (0..10)
+            .map(|index| crate::model::FolderDescriptor {
+                id: FolderId::Label(format!("Label {index}")),
+                mailbox: format!("Label {index}"),
+                display_name: format!("Label {index}"),
+                kind: crate::model::FolderKind::Label,
+            })
+            .chain(crate::model::FolderCatalog::inbox_only().folders)
+            .collect::<Vec<_>>();
+        let catalog = crate::model::FolderCatalog::bounded(descriptors);
+        for index in 0..9_u32 {
+            let folder_id = FolderId::Label(format!("Label {index}"));
+            let messages = (1..=600_u32)
+                .map(|uid| {
+                    let mut value = summary(uid);
+                    value.id = MessageId::gmail(u64::from(index) * 1_000 + u64::from(uid));
+                    value.folder_id = folder_id.clone();
+                    value.locator = crate::model::MessageLocator {
+                        folder_id: folder_id.clone(),
+                        mailbox: format!("Label {index}"),
+                        uid_validity: index + 1,
+                        uid,
+                    };
+                    value
+                })
+                .collect();
+            replace_folder_and_save_at(
+                &root.0,
+                &account(),
+                folder_id,
+                MailboxSnapshot {
+                    messages,
+                    metadata: SyncMetadata {
+                        completed_at: UNIX_EPOCH,
+                        requested_limit: 500,
+                        loaded_count: 600,
+                        fallback_count: 0,
+                        skipped_count: 0,
+                    },
+                    folder_catalog: catalog.clone(),
+                },
+                500,
+                u64::from(index + 1),
+            )
+            .unwrap();
+        }
+
+        let stored = read_json::<StoredMailbox>(&mailbox_path(&root.0))
+            .unwrap()
+            .unwrap();
+        assert!(valid_stored_mailbox(&stored));
+        assert_eq!(stored.views.len(), MAX_CACHED_FOLDER_VIEWS);
+        assert!(
+            stored
+                .views
+                .iter()
+                .all(|view| view.messages.len() == MAX_SUMMARIES_PER_FOLDER)
+        );
+        assert!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 0".into()), 500, 20,)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 8".into()), 500, 20,)
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            500
+        );
+
+        load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 1".into()), 500, 30)
+            .unwrap()
+            .unwrap();
+        let folder_id = FolderId::Label("Label 9".into());
+        let mut value = summary(1);
+        value.id = MessageId::gmail(9_001);
+        value.folder_id = folder_id.clone();
+        value.locator = crate::model::MessageLocator {
+            folder_id: folder_id.clone(),
+            mailbox: "Label 9".into(),
+            uid_validity: 10,
+            uid: 1,
+        };
+        replace_folder_and_save_at(
+            &root.0,
+            &account(),
+            folder_id,
+            MailboxSnapshot {
+                messages: vec![value],
+                metadata: SyncMetadata {
+                    completed_at: UNIX_EPOCH,
+                    requested_limit: 500,
+                    loaded_count: 1,
+                    fallback_count: 0,
+                    skipped_count: 0,
+                },
+                folder_catalog: catalog,
+            },
+            500,
+            21,
+        )
+        .unwrap();
+        assert!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 1".into()), 500, 31,)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 2".into()), 500, 31,)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -360,7 +360,7 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
         content.append(&gtk::Image::from_icon_name(folder.icon));
         content.append(
             &gtk::Label::builder()
-                .label(folder.name)
+                .label(&folder.name)
                 .xalign(0.0)
                 .hexpand(true)
                 .build(),
@@ -368,7 +368,7 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
         let count = snapshot
             .folder_counts
             .iter()
-            .find(|(id, _)| *id == folder.id)
+            .find(|(id, _)| id == &folder.id)
             .map_or(0, |(_, count)| *count);
         if count > 0 {
             content.append(
@@ -386,12 +386,12 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
             folder.name
         ))]);
         row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
-        let id = folder.id;
+        let id = folder.id.clone();
         row.connect_clicked({
             let weak_ui = ui.downgrade();
             move |_| {
                 if let Some(ui) = weak_ui.upgrade() {
-                    ui.dispatch(Action::SelectFolder(id));
+                    ui.dispatch(Action::SelectFolder(id.clone()));
                     if ui.outer.is_collapsed() {
                         ui.outer.set_show_sidebar(false);
                     }
@@ -1139,6 +1139,7 @@ mod tests {
             },
             snapshot: crate::model::MailboxSnapshot {
                 messages: vec![],
+                folder_catalog: crate::model::FolderCatalog::inbox_only(),
                 metadata: SyncMetadata {
                     completed_at: UNIX_EPOCH,
                     requested_limit: 50,

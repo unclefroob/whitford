@@ -568,8 +568,13 @@ mod tests {
     #[test]
     fn raw_multi_value_references_survive_parsing_and_outgoing_threading() {
         let original = map_body(RawMessageBody {
-            uid_validity: 7,
-            uid: 9,
+            id: crate::model::MessageId::gmail(99),
+            locator: crate::model::MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 9,
+            },
             raw: b"From: Sender <sender@example.com>\r\n\
 Message-ID: <parent@example.com>\r\n\
 References: <root@example.com> <middle@example.com>\r\n\

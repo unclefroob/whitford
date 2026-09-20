@@ -479,7 +479,7 @@ mod tests {
             id: "draft-1".into(),
             account_email: "me@example.com".into(),
             kind: ComposeKind::Forward {
-                original: MessageId::gmail(1, 1),
+                original: MessageId::gmail(1),
             },
             to: Vec::new(),
             cc: Vec::new(),
