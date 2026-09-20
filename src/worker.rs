@@ -4,7 +4,7 @@ use crate::{
     config, drafts, gmail, message,
     model::{
         AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, MessageLocator,
-        ReplyContext, SyncMetadata,
+        MessageMutation, ReconciledMessageState, ReplyContext, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -46,6 +46,8 @@ pub struct CacheOperationId(pub u64);
 pub struct SendRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DraftOperationId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MutationRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncKind {
     Restore,
@@ -246,6 +248,14 @@ pub enum WorkerCommand {
         account_email: String,
         preference: drafts::SignaturePreference,
     },
+    MutateMessage {
+        request_id: MutationRequestId,
+        generation: u64,
+        account_email: String,
+        message_id: MessageId,
+        locator: MessageLocator,
+        mutation: MessageMutation,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -326,6 +336,26 @@ impl fmt::Debug for WorkerCommand {
             Self::SaveSignature { operation_id, .. } => {
                 f.debug_tuple("SaveSignature").field(operation_id).finish()
             }
+            Self::MutateMessage {
+                request_id,
+                generation,
+                mutation,
+                ..
+            } => f
+                .debug_struct("MutateMessage")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field(
+                    "kind",
+                    &match mutation {
+                        MessageMutation::SetRead(_) => "read",
+                        MessageMutation::SetStarred(_) => "starred",
+                        MessageMutation::Archive => "archive",
+                        MessageMutation::MoveToTrash { .. } => "trash",
+                        MessageMutation::SetLabel { .. } => "label",
+                    },
+                )
+                .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -451,6 +481,23 @@ pub enum WorkerEvent {
         operation_id: DraftOperationId,
         generation: u64,
         account_email: String,
+    },
+    MutationConfirmed {
+        request_id: MutationRequestId,
+        generation: u64,
+        message_id: MessageId,
+    },
+    MutationReconciled {
+        request_id: MutationRequestId,
+        generation: u64,
+        message_id: MessageId,
+        state: Option<ReconciledMessageState>,
+    },
+    MutationFailed {
+        request_id: MutationRequestId,
+        generation: u64,
+        message_id: MessageId,
+        uncertain: bool,
     },
 }
 impl fmt::Debug for WorkerEvent {
@@ -597,6 +644,26 @@ impl fmt::Debug for WorkerEvent {
                 .debug_struct("DraftOperationFailed")
                 .field("operation_id", operation_id)
                 .finish(),
+            Self::MutationConfirmed { request_id, .. } => f
+                .debug_tuple("MutationConfirmed")
+                .field(request_id)
+                .finish(),
+            Self::MutationReconciled {
+                request_id, state, ..
+            } => f
+                .debug_struct("MutationReconciled")
+                .field("request_id", request_id)
+                .field("in_inbox", &state.is_some())
+                .finish(),
+            Self::MutationFailed {
+                request_id,
+                uncertain,
+                ..
+            } => f
+                .debug_struct("MutationFailed")
+                .field("request_id", request_id)
+                .field("uncertain", uncertain)
+                .finish(),
         }
     }
 }
@@ -648,6 +715,7 @@ async fn controller(
     let mut active: Option<Active> = None;
     let auth = Arc::new(Mutex::new(None::<RuntimeAuth>));
     let cache_io = Arc::new(Mutex::new(()));
+    let metadata_lane = Arc::new(tokio::sync::Mutex::new(()));
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut body_task: Option<JoinHandle<()>> = None;
@@ -655,6 +723,15 @@ async fn controller(
     let (draft_tx, draft_rx) = mpsc::unbounded_channel();
     let draft_events = events.clone();
     let draft_task = tokio::spawn(draft_io_actor(draft_rx, draft_events));
+    let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
+    let mutation_task = tokio::spawn(mutation_actor(
+        mutation_rx,
+        events.clone(),
+        auth.clone(),
+        cache_io.clone(),
+        cache_generation.clone(),
+        metadata_lane.clone(),
+    ));
     loop {
         let command = if let Some(current) = active.as_mut() {
             tokio::select! {
@@ -710,6 +787,36 @@ async fn controller(
             .await;
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
+            }
+            continue;
+        }
+        if matches!(&command, WorkerCommand::MutateMessage { .. }) {
+            let WorkerCommand::MutateMessage {
+                request_id,
+                generation,
+                account_email,
+                message_id,
+                locator,
+                mutation,
+            } = command
+            else {
+                unreachable!()
+            };
+            if let Err(error) = mutation_tx.send(MutationIo {
+                request_id,
+                generation,
+                account_email,
+                message_id,
+                locator,
+                mutation,
+            }) {
+                let failed = error.0;
+                let _ = events.send(WorkerEvent::MutationFailed {
+                    request_id: failed.request_id,
+                    generation: failed.generation,
+                    message_id: failed.message_id,
+                    uncertain: false,
+                });
             }
             continue;
         }
@@ -1191,7 +1298,9 @@ async fn controller(
                 let cleanup_task = cleanup.clone();
                 let auth = auth.clone();
                 let cache_io = cache_io.clone();
+                let metadata_lane = metadata_lane.clone();
                 tokio::spawn(async move {
+                    let _lane = metadata_lane.lock().await;
                     let result = connect(id, &tx, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
                         cleanup_task.store(false, Ordering::Release);
@@ -1206,7 +1315,9 @@ async fn controller(
                 let cleanup_task = cleanup.clone();
                 let auth = auth.clone();
                 let cache_io = cache_io.clone();
+                let metadata_lane = metadata_lane.clone();
                 tokio::spawn(async move {
+                    let _lane = metadata_lane.lock().await;
                     let result =
                         restore_or_refresh(id, &tx, true, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
@@ -1222,7 +1333,9 @@ async fn controller(
                 let cleanup_task = cleanup.clone();
                 let auth = auth.clone();
                 let cache_io = cache_io.clone();
+                let metadata_lane = metadata_lane.clone();
                 tokio::spawn(async move {
+                    let _lane = metadata_lane.lock().await;
                     let result =
                         restore_or_refresh(id, &tx, false, &cleanup_task, &auth, &cache_io).await;
                     if !result.as_ref().is_err_and(|failure| failure.cleanup_failed) {
@@ -1246,11 +1359,127 @@ async fn controller(
             | WorkerCommand::RemoveStaged { .. }
             | WorkerCommand::LoadSignature { .. }
             | WorkerCommand::SaveSignature { .. }
+            | WorkerCommand::MutateMessage { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
     }
     draft_task.abort();
+    mutation_task.abort();
+}
+
+struct MutationIo {
+    request_id: MutationRequestId,
+    generation: u64,
+    account_email: String,
+    message_id: MessageId,
+    locator: MessageLocator,
+    mutation: MessageMutation,
+}
+
+async fn mutation_actor(
+    mut commands: mpsc::UnboundedReceiver<MutationIo>,
+    events: mpsc::UnboundedSender<WorkerEvent>,
+    auth: Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: Arc<Mutex<()>>,
+    generation_gate: Arc<std::sync::atomic::AtomicU64>,
+    metadata_lane: Arc<tokio::sync::Mutex<()>>,
+) {
+    while let Some(command) = commands.recv().await {
+        if generation_gate.load(Ordering::Acquire) != command.generation {
+            continue;
+        }
+        let _lane = metadata_lane.lock().await;
+        if generation_gate.load(Ordering::Acquire) != command.generation {
+            continue;
+        }
+        let credentials = auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|value| value.email.eq_ignore_ascii_case(&command.account_email))
+            .map(|value| Zeroizing::new(value.access_token.as_str().to_owned()));
+        let outcome = if let Some(token) = credentials {
+            gmail::mutate_inbox(
+                &command.account_email,
+                token.as_str(),
+                &command.message_id,
+                &command.locator,
+                &command.mutation,
+            )
+            .await
+        } else {
+            gmail::MutationResult::DefiniteFailure(gmail::GmailError::AuthenticationFailed)
+        };
+        if generation_gate.load(Ordering::Acquire) != command.generation {
+            continue;
+        }
+        let persist = match &outcome {
+            gmail::MutationResult::Confirmed => {
+                let account = command.account_email.clone();
+                let id = command.message_id.clone();
+                let mutation = command.mutation.clone();
+                let gate = generation_gate.clone();
+                let generation = command.generation;
+                Some(
+                    cache_blocking(cache_io.clone(), move || {
+                        (gate.load(Ordering::Acquire) == generation)
+                            .then(|| cache::persist_confirmed_mutation(&account, &id, &mutation))
+                            .transpose()
+                    })
+                    .await,
+                )
+            }
+            gmail::MutationResult::Reconciled(state) => {
+                let account = command.account_email.clone();
+                let id = command.message_id.clone();
+                let state = state.clone();
+                let gate = generation_gate.clone();
+                let generation = command.generation;
+                Some(
+                    cache_blocking(cache_io.clone(), move || {
+                        (gate.load(Ordering::Acquire) == generation)
+                            .then(|| cache::persist_reconciled_inbox(&account, &id, state.as_ref()))
+                            .transpose()
+                    })
+                    .await,
+                )
+            }
+            _ => None,
+        };
+        if generation_gate.load(Ordering::Acquire) != command.generation {
+            continue;
+        }
+        if persist.is_some_and(|result| !matches!(result, Ok(Ok(Some(()))))) {
+            tracing::warn!("authoritative Gmail mutation could not be saved to the local cache");
+        }
+        let event = match outcome {
+            gmail::MutationResult::Confirmed => WorkerEvent::MutationConfirmed {
+                request_id: command.request_id,
+                generation: command.generation,
+                message_id: command.message_id,
+            },
+            gmail::MutationResult::Reconciled(state) => WorkerEvent::MutationReconciled {
+                request_id: command.request_id,
+                generation: command.generation,
+                message_id: command.message_id,
+                state,
+            },
+            gmail::MutationResult::DefiniteFailure(_) => WorkerEvent::MutationFailed {
+                request_id: command.request_id,
+                generation: command.generation,
+                message_id: command.message_id,
+                uncertain: false,
+            },
+            gmail::MutationResult::Uncertain => WorkerEvent::MutationFailed {
+                request_id: command.request_id,
+                generation: command.generation,
+                message_id: command.message_id,
+                uncertain: true,
+            },
+        };
+        let _ = events.send(event);
+    }
 }
 
 enum DraftIo {
@@ -1719,6 +1948,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::RemoveStaged { .. }
         | WorkerCommand::LoadSignature { .. }
         | WorkerCommand::SaveSignature { .. }
+        | WorkerCommand::MutateMessage { .. }
         | WorkerCommand::Shutdown => None,
     }
 }
@@ -2687,5 +2917,31 @@ mod tests {
             Ok(())
         }));
         assert_eq!(result, Err(smtp::SmtpError::DeliveryUncertain));
+    }
+
+    #[test]
+    fn mutation_commands_are_non_interrupting_and_redact_user_labels() {
+        let command = WorkerCommand::MutateMessage {
+            request_id: MutationRequestId(9),
+            generation: 3,
+            account_email: "private@example.com".into(),
+            message_id: MessageId::gmail(42),
+            locator: MessageLocator {
+                folder_id: crate::model::FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                uid_validity: 7,
+                uid: 11,
+            },
+            mutation: MessageMutation::SetLabel {
+                mailbox: "Private project".into(),
+                applied: true,
+            },
+        };
+        assert_eq!(command_id(&command), None);
+        let debug = format!("{command:?}");
+        assert!(debug.contains("label"));
+        assert!(!debug.contains("Private project"));
+        assert!(!debug.contains("private@example.com"));
+        assert!(!debug.contains("gmail-msg"));
     }
 }

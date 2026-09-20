@@ -234,6 +234,120 @@ fn startup_is_disconnected_then_restore_is_an_effect() {
         [Effect::SendWorker(WorkerCommand::Restore { .. })]
     ));
 }
+
+fn mutation_effect(update: Update) -> (MutationRequestId, u64, MessageId, MessageMutation) {
+    match update.effects.into_iter().next().expect("mutation effect") {
+        Effect::SendWorker(WorkerCommand::MutateMessage {
+            request_id,
+            generation,
+            message_id,
+            mutation,
+            ..
+        }) => (request_id, generation, message_id, mutation),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+#[test]
+fn optimistic_dimensions_settle_without_clobbering_each_other() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let (star_id, generation, id, _) = mutation_effect(state.dispatch(Action::ToggleStar));
+    let (read_id, _, _, _) = mutation_effect(state.dispatch(Action::ToggleRead));
+    let message = state.selected_message().unwrap();
+    assert!(message.starred);
+    assert!(!message.unread);
+
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id: star_id,
+        generation,
+        message_id: id.clone(),
+        uncertain: false,
+    }));
+    let message = state.selected_message().unwrap();
+    assert!(!message.starred);
+    assert!(!message.unread, "read dimension must remain optimistic");
+    state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: read_id,
+        generation,
+        message_id: id,
+    }));
+    assert!(!state.selected_message().unwrap().unread);
+}
+
+#[test]
+fn uncertain_mutation_is_never_rolled_back_or_replayed() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let (request_id, generation, message_id, _) =
+        mutation_effect(state.dispatch(Action::ToggleStar));
+    let settled = state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id,
+        uncertain: true,
+    }));
+    assert!(state.selected_message().unwrap().starred);
+    assert!(settled.effects.is_empty());
+    assert!(settled.feedback.unwrap().contains("could not be verified"));
+}
+
+#[test]
+fn archive_rolls_back_at_the_original_position_on_definite_failure() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) = mutation_effect(state.dispatch(Action::Archive));
+    assert!(!state.visible_message_ids().contains(&message_id));
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        uncertain: false,
+    }));
+    assert_eq!(state.mailbox.as_ref().unwrap().messages[1].id, message_id);
+}
+
+#[test]
+fn archive_reconciliation_restores_authoritative_inbox_membership() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) = mutation_effect(state.dispatch(Action::Archive));
+    state.dispatch(Action::Worker(WorkerEvent::MutationReconciled {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        state: Some(ReconciledMessageState {
+            unread: true,
+            starred: true,
+            labels: vec!["Work".into()],
+        }),
+    }));
+    let restored = state
+        .mailbox
+        .as_ref()
+        .unwrap()
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+        .unwrap();
+    assert!(restored.unread && restored.starred);
+    assert_eq!(restored.labels, ["Work"]);
+}
+
+#[test]
+fn second_change_to_same_dimension_waits_for_settlement() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(1));
+    mutation_effect(state.dispatch(Action::ToggleStar));
+    let second = state.dispatch(Action::ToggleStar);
+    assert!(second.effects.is_empty());
+    assert_eq!(second.feedback, Some("That change is already in progress"));
+}
 #[test]
 fn complete_sync_replaces_mailbox_and_searches_loaded_messages() {
     let mut state = AppState::new();

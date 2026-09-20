@@ -41,6 +41,9 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "reopen-authorization", snapshot.can_reopen);
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
+    for action in ["archive", "mark-read", "delete", "star", "toggle-label"] {
+        set_action_enabled(ui, action, snapshot.can_mutate);
+    }
     set_action_enabled(
         ui,
         "retry-drafts",
@@ -56,8 +59,24 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
         ui.last_list_revision.set(snapshot.list_revision);
     }
     if ui.last_reader_revision.get() != snapshot.reader_revision {
+        render_label_menu(ui, snapshot);
         render_reader(ui, snapshot);
         ui.last_reader_revision.set(snapshot.reader_revision);
+    }
+}
+
+fn render_label_menu(ui: &Ui, snapshot: &ViewSnapshot) {
+    ui.label_menu.remove_all();
+    if snapshot.label_options.is_empty() {
+        ui.label_menu
+            .append_item(&gtk::gio::MenuItem::new(Some("No user labels"), None));
+        return;
+    }
+    for (mailbox, display, applied) in &snapshot.label_options {
+        let label = format!("{} {display}", if *applied { "✓" } else { "  " });
+        let item = gtk::gio::MenuItem::new(Some(&label), Some("win.toggle-label"));
+        item.set_attribute_value("target", Some(&mailbox.to_variant()));
+        ui.label_menu.append_item(&item);
     }
 }
 
@@ -463,8 +482,16 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             .build(),
     );
     title_line.append(&icon_button(
-        "non-starred-symbolic",
-        "Star message",
+        if message.starred {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        },
+        if message.starred {
+            "Unstar message"
+        } else {
+            "Star message"
+        },
         "win.star",
     ));
     ui.reader.append(&title_line);

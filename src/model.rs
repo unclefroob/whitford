@@ -3,6 +3,7 @@ use std::time::SystemTime;
 
 pub const MAX_FOLDER_MAILBOX_BYTES: usize = 1_024;
 pub const MAX_FOLDER_CATALOG_ENTRIES: usize = 256;
+pub const MAX_MESSAGE_LABELS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum FolderId {
@@ -203,8 +204,62 @@ pub struct MessageSummary {
     pub received_at_unix: Option<i64>,
     pub unread: bool,
     pub starred: bool,
+    #[serde(default)]
+    pub labels: Vec<String>,
     pub attachment_state: AttachmentState,
     pub used_fallback: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum MutationDimension {
+    Read,
+    Starred,
+    Inbox,
+    Label(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MessageMutation {
+    SetRead(bool),
+    SetStarred(bool),
+    Archive,
+    MoveToTrash { mailbox: String },
+    SetLabel { mailbox: String, applied: bool },
+}
+
+impl MessageMutation {
+    pub fn dimension(&self) -> MutationDimension {
+        match self {
+            Self::SetRead(_) => MutationDimension::Read,
+            Self::SetStarred(_) => MutationDimension::Starred,
+            Self::Archive | Self::MoveToTrash { .. } => MutationDimension::Inbox,
+            Self::SetLabel { mailbox, .. } => MutationDimension::Label(mailbox.clone()),
+        }
+    }
+
+    pub fn apply(&self, message: &mut MessageSummary) {
+        match self {
+            Self::SetRead(read) => message.unread = !read,
+            Self::SetStarred(starred) => message.starred = *starred,
+            Self::SetLabel { mailbox, applied } => {
+                message.labels.retain(|label| label != mailbox);
+                if *applied {
+                    message.labels.push(mailbox.clone());
+                    message.labels.sort();
+                    message.labels.dedup();
+                    message.labels.truncate(MAX_MESSAGE_LABELS);
+                }
+            }
+            Self::Archive | Self::MoveToTrash { .. } => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciledMessageState {
+    pub unread: bool,
+    pub starred: bool,
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -311,6 +366,7 @@ pub fn fixture_messages() -> Vec<MessageSummary> {
             received_at_unix: Some(1_700_000_000 + i64::from(uid)),
             unread,
             starred: false,
+            labels: Vec::new(),
             attachment_state: AttachmentState::Known(if attachment {
                 vec![Attachment {
                     name: "notes.pdf".into(),

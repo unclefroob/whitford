@@ -3,16 +3,20 @@ use crate::{
     composer::{self, ComposeDraft, Recipient},
     model::{
         AccountIdentity, CacheUsage, Folder, FolderId, MailboxSnapshot, MessageBody, MessageId,
-        MessageSummary, inbox_folder,
+        MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState, inbox_folder,
     },
     smtp,
     worker::{
-        BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind, OperationId,
-        SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent,
-        WorkerPhase,
+        BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
+        MutationRequestId, OperationId, SendFailure, SendRequestId, ServiceFailure, SyncKind,
+        WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
-use std::{collections::HashSet, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::SystemTime,
+};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -48,6 +52,25 @@ pub struct AppState {
     draft_save_state: DraftSaveState,
     list_revision: u64,
     reader_revision: u64,
+    next_mutation_request: u64,
+    pending_mutations: HashMap<(MessageId, MutationDimension), PendingMutation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMutation {
+    request_id: MutationRequestId,
+    mutation: MessageMutation,
+    previous: PendingValue,
+}
+
+#[derive(Clone, Debug)]
+enum PendingValue {
+    Bool(bool),
+    Label(bool),
+    Inbox {
+        message: Box<MessageSummary>,
+        index: usize,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryAction {
@@ -155,6 +178,11 @@ pub enum Action {
     SelectMessage(MessageId),
     SetSearch(String),
     SetFilter(MessageFilter),
+    ToggleRead,
+    ToggleStar,
+    Archive,
+    MoveToTrash,
+    ToggleLabel(String),
     SetCacheLimit(usize),
     RetryBody,
     RetryDraftRestore,
@@ -248,6 +276,8 @@ pub struct ViewSnapshot {
     pub cache_usage: CacheUsage,
     pub list_revision: u64,
     pub reader_revision: u64,
+    pub can_mutate: bool,
+    pub label_options: Vec<(String, String, bool)>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedDraftSummary {
@@ -334,6 +364,8 @@ impl AppState {
             draft_save_state: DraftSaveState::Saved,
             list_revision: 1,
             reader_revision: 1,
+            next_mutation_request: 1,
+            pending_mutations: HashMap::new(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -406,6 +438,7 @@ impl AppState {
             Action::WorkerUnavailable => {
                 self.active_operation = None;
                 self.recovery = None;
+                self.pending_mutations.clear();
                 if let ReaderState::Loading { id, .. } = &self.reader {
                     self.reader = ReaderState::Failed {
                         id: id.clone(),
@@ -462,6 +495,29 @@ impl AppState {
                 self.normalize();
                 self.bump_list();
                 Update::default()
+            }
+            Action::ToggleRead => {
+                self.mutate_selected(|message, _| MessageMutation::SetRead(message.unread))
+            }
+            Action::ToggleStar => {
+                self.mutate_selected(|message, _| MessageMutation::SetStarred(!message.starred))
+            }
+            Action::Archive => self.mutate_selected(|_, _| MessageMutation::Archive),
+            Action::MoveToTrash => self.mutate_selected(|_, catalog| {
+                catalog
+                    .find(&FolderId::Trash)
+                    .map(|folder| MessageMutation::MoveToTrash {
+                        mailbox: folder.mailbox.clone(),
+                    })
+                    .unwrap_or(MessageMutation::MoveToTrash {
+                        mailbox: String::new(),
+                    })
+            }),
+            Action::ToggleLabel(mailbox) => {
+                self.mutate_selected(|message, _| MessageMutation::SetLabel {
+                    applied: !message.labels.contains(&mailbox),
+                    mailbox,
+                })
             }
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::RetryBody => self.retry_body(),
@@ -556,6 +612,7 @@ impl AppState {
             return Update::default();
         };
         self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.pending_mutations.clear();
         self.send_generation = self.send_generation.wrapping_add(1);
         self.reset_draft_session();
         self.mailbox = None;
@@ -953,6 +1010,30 @@ impl AppState {
                     ..Default::default()
                 }
             }
+            WorkerEvent::MutationConfirmed {
+                request_id,
+                generation,
+                message_id,
+            } => self.finish_mutation(request_id, generation, &message_id, true, None, false),
+            WorkerEvent::MutationReconciled {
+                request_id,
+                generation,
+                message_id,
+                state,
+            } => self.finish_mutation(
+                request_id,
+                generation,
+                &message_id,
+                false,
+                Some(state),
+                false,
+            ),
+            WorkerEvent::MutationFailed {
+                request_id,
+                generation,
+                message_id,
+                uncertain,
+            } => self.finish_mutation(request_id, generation, &message_id, false, None, uncertain),
             other => self.account_worker_event(other),
         }
     }
@@ -982,7 +1063,10 @@ impl AppState {
             | WorkerEvent::StagedRemoved { .. }
             | WorkerEvent::SignatureLoaded { .. }
             | WorkerEvent::SignatureSaved { .. }
-            | WorkerEvent::DraftOperationFailed { .. } => unreachable!(),
+            | WorkerEvent::DraftOperationFailed { .. }
+            | WorkerEvent::MutationConfirmed { .. }
+            | WorkerEvent::MutationReconciled { .. }
+            | WorkerEvent::MutationFailed { .. } => unreachable!(),
         };
         if self.active_operation != Some(id) {
             return Update::default();
@@ -1014,6 +1098,7 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.pending_mutations.clear();
                     self.reset_draft_session();
                     self.send_generation = self.send_generation.wrapping_add(1);
                     self.composer = ComposerState::Closed;
@@ -1109,6 +1194,7 @@ impl AppState {
                 }
             }
             WorkerEvent::Disconnected { .. } => {
+                self.pending_mutations.clear();
                 self.account = None;
                 self.mailbox = None;
                 self.selected_message_id = None;
@@ -1179,6 +1265,9 @@ impl AppState {
             | WorkerEvent::SignatureLoaded { .. }
             | WorkerEvent::SignatureSaved { .. }
             | WorkerEvent::DraftOperationFailed { .. } => unreachable!(),
+            WorkerEvent::MutationConfirmed { .. }
+            | WorkerEvent::MutationReconciled { .. }
+            | WorkerEvent::MutationFailed { .. } => unreachable!(),
         }
     }
     pub fn snapshot(&self) -> ViewSnapshot {
@@ -1233,6 +1322,28 @@ impl AppState {
             _ => ViewStatus::Ready,
         };
         ViewSnapshot {
+            can_mutate: matches!(self.session, SessionState::Ready)
+                && self.selected_message().is_some(),
+            label_options: self
+                .mailbox
+                .as_ref()
+                .map(|mailbox| {
+                    mailbox
+                        .folder_catalog
+                        .folders
+                        .iter()
+                        .filter_map(|folder| match &folder.id {
+                            FolderId::Label(mailbox_name) => Some((
+                                mailbox_name.clone(),
+                                folder.display_name.clone(),
+                                self.selected_message()
+                                    .is_some_and(|message| message.labels.contains(mailbox_name)),
+                            )),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             folders: vec![inbox_folder()],
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
@@ -1363,6 +1474,228 @@ impl AppState {
                 feedback: Some("Message is unavailable"),
                 ..Default::default()
             }
+        }
+    }
+    fn mutate_selected(
+        &mut self,
+        build: impl FnOnce(&MessageSummary, &crate::model::FolderCatalog) -> MessageMutation,
+    ) -> Update {
+        if !matches!(self.session, SessionState::Ready) {
+            return Update {
+                feedback: Some("Connect Gmail before changing messages"),
+                ..Default::default()
+            };
+        }
+        let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
+            return Update::default();
+        };
+        let Some(message) = self.selected_message().cloned() else {
+            return Update::default();
+        };
+        let Some(catalog) = self
+            .mailbox
+            .as_ref()
+            .map(|mailbox| mailbox.folder_catalog.clone())
+        else {
+            return Update::default();
+        };
+        let mutation = build(&message, &catalog);
+        if matches!(&mutation, MessageMutation::MoveToTrash { mailbox } if mailbox.is_empty()) {
+            return Update {
+                feedback: Some("Gmail did not expose a Trash mailbox"),
+                ..Default::default()
+            };
+        }
+        if let MessageMutation::SetLabel { mailbox, .. } = &mutation
+            && !matches!(catalog.find(&FolderId::Label(mailbox.clone())), Some(folder) if folder.mailbox == *mailbox)
+        {
+            return Update {
+                feedback: Some("That Gmail label is unavailable"),
+                ..Default::default()
+            };
+        }
+        let dimension = mutation.dimension();
+        let key = (message.id.clone(), dimension.clone());
+        if self.pending_mutations.contains_key(&key) {
+            return Update {
+                feedback: Some("That change is already in progress"),
+                ..Default::default()
+            };
+        }
+        let request_id = MutationRequestId(self.next_mutation_request);
+        self.next_mutation_request = self.next_mutation_request.wrapping_add(1).max(1);
+        let previous = match &mutation {
+            MessageMutation::SetRead(_) => PendingValue::Bool(message.unread),
+            MessageMutation::SetStarred(_) => PendingValue::Bool(message.starred),
+            MessageMutation::SetLabel { mailbox, .. } => {
+                PendingValue::Label(message.labels.contains(mailbox))
+            }
+            MessageMutation::Archive | MessageMutation::MoveToTrash { .. } => {
+                let index = self
+                    .mailbox
+                    .as_ref()
+                    .and_then(|mailbox| {
+                        mailbox
+                            .messages
+                            .iter()
+                            .position(|item| item.id == message.id)
+                    })
+                    .unwrap_or(0);
+                PendingValue::Inbox {
+                    message: Box::new(message.clone()),
+                    index,
+                }
+            }
+        };
+        if matches!(
+            mutation,
+            MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
+        ) {
+            if let Some(mailbox) = self.mailbox.as_mut() {
+                mailbox.messages.retain(|item| item.id != message.id);
+                mailbox.metadata.loaded_count = mailbox.messages.len();
+            }
+            self.normalize();
+            self.bump_reader();
+        } else if let Some(current) = self.mailbox.as_mut().and_then(|mailbox| {
+            mailbox
+                .messages
+                .iter_mut()
+                .find(|item| item.id == message.id)
+        }) {
+            mutation.apply(current);
+        }
+        self.pending_mutations.insert(
+            key,
+            PendingMutation {
+                request_id,
+                mutation: mutation.clone(),
+                previous,
+            },
+        );
+        self.bump_list();
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::MutateMessage {
+                request_id,
+                generation: self.cache_generation,
+                account_email,
+                message_id: message.id,
+                locator: message.locator,
+                mutation,
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn finish_mutation(
+        &mut self,
+        request_id: MutationRequestId,
+        generation: u64,
+        message_id: &MessageId,
+        confirmed: bool,
+        reconciled: Option<Option<ReconciledMessageState>>,
+        uncertain: bool,
+    ) -> Update {
+        if generation != self.cache_generation {
+            return Update::default();
+        }
+        let key = self.pending_mutations.iter().find_map(|(key, pending)| {
+            (pending.request_id == request_id && &key.0 == message_id).then(|| key.clone())
+        });
+        let Some(key) = key else {
+            return Update::default();
+        };
+        let pending = self
+            .pending_mutations
+            .remove(&key)
+            .expect("pending mutation exists");
+        let definite_failure = !confirmed && reconciled.is_none() && !uncertain;
+        if definite_failure {
+            match pending.previous {
+                PendingValue::Bool(value) => {
+                    if let Some(message) = self.mailbox.as_mut().and_then(|mailbox| {
+                        mailbox
+                            .messages
+                            .iter_mut()
+                            .find(|message| &message.id == message_id)
+                    }) {
+                        match pending.mutation {
+                            MessageMutation::SetRead(_) => message.unread = value,
+                            MessageMutation::SetStarred(_) => message.starred = value,
+                            _ => {}
+                        }
+                    }
+                }
+                PendingValue::Label(applied) => {
+                    if let MessageMutation::SetLabel { mailbox, .. } = pending.mutation
+                        && let Some(message) = self.mailbox.as_mut().and_then(|mailbox| {
+                            mailbox
+                                .messages
+                                .iter_mut()
+                                .find(|message| &message.id == message_id)
+                        })
+                    {
+                        message.labels.retain(|label| label != &mailbox);
+                        if applied {
+                            message.labels.push(mailbox);
+                            message.labels.sort();
+                            message.labels.dedup();
+                        }
+                    }
+                }
+                PendingValue::Inbox { message, index } => {
+                    if let Some(mailbox) = self.mailbox.as_mut() {
+                        let index = index.min(mailbox.messages.len());
+                        mailbox.messages.insert(index, *message);
+                        mailbox.metadata.loaded_count = mailbox.messages.len();
+                    }
+                }
+            }
+        } else if let Some(state) = reconciled {
+            match state {
+                Some(state) => {
+                    if let Some(mailbox) = self.mailbox.as_mut() {
+                        if let Some(message) = mailbox
+                            .messages
+                            .iter_mut()
+                            .find(|message| &message.id == message_id)
+                        {
+                            message.unread = state.unread;
+                            message.starred = state.starred;
+                            message.labels = state.labels;
+                        } else if let PendingValue::Inbox { message, index } = &pending.previous {
+                            let mut message = (**message).clone();
+                            message.unread = state.unread;
+                            message.starred = state.starred;
+                            message.labels = state.labels;
+                            mailbox
+                                .messages
+                                .insert((*index).min(mailbox.messages.len()), message);
+                            mailbox.metadata.loaded_count = mailbox.messages.len();
+                        }
+                    }
+                }
+                None => {
+                    if let Some(mailbox) = self.mailbox.as_mut() {
+                        mailbox.messages.retain(|message| &message.id != message_id);
+                        mailbox.metadata.loaded_count = mailbox.messages.len();
+                    }
+                }
+            }
+        }
+        self.normalize();
+        self.bump_list();
+        self.bump_reader();
+        Update {
+            feedback: if uncertain {
+                Some("Gmail received the change, but its final state could not be verified")
+            } else if definite_failure {
+                Some("Gmail rejected the change; it was restored")
+            } else {
+                None
+            },
+            ..Default::default()
         }
     }
     fn set_cache_limit(&mut self, limit: usize) -> Update {

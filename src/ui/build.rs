@@ -41,7 +41,7 @@ pub(super) fn build(
         build_folder_pane(&folders);
     let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &search, &list_menu);
-    let (reader_page, reader, reader_banner) = build_reader_page(&reader_menu);
+    let (reader_page, reader, reader_banner, label_menu) = build_reader_page(&reader_menu);
 
     let inner = adw::NavigationSplitView::builder()
         .sidebar(&message_page)
@@ -95,6 +95,7 @@ pub(super) fn build(
         search,
         reader,
         reader_banner,
+        label_menu,
         outer,
         inner,
         toast_overlay,
@@ -976,7 +977,9 @@ fn build_message_page(
     )
 }
 
-fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box, gtk::Box) {
+fn build_reader_page(
+    menu: &gtk::Button,
+) -> (adw::NavigationPage, gtk::Box, gtk::Box, gtk::gio::Menu) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_show_title(false);
@@ -985,10 +988,16 @@ fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box, gtk:
         ("mail-mark-read-symbolic", "Mark read", "win.mark-read"),
         ("user-trash-symbolic", "Delete", "win.delete"),
         ("mail-archive-symbolic", "Archive (Delete)", "win.archive"),
-        ("tag-symbolic", "Add label", "win.label"),
     ] {
         header.pack_start(&icon_button(icon, tooltip, action));
     }
+    let label_menu = gtk::gio::Menu::new();
+    let label_button = gtk::MenuButton::builder()
+        .icon_name("tag-symbolic")
+        .tooltip_text("Apply or remove label")
+        .menu_model(&label_menu)
+        .build();
+    header.pack_start(&label_button);
     header.pack_end(&icon_button(
         "go-next-symbolic",
         "Next message",
@@ -1028,6 +1037,7 @@ fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box, gtk:
         adw::NavigationPage::with_tag(&toolbar, "Message", "reader"),
         reader,
         reader_banner,
+        label_menu,
     )
 }
 

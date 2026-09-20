@@ -51,6 +51,7 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
         received_at_unix: received_at.or(raw.internal_date_unix),
         unread: !raw.flags.seen,
         starred: raw.flags.flagged,
+        labels: raw.labels,
         attachment_state: raw.attachment_state,
         used_fallback,
     }
@@ -312,6 +313,7 @@ mod tests {
             rfc822_size: Some(90_000),
             header: bytes.to_vec(),
             attachment_state: AttachmentState::Known(Vec::new()),
+            labels: Vec::new(),
         }
     }
 

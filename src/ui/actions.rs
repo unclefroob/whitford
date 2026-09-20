@@ -40,16 +40,21 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "message-previous", |ui| {
         ui.dispatch(Action::SelectPrevious)
     });
-    for name in [
-        "archive",
-        "mark-read",
-        "delete",
-        "label",
-        "star",
-        "download",
-    ] {
-        add_disabled(ui, name);
-    }
+    add(ui, "archive", |ui| ui.dispatch(Action::Archive));
+    add(ui, "mark-read", |ui| ui.dispatch(Action::ToggleRead));
+    add(ui, "delete", |ui| ui.dispatch(Action::MoveToTrash));
+    add(ui, "star", |ui| ui.dispatch(Action::ToggleStar));
+    let label = gio::SimpleAction::new("toggle-label", Some(&String::static_variant_type()));
+    let weak_ui = ui.downgrade();
+    label.connect_activate(move |_, parameter| {
+        if let (Some(ui), Some(mailbox)) =
+            (weak_ui.upgrade(), parameter.and_then(|value| value.str()))
+        {
+            ui.dispatch(Action::ToggleLabel(mailbox.to_owned()));
+        }
+    });
+    ui.window.add_action(&label);
+    add_disabled(ui, "download");
     add(ui, "toggle-folders", |ui| {
         ui.outer.set_show_sidebar(!ui.outer.shows_sidebar())
     });
@@ -62,6 +67,10 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
         ("win.message-next", &["<Primary>Down"]),
         ("win.message-previous", &["<Primary>Up"]),
         ("win.back", &["Escape"]),
+        ("win.archive", &["<Primary>e"]),
+        ("win.mark-read", &["<Primary>u"]),
+        ("win.delete", &["Delete"]),
+        ("win.star", &["<Primary>period"]),
     ] {
         application.set_accels_for_action(action, accelerators);
     }

@@ -1,6 +1,6 @@
 use crate::model::{
     AccountIdentity, CacheUsage, FolderCatalog, FolderId, MailProvider, MailboxSnapshot,
-    MessageBody, MessageId, MessageSummary, SyncMetadata,
+    MessageBody, MessageId, MessageMutation, MessageSummary, ReconciledMessageState, SyncMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -129,6 +129,81 @@ pub fn replace_folder_and_save(
     limit: usize,
 ) -> io::Result<MailboxSnapshot> {
     replace_folder_and_save_at(&cache_root(), account, folder_id, fresh, limit, now_unix())
+}
+
+/// Updates only data established by a successful IMAP mutation response.
+pub fn persist_confirmed_mutation(
+    account_email: &str,
+    id: &MessageId,
+    mutation: &MessageMutation,
+) -> io::Result<()> {
+    persist_confirmed_mutation_at(&cache_root(), account_email, id, mutation)
+}
+
+fn persist_confirmed_mutation_at(
+    cache: &Path,
+    account_email: &str,
+    id: &MessageId,
+    mutation: &MessageMutation,
+) -> io::Result<()> {
+    mutate_stored_mailbox_at(cache, account_email, |view| {
+        if matches!(
+            mutation,
+            MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
+        ) && view.folder_id == FolderId::Inbox
+        {
+            view.messages.retain(|message| &message.id != id);
+        } else if let Some(message) = view.messages.iter_mut().find(|message| &message.id == id) {
+            mutation.apply(message);
+        }
+    })
+}
+
+pub fn persist_reconciled_inbox(
+    account_email: &str,
+    id: &MessageId,
+    state: Option<&ReconciledMessageState>,
+) -> io::Result<()> {
+    persist_reconciled_inbox_at(&cache_root(), account_email, id, state)
+}
+
+fn persist_reconciled_inbox_at(
+    cache: &Path,
+    account_email: &str,
+    id: &MessageId,
+    state: Option<&ReconciledMessageState>,
+) -> io::Result<()> {
+    mutate_stored_mailbox_at(cache, account_email, |view| {
+        if state.is_none() && view.folder_id == FolderId::Inbox {
+            view.messages.retain(|message| &message.id != id);
+        } else if let (Some(state), Some(message)) = (
+            state,
+            view.messages.iter_mut().find(|message| &message.id == id),
+        ) {
+            message.unread = state.unread;
+            message.starred = state.starred;
+            message.labels = state.labels.clone();
+        }
+    })
+}
+
+fn mutate_stored_mailbox_at(
+    cache: &Path,
+    account_email: &str,
+    mut operation: impl FnMut(&mut StoredFolderView),
+) -> io::Result<()> {
+    validate_account_email(account_email)?;
+    let path = mailbox_path(cache);
+    let Some(mut stored) = read_json::<StoredMailbox>(&path)? else {
+        return Ok(());
+    };
+    if !valid_stored_mailbox(&stored) || !stored.account_email.eq_ignore_ascii_case(account_email) {
+        return Ok(());
+    }
+    for view in &mut stored.views {
+        operation(view);
+    }
+    write_private_json(&path, &stored)
 }
 
 pub fn load_body(account_email: &str, id: &MessageId) -> io::Result<Option<MessageBody>> {
@@ -661,6 +736,12 @@ fn valid_stored_mailbox(stored: &StoredMailbox) -> bool {
             && view.messages.iter().all(|message| {
                 message.id.gmail_value().is_some()
                     && ids.insert(message.id.clone())
+                    && message.labels.len() <= crate::model::MAX_MESSAGE_LABELS
+                    && message.labels.iter().all(|label| {
+                        !label.is_empty()
+                            && label.len() <= crate::model::MAX_FOLDER_MAILBOX_BYTES
+                            && !label.chars().any(char::is_control)
+                    })
                     && message.folder_id == view.folder_id
                     && message.locator.folder_id == view.folder_id
                     && message.locator.is_valid()
@@ -895,6 +976,7 @@ mod tests {
             received_at_unix: Some(i64::from(uid)),
             unread: false,
             starred: false,
+            labels: Vec::new(),
             attachment_state: AttachmentState::Known(Vec::new()),
             used_fallback: false,
         }
@@ -1328,6 +1410,43 @@ mod tests {
             load_folder_from(&root.0, EMAIL, &FolderId::Label("Label 2".into()), 500, 31,)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn only_authoritative_mutations_change_the_summary_cache() {
+        let root = TestRoot::new();
+        replace_and_save_at(&root.0, &account(), snapshot(&[1, 2]), 50).unwrap();
+        persist_confirmed_mutation_at(
+            &root.0,
+            EMAIL,
+            &MessageId::gmail(1),
+            &MessageMutation::SetStarred(true),
+        )
+        .unwrap();
+        let loaded = load_folder_from(&root.0, EMAIL, &FolderId::Inbox, 50, 20)
+            .unwrap()
+            .unwrap();
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .find(|message| message.id == MessageId::gmail(1))
+                .unwrap()
+                .starred
+        );
+
+        persist_reconciled_inbox_at(&root.0, EMAIL, &MessageId::gmail(1), None).unwrap();
+        let loaded = load_folder_from(&root.0, EMAIL, &FolderId::Inbox, 50, 21)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>(),
+            vec![MessageId::gmail(2)]
         );
     }
 }
