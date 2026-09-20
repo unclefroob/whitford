@@ -1,11 +1,10 @@
 use adw::prelude::*;
 
 use super::{
-    Ui,
+    MessageListItem, Ui,
     time::format_unix_local,
     widgets::{
-        attachment_card, icon_button, message_row, notice_banner, onboarding_panel, status_panel,
-        text_action,
+        attachment_card, icon_button, notice_banner, onboarding_panel, status_panel, text_action,
     },
 };
 use crate::{
@@ -443,30 +442,59 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
 }
 
 fn render_messages(ui: &Ui, snapshot: &ViewSnapshot) {
-    clear_list(&ui.messages);
     if !should_render_mail(snapshot.status, !snapshot.visible_messages.is_empty()) {
-        ui.messages.append(&main_status_panel(snapshot));
+        ui.messages.set_visible(false);
+        clear_box(&ui.message_status);
+        ui.message_status.append(&main_status_panel(snapshot));
+        ui.message_status.set_visible(true);
         return;
     }
+    ui.message_status.set_visible(false);
+    ui.messages.set_visible(true);
     let selected_id = snapshot
         .selected_message
         .as_ref()
         .map(|message| &message.id);
-    for message in &snapshot.visible_messages {
-        let row = message_row(message, selected_id == Some(&message.id));
-        let id = message.id.clone();
-        row.connect_clicked({
-            let weak_ui = ui.downgrade();
-            move |_| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    ui.dispatch(Action::SelectMessage(id.clone()));
-                    if ui.inner.is_collapsed() {
-                        ui.inner.set_show_content(true);
-                    }
-                }
-            }
-        });
-        ui.messages.append(&row);
+    let desired = snapshot
+        .visible_messages
+        .iter()
+        .cloned()
+        .map(|message| MessageListItem {
+            selected: selected_id == Some(&message.id),
+            message,
+        })
+        .collect::<Vec<_>>();
+    update_message_model(&ui.message_model, &desired);
+}
+
+fn update_message_model(model: &gtk::gio::ListStore, desired: &[MessageListItem]) {
+    let existing = (0..model.n_items())
+        .filter_map(|index| {
+            model
+                .item(index)
+                .and_downcast::<gtk::glib::BoxedAnyObject>()
+                .map(|object| object.borrow::<MessageListItem>().clone())
+        })
+        .collect::<Vec<_>>();
+    let prefix = existing
+        .iter()
+        .zip(desired)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = existing[prefix..]
+        .iter()
+        .rev()
+        .zip(desired[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let remove = existing.len().saturating_sub(prefix + suffix);
+    let additions = desired[prefix..desired.len().saturating_sub(suffix)]
+        .iter()
+        .cloned()
+        .map(gtk::glib::BoxedAnyObject::new)
+        .collect::<Vec<_>>();
+    if remove > 0 || !additions.is_empty() {
+        model.splice(prefix as u32, remove as u32, &additions);
     }
 }
 
@@ -500,6 +528,8 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["title-1"])
             .build(),
     );
@@ -793,7 +823,11 @@ fn render_filters(ui: &Ui, active: MessageFilter) {
         } else {
             button.remove_css_class("whitford-filter-active");
         }
-        button.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
+        button.update_state(&[gtk::accessible::State::Checked(if selected {
+            gtk::AccessibleTristate::True
+        } else {
+            gtk::AccessibleTristate::False
+        })]);
     }
 }
 
@@ -1249,6 +1283,30 @@ fn clear_box(container: &gtk::Box) {
 mod tests {
     use super::*;
     use crate::model::SyncMetadata;
+    #[test]
+    fn virtual_message_model_keeps_unchanged_rows_stable_at_five_hundred_items() {
+        let model = gtk::gio::ListStore::new::<gtk::glib::BoxedAnyObject>();
+        let template = crate::model::fixture_messages().remove(0);
+        let mut desired = (1..=500_u64)
+            .map(|id| {
+                let mut message = template.clone();
+                message.id = crate::model::MessageId::gmail(id);
+                message.subject = format!("Message {id}");
+                MessageListItem {
+                    message,
+                    selected: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        update_message_model(&model, &desired);
+        assert_eq!(model.n_items(), 500);
+        let unchanged = model.item(499).unwrap();
+
+        desired[0].selected = true;
+        update_message_model(&model, &desired);
+        assert_eq!(model.n_items(), 500);
+        assert_eq!(model.item(499).unwrap(), unchanged);
+    }
     #[test]
     fn offline_snapshot_keeps_mail_visible() {
         assert!(should_render_mail(ViewStatus::Offline, true));

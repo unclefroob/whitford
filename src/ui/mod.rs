@@ -15,18 +15,26 @@ use std::{
 use adw::prelude::*;
 
 use crate::{
-    model::FolderId,
+    model::{FolderId, MessageSummary},
     oauth::AuthorizationUrl,
     state::{Action, AppState, ComposerState, Effect, MessageFilter},
     worker::{OperationId, WorkerCommand, WorkerEvent},
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MessageListItem {
+    pub(crate) message: MessageSummary,
+    pub(crate) selected: bool,
+}
 
 #[derive(Clone)]
 pub struct Ui {
     pub window: adw::ApplicationWindow,
     pub(crate) state: Rc<RefCell<AppState>>,
     pub(crate) folders: gtk::ListBox,
-    pub(crate) messages: gtk::ListBox,
+    pub(crate) messages: gtk::ListView,
+    pub(crate) message_model: gtk::gio::ListStore,
+    pub(crate) message_status: gtk::Box,
     pub(crate) list_banner: gtk::Box,
     pub(crate) search: gtk::SearchEntry,
     pub(crate) reader: gtk::Box,
@@ -76,7 +84,9 @@ pub(crate) struct WeakUi {
     window: gtk::glib::WeakRef<adw::ApplicationWindow>,
     state: Weak<RefCell<AppState>>,
     folders: gtk::glib::WeakRef<gtk::ListBox>,
-    messages: gtk::glib::WeakRef<gtk::ListBox>,
+    messages: gtk::glib::WeakRef<gtk::ListView>,
+    message_model: gtk::gio::ListStore,
+    message_status: gtk::glib::WeakRef<gtk::Box>,
     list_banner: gtk::glib::WeakRef<gtk::Box>,
     search: gtk::glib::WeakRef<gtk::SearchEntry>,
     reader: gtk::glib::WeakRef<gtk::Box>,
@@ -155,6 +165,8 @@ impl Ui {
             state: Rc::downgrade(&self.state),
             folders: self.folders.downgrade(),
             messages: self.messages.downgrade(),
+            message_model: self.message_model.clone(),
+            message_status: self.message_status.downgrade(),
             list_banner: self.list_banner.downgrade(),
             search: self.search.downgrade(),
             reader: self.reader.downgrade(),
@@ -450,6 +462,8 @@ impl WeakUi {
             state: self.state.upgrade()?,
             folders: self.folders.upgrade()?,
             messages: self.messages.upgrade()?,
+            message_model: self.message_model.clone(),
+            message_status: self.message_status.upgrade()?,
             list_banner: self.list_banner.upgrade()?,
             search: self.search.upgrade()?,
             reader: self.reader.upgrade()?,

@@ -7,9 +7,9 @@ use crate::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Button {
-    let row = gtk::Button::builder()
-        .has_frame(false)
+pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
         .css_classes(["whitford-message-row"])
         .build();
     if selected {
@@ -61,7 +61,7 @@ pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Butt
     if message.starred {
         line.append(&gtk::Image::from_icon_name("starred-symbolic"));
     }
-    row.set_child(Some(&line));
+    row.append(&line);
     let mut traits = Vec::new();
     if selected {
         traits.push("selected");

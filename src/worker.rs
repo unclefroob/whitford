@@ -471,6 +471,10 @@ pub enum WorkerEvent {
         url: AuthorizationUrl,
         deadline: SystemTime,
     },
+    IdentityVerified {
+        id: OperationId,
+        account: AccountIdentity,
+    },
     AccountPersisted {
         id: OperationId,
         account: AccountIdentity,
@@ -667,6 +671,9 @@ impl fmt::Debug for WorkerEvent {
                 .debug_struct("AuthorizationRequired")
                 .field("id", id)
                 .finish(),
+            Self::IdentityVerified { id, .. } => {
+                f.debug_struct("IdentityVerified").field("id", id).finish()
+            }
             Self::AccountPersisted { id, .. } => {
                 f.debug_struct("AccountPersisted").field("id", id).finish()
             }
@@ -1224,15 +1231,17 @@ async fn controller(
             else {
                 unreachable!()
             };
-            if let Err(error) = mutation_tx.send(MutationIo {
+            if let Err(error) = mutation_tx.send(MutationActorCommand::Mutate(MutationIo {
                 request_id,
                 generation,
                 account_email,
                 message_id,
                 locator,
                 mutation,
-            }) {
-                let failed = error.0;
+            })) {
+                let MutationActorCommand::Mutate(failed) = error.0 else {
+                    unreachable!()
+                };
                 let _ = events.send(WorkerEvent::MutationFailed {
                     request_id: failed.request_id,
                     generation: failed.generation,
@@ -1540,6 +1549,47 @@ async fn controller(
             }
             continue;
         }
+        let account_boundary = matches!(
+            &command,
+            WorkerCommand::Connect { .. }
+                | WorkerCommand::Restore { .. }
+                | WorkerCommand::Refresh { .. }
+                | WorkerCommand::Disconnect { .. }
+        );
+        if account_boundary {
+            // The barrier is queued behind every transmitted mutation. It is
+            // deliberately awaited before auth replacement or local purge.
+            if !drain_mutations(&mutation_tx).await {
+                let id = command_id(&command).unwrap_or(OperationId(0));
+                if matches!(&command, WorkerCommand::Disconnect { .. }) {
+                    fail_cleanup(&events, id, false);
+                } else {
+                    fail(&events, id, FailureKind::WorkerUnavailable, false, true);
+                }
+                continue;
+            }
+            // State blocks account transitions during SMTP. This defensive
+            // wait preserves a definite send outcome if a command is injected.
+            if let Some(task) = send_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = search_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            for (_, task) in attachment_tasks.drain() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         if let WorkerCommand::Disconnect { generation, .. } = &command {
             cache_generation.store(*generation, Ordering::Release);
             send_generation.store(*generation, Ordering::Release);
@@ -1641,7 +1691,7 @@ async fn controller(
                 let draft_tx = draft_tx.clone();
                 tokio::spawn(async move {
                     emit_phase(&tx, id, WorkerPhase::Disconnecting);
-                    let local_cleanup = async {
+                    let draft_cleanup = async {
                         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                         if draft_tx
                             .send(DraftIo::PurgeAccount {
@@ -1656,6 +1706,9 @@ async fn controller(
                         if !matches!(timeout(KEYRING_TIMEOUT, result_rx).await, Ok(Ok(Ok(())))) {
                             return false;
                         }
+                        true
+                    };
+                    let cache_cleanup = async {
                         matches!(
                             cache_blocking(cache_io, cache::clear_all_mail).await,
                             Ok(Ok(()))
@@ -1667,7 +1720,8 @@ async fn controller(
                             Ok(Ok(()))
                         )
                     };
-                    if cleanup_token_last(local_cleanup, token_cleanup).await {
+                    if cleanup_account_token_last(draft_cleanup, cache_cleanup, token_cleanup).await
+                    {
                         let _ = tx.send(WorkerEvent::Disconnected { id });
                     } else {
                         fail_cleanup(&tx, id, false);
@@ -1813,15 +1867,27 @@ struct MutationIo {
     mutation: MessageMutation,
 }
 
+enum MutationActorCommand {
+    Mutate(MutationIo),
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
 async fn mutation_actor(
-    mut commands: mpsc::UnboundedReceiver<MutationIo>,
+    mut commands: mpsc::UnboundedReceiver<MutationActorCommand>,
     events: mpsc::UnboundedSender<WorkerEvent>,
     auth: Arc<Mutex<Option<RuntimeAuth>>>,
     cache_io: Arc<Mutex<()>>,
     generation_gate: Arc<std::sync::atomic::AtomicU64>,
     metadata_lane: Arc<tokio::sync::Mutex<()>>,
 ) {
-    while let Some(command) = commands.recv().await {
+    while let Some(actor_command) = commands.recv().await {
+        let command = match actor_command {
+            MutationActorCommand::Mutate(command) => command,
+            MutationActorCommand::Barrier(done) => {
+                let _ = done.send(());
+                continue;
+            }
+        };
         if generation_gate.load(Ordering::Acquire) != command.generation {
             continue;
         }
@@ -1916,6 +1982,11 @@ async fn mutation_actor(
         };
         let _ = events.send(event);
     }
+}
+
+async fn drain_mutations(tx: &mpsc::UnboundedSender<MutationActorCommand>) -> bool {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tx.send(MutationActorCommand::Barrier(done_tx)).is_ok() && done_rx.await.is_ok()
 }
 
 enum DraftIo {
@@ -2349,6 +2420,22 @@ where
     token_cleanup.await
 }
 
+async fn cleanup_account_token_last<Drafts, Cache, Token>(
+    drafts_cleanup: Drafts,
+    cache_cleanup: Cache,
+    token_cleanup: Token,
+) -> bool
+where
+    Drafts: Future<Output = bool>,
+    Cache: Future<Output = bool>,
+    Token: Future<Output = bool>,
+{
+    if !drafts_cleanup.await {
+        return false;
+    }
+    cleanup_token_last(cache_cleanup, token_cleanup).await
+}
+
 async fn save_with_cleanup<Save, SaveFuture, Cleanup, CleanupFuture>(
     cleanup_required: &AtomicBool,
     preserve_mail: bool,
@@ -2470,6 +2557,17 @@ async fn connect(
     let account = oauth::fetch_identity(&grant.access_token, &client)
         .await
         .map_err(map_oauth)?;
+    cache_blocking(cache_io.clone(), {
+        let email = account.email.clone();
+        move || cache::prepare_verified_account(&email)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, false, false))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, false))?;
+    let _ = tx.send(WorkerEvent::IdentityVerified {
+        id,
+        account: account.clone(),
+    });
     *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
         email: account.email.clone(),
         access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
@@ -2593,16 +2691,6 @@ async fn restore_or_refresh(
         (latest, usage)
     })
     .await;
-    if let Ok((Ok(Some((account, snapshot))), usage)) = cached {
-        let _ = tx.send(WorkerEvent::CacheLoaded {
-            id,
-            account,
-            snapshot,
-        });
-        if let Ok(usage) = usage {
-            let _ = tx.send(WorkerEvent::CacheUsageChanged { usage });
-        }
-    }
     emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
     let config = config::load().map_err(|error| map_config(error, true))?;
     let client = oauth::http_client().map_err(map_oauth)?;
@@ -2660,6 +2748,29 @@ async fn restore_or_refresh(
     let account = oauth::fetch_identity(&grant.access_token, &client)
         .await
         .map_err(map_oauth)?;
+    cache_blocking(cache_io.clone(), {
+        let email = account.email.clone();
+        move || cache::prepare_verified_account(&email)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, false, false))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, false))?;
+    let _ = tx.send(WorkerEvent::IdentityVerified {
+        id,
+        account: account.clone(),
+    });
+    if let Ok((Ok(Some((cached_account, snapshot))), usage)) = cached
+        && cached_account.email.eq_ignore_ascii_case(&account.email)
+    {
+        let _ = tx.send(WorkerEvent::CacheLoaded {
+            id,
+            account: cached_account,
+            snapshot,
+        });
+        if let Ok(usage) = usage {
+            let _ = tx.send(WorkerEvent::CacheUsageChanged { usage });
+        }
+    }
     *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
         email: account.email.clone(),
         access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
@@ -2708,14 +2819,14 @@ async fn complete_sync(
             },
             messages,
         };
-        let snapshot = cache::replace_and_save(&account_for_cache, fresh.clone(), requested_limit)
-            .unwrap_or(fresh);
+        let snapshot = cache::replace_and_save(&account_for_cache, fresh, requested_limit)?;
         let usage = cache::usage();
-        (snapshot, usage)
+        Ok::<_, std::io::Error>((snapshot, usage))
     })
     .await
     .map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?;
-    let (snapshot, usage) = result;
+    let (snapshot, usage) =
+        result.map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
     let _ = tx.send(WorkerEvent::SyncComplete {
         id,
         account,
@@ -3688,6 +3799,141 @@ mod tests {
                 .await
             );
             assert_eq!(*calls.lock().unwrap(), ["local"]);
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let first_local = calls.clone();
+            let first_token = calls.clone();
+            assert!(
+                !cleanup_token_last(
+                    async move {
+                        first_local.lock().unwrap().push("local-failed");
+                        false
+                    },
+                    async move {
+                        first_token.lock().unwrap().push("token-too-early");
+                        true
+                    },
+                )
+                .await
+            );
+            let retry_local = calls.clone();
+            let retry_token = calls.clone();
+            assert!(
+                cleanup_token_last(
+                    async move {
+                        retry_local.lock().unwrap().push("local-retried");
+                        true
+                    },
+                    async move {
+                        retry_token.lock().unwrap().push("token");
+                        true
+                    },
+                )
+                .await
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["local-failed", "local-retried", "token"]
+            );
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let draft_calls = calls.clone();
+            let cache_calls = calls.clone();
+            let token_calls = calls.clone();
+            assert!(
+                !cleanup_account_token_last(
+                    async move {
+                        draft_calls.lock().unwrap().push("drafts");
+                        true
+                    },
+                    async move {
+                        cache_calls.lock().unwrap().push("cache-failed");
+                        false
+                    },
+                    async move {
+                        token_calls.lock().unwrap().push("token-too-early");
+                        true
+                    },
+                )
+                .await
+            );
+            let retry_drafts = calls.clone();
+            let retry_cache = calls.clone();
+            let retry_token = calls.clone();
+            assert!(
+                cleanup_account_token_last(
+                    async move {
+                        retry_drafts.lock().unwrap().push("drafts-retried");
+                        true
+                    },
+                    async move {
+                        retry_cache.lock().unwrap().push("cache-retried");
+                        true
+                    },
+                    async move {
+                        retry_token.lock().unwrap().push("token");
+                        true
+                    },
+                )
+                .await
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [
+                    "drafts",
+                    "cache-failed",
+                    "drafts-retried",
+                    "cache-retried",
+                    "token"
+                ]
+            );
+        });
+    }
+    #[test]
+    fn mutation_barrier_settles_every_prior_command_before_account_boundary() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+            let actor = tokio::spawn(mutation_actor(
+                command_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(())),
+                generation,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ));
+            command_tx
+                .send(MutationActorCommand::Mutate(MutationIo {
+                    request_id: MutationRequestId(1),
+                    generation: 7,
+                    account_email: "person@example.com".into(),
+                    message_id: MessageId::gmail(9),
+                    locator: MessageLocator {
+                        folder_id: FolderId::Inbox,
+                        mailbox: "INBOX".into(),
+                        uid_validity: 4,
+                        uid: 9,
+                    },
+                    mutation: MessageMutation::SetStarred(true),
+                }))
+                .unwrap();
+
+            assert!(drain_mutations(&command_tx).await);
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(WorkerEvent::MutationFailed {
+                    request_id: MutationRequestId(1),
+                    uncertain: false,
+                    ..
+                })
+            ));
+            drop(command_tx);
+            actor.await.unwrap();
         });
     }
     #[test]

@@ -107,6 +107,13 @@ pub fn load_latest(limit: usize) -> io::Result<Option<(AccountIdentity, MailboxS
     load_latest_from(&cache_root(), limit)
 }
 
+/// Removes every cached artifact when the verified Gmail identity changes.
+/// This runs before the new account is exposed to the UI, so a later save
+/// failure can never leave the previous account's mailbox available.
+pub fn prepare_verified_account(account_email: &str) -> io::Result<()> {
+    prepare_verified_account_at(&cache_root(), account_email)
+}
+
 pub fn load_folder(
     account_email: &str,
     folder_id: &FolderId,
@@ -613,9 +620,10 @@ fn replace_folder_and_save_at(
             "invalid folder cache snapshot",
         ));
     }
-    // Remove the previous account's bodies before publishing the new account index. A crash can
-    // lose reusable cache data, but can never pair one account's index with another's bodies.
+    // Remove the previous account's identifying index before touching reusable data. A crash can
+    // lose cache data, but can never leave the previous account renderable after a switch.
     if account_changed {
+        remove_file_if_exists(&mailbox_path(cache))?;
         remove_dir_if_exists(&bodies_path(cache))?;
         remove_dir_if_exists(&attachments_path(cache))?;
     }
@@ -627,6 +635,27 @@ fn replace_folder_and_save_at(
     let _ = remove_dir_if_exists(&legacy_bodies_path(cache));
     reconcile_bodies(cache, &account.email, None, None, BODY_CACHE_BUDGET_BYTES)?;
     Ok(fresh)
+}
+
+fn prepare_verified_account_at(cache: &Path, account_email: &str) -> io::Result<()> {
+    validate_account_email(account_email)?;
+    let previous = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
+        Ok(Some(value)) if valid_stored_mailbox(&value) => Some(value),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+        Err(error) => return Err(error),
+    };
+    if previous
+        .as_ref()
+        .is_some_and(|stored| !stored.account_email.eq_ignore_ascii_case(account_email))
+    {
+        // Delete the identifying index first. Cleanup can be retried safely,
+        // while the previous account can no longer be rendered after this point.
+        remove_file_if_exists(&mailbox_path(cache))?;
+        remove_dir_if_exists(&bodies_path(cache))?;
+        remove_dir_if_exists(&attachments_path(cache))?;
+    }
+    Ok(())
 }
 
 fn load_body_at(
@@ -1540,6 +1569,35 @@ mod tests {
         replace_and_save_at(&root.0, &other, snapshot(&[1]), 50).unwrap();
         assert!(
             load_body_at(&root.0, "other@example.com", &id, 2)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verified_account_switch_invalidates_old_mail_before_a_failed_new_save() {
+        let root = TestRoot::new();
+        replace_and_save_at(&root.0, &account(), snapshot(&[1]), 50).unwrap();
+        save_body_at(
+            &root.0,
+            EMAIL,
+            &MessageId::gmail(1),
+            &body("account a private"),
+            1,
+            u64::MAX,
+        )
+        .unwrap();
+
+        prepare_verified_account_at(&root.0, "other@example.com").unwrap();
+        let other = AccountIdentity {
+            provider: MailProvider::Gmail,
+            email: "other@example.com".into(),
+        };
+        assert!(replace_and_save_at(&root.0, &other, snapshot(&[1]), 42).is_err());
+
+        assert!(load_latest_from(&root.0, 50).unwrap().is_none());
+        assert!(
+            load_body_at(&root.0, EMAIL, &MessageId::gmail(1), 2)
                 .unwrap()
                 .is_none()
         );

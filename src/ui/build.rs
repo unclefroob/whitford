@@ -6,7 +6,7 @@ use std::{
 use adw::prelude::*;
 use gtk::glib::value::ToValue;
 
-use super::Ui;
+use super::{MessageListItem, Ui, widgets::message_row};
 use crate::state::{Action, AppState, MessageFilter};
 
 pub(super) fn build(
@@ -21,9 +21,34 @@ pub(super) fn build(
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["whitford-folder-list"])
         .build();
-    let messages = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
+    let message_model = gtk::gio::ListStore::new::<gtk::glib::BoxedAnyObject>();
+    let message_selection = gtk::NoSelection::new(Some(message_model.clone()));
+    let message_factory = gtk::SignalListItemFactory::new();
+    message_factory.connect_bind(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(object) = list_item.item().and_downcast::<gtk::glib::BoxedAnyObject>() else {
+            return;
+        };
+        let item = object.borrow::<MessageListItem>();
+        list_item.set_child(Some(&message_row(&item.message, item.selected)));
+    });
+    message_factory.connect_unbind(|_, object| {
+        if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
+            list_item.set_child(None::<&gtk::Widget>);
+        }
+    });
+    let messages = gtk::ListView::builder()
+        .model(&message_selection)
+        .factory(&message_factory)
+        .single_click_activate(true)
         .css_classes(["whitford-message-list"])
+        .build();
+    let message_status = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .vexpand(true)
+        .visible(false)
         .build();
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search sender or subject")
@@ -40,7 +65,7 @@ pub(super) fn build(
     let (folder_pane, sync_title, sync_detail, cache_limit, cache_usage) =
         build_folder_pane(&folders);
     let (message_page, list_header, filter_buttons, list_banner) =
-        build_message_page(&messages, &search, &list_menu);
+        build_message_page(&messages, &message_status, &search, &list_menu);
     let (reader_page, reader, reader_banner, label_menu) = build_reader_page(&reader_menu);
 
     let inner = adw::NavigationSplitView::builder()
@@ -91,6 +116,8 @@ pub(super) fn build(
         state,
         folders,
         messages,
+        message_model,
+        message_status,
         list_banner,
         search,
         reader,
@@ -707,6 +734,26 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         });
     }
+    ui.messages.connect_activate({
+        let weak_ui = ui.downgrade();
+        move |_, position| {
+            let Some(ui) = weak_ui.upgrade() else {
+                return;
+            };
+            let Some(object) = ui
+                .message_model
+                .item(position)
+                .and_downcast::<gtk::glib::BoxedAnyObject>()
+            else {
+                return;
+            };
+            let id = object.borrow::<MessageListItem>().message.id.clone();
+            ui.dispatch(Action::SelectMessage(id));
+            if ui.inner.is_collapsed() {
+                ui.inner.set_show_content(true);
+            }
+        }
+    });
     ui.cache_limit.connect_selected_notify({
         let weak_ui = ui.downgrade();
         move |dropdown| {
@@ -921,7 +968,8 @@ fn build_folder_pane(
 }
 
 fn build_message_page(
-    messages: &gtk::ListBox,
+    messages: &gtk::ListView,
+    message_status: &gtk::Box,
     search: &gtk::SearchEntry,
     menu: &gtk::Button,
 ) -> (
@@ -969,6 +1017,7 @@ fn build_message_page(
         .margin_top(8)
         .margin_bottom(6)
         .build();
+    filters.set_accessible_role(gtk::AccessibleRole::RadioGroup);
     let filter_buttons = [
         (MessageFilter::All, "All"),
         (MessageFilter::Unread, "Unread"),
@@ -981,6 +1030,7 @@ fn build_message_page(
             .has_frame(false)
             .css_classes(["whitford-filter"])
             .build();
+        button.set_accessible_role(gtk::AccessibleRole::Radio);
         button.update_property(&[gtk::accessible::Property::Label(&format!(
             "Show {text} messages"
         ))]);
@@ -996,6 +1046,7 @@ fn build_message_page(
         .visible(false)
         .build();
     content.append(&list_banner);
+    content.append(message_status);
     content.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(true)

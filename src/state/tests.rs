@@ -606,6 +606,162 @@ fn archive_reconciliation_restores_authoritative_inbox_membership() {
     assert_eq!(restored.labels, ["Work"]);
 }
 
+fn load_folder_for_test(state: &mut AppState, id: FolderId, mailbox: &str, subject: &str) {
+    let (request_id, generation, folder_id) =
+        folder_effect(state.dispatch(Action::SelectFolder(id)));
+    state.dispatch(Action::Worker(WorkerEvent::FolderLoaded {
+        request_id,
+        generation,
+        folder_id: folder_id.clone(),
+        snapshot: folder_snapshot(folder_id, mailbox, subject),
+    }));
+}
+
+#[test]
+fn trash_failure_after_navigation_never_inserts_inbox_row_into_sent() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, mutation) =
+        mutation_effect(state.dispatch(Action::MoveToTrash));
+    assert!(matches!(mutation, MessageMutation::MoveToTrash { .. }));
+    load_folder_for_test(&mut state, FolderId::Sent, "[Gmail]/Sent Mail", "Sent only");
+
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id,
+        uncertain: false,
+    }));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.selected_folder_id, FolderId::Sent);
+    assert_eq!(snapshot.visible_messages.len(), 1);
+    assert_eq!(snapshot.visible_messages[0].subject, "Sent only");
+    assert_eq!(snapshot.visible_messages[0].folder_id, FolderId::Sent);
+}
+
+#[test]
+fn label_failure_after_navigation_does_not_mutate_the_label_view() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let (request_id, generation, message_id, mutation) =
+        mutation_effect(state.dispatch(Action::ToggleLabel("Projects/Rust".into())));
+    assert!(matches!(mutation, MessageMutation::SetLabel { .. }));
+    load_folder_for_test(
+        &mut state,
+        FolderId::Label("Projects/Rust".into()),
+        "Projects/Rust",
+        "Label only",
+    );
+    let labels_before = state.snapshot().visible_messages[0].labels.clone();
+
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id,
+        uncertain: false,
+    }));
+    assert_eq!(state.snapshot().visible_messages[0].labels, labels_before);
+}
+
+#[test]
+fn trash_and_label_optimistic_changes_roll_back_only_in_the_originating_inbox() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let (label_request, generation, label_id, _) =
+        mutation_effect(state.dispatch(Action::ToggleLabel("Projects/Rust".into())));
+    assert!(
+        state
+            .selected_message()
+            .unwrap()
+            .labels
+            .contains(&"Projects/Rust".into())
+    );
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id: label_request,
+        generation,
+        message_id: label_id,
+        uncertain: false,
+    }));
+    assert!(state.selected_message().unwrap().labels.is_empty());
+
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (trash_request, generation, trashed_id, _) =
+        mutation_effect(state.dispatch(Action::MoveToTrash));
+    assert!(!state.visible_message_ids().contains(&trashed_id));
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id: trash_request,
+        generation,
+        message_id: trashed_id.clone(),
+        uncertain: false,
+    }));
+    assert_eq!(
+        state
+            .mailbox
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|message| message.id == trashed_id)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn reconciliation_after_navigation_never_inserts_an_inbox_row_into_trash() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) = mutation_effect(state.dispatch(Action::Archive));
+    load_folder_for_test(&mut state, FolderId::Trash, "[Gmail]/Trash", "Trash only");
+    state.dispatch(Action::Worker(WorkerEvent::MutationReconciled {
+        request_id,
+        generation,
+        message_id,
+        state: Some(ReconciledMessageState {
+            unread: true,
+            starred: false,
+            labels: vec!["Work".into()],
+        }),
+    }));
+    assert_eq!(state.snapshot().visible_messages.len(), 1);
+    assert_eq!(state.snapshot().visible_messages[0].subject, "Trash only");
+    assert_eq!(
+        state.snapshot().visible_messages[0].folder_id,
+        FolderId::Trash
+    );
+}
+
+#[test]
+fn trash_uncertain_and_missing_target_settle_without_reinsert_or_duplicate() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) =
+        mutation_effect(state.dispatch(Action::MoveToTrash));
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        uncertain: true,
+    }));
+    assert!(!state.visible_message_ids().contains(&message_id));
+
+    state.selected_message_id = Some(MessageId::gmail(1));
+    let (request_id, generation, missing, _) = mutation_effect(state.dispatch(Action::ToggleStar));
+    state
+        .mailbox
+        .as_mut()
+        .unwrap()
+        .messages
+        .retain(|message| message.id != missing);
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id: missing.clone(),
+        uncertain: false,
+    }));
+    assert!(!state.visible_message_ids().contains(&missing));
+}
+
 #[test]
 fn second_change_to_same_dimension_waits_for_settlement() {
     let mut state = AppState::new();
@@ -732,6 +888,49 @@ fn offline_session_classifies_missing_runtime_auth_as_offline() {
             failure: BodyFailure::Offline
         } if id == message_id
     ));
+}
+
+#[test]
+fn cached_folder_rows_survive_refresh_failures_and_stale_failures_are_ignored() {
+    for failure in [
+        BodyFailure::Offline,
+        BodyFailure::TimedOut,
+        BodyFailure::Protocol,
+    ] {
+        let mut state = ready_for_search();
+        let (request_id, generation, folder_id) =
+            folder_effect(state.dispatch(Action::SelectFolder(FolderId::Sent)));
+        let cached = folder_snapshot(FolderId::Sent, "[Gmail]/Sent Mail", "Cached sent");
+        state.dispatch(Action::Worker(WorkerEvent::FolderCacheLoaded {
+            request_id,
+            generation,
+            folder_id: folder_id.clone(),
+            snapshot: cached,
+        }));
+        state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+            request_id,
+            generation,
+            folder_id,
+            failure,
+        }));
+        assert_eq!(state.snapshot().visible_messages[0].subject, "Cached sent");
+
+        let (new_request, new_generation, new_folder) =
+            folder_effect(state.dispatch(Action::SelectFolder(FolderId::Trash)));
+        state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+            request_id,
+            generation,
+            folder_id: FolderId::Sent,
+            failure: BodyFailure::Protocol,
+        }));
+        assert_eq!(state.snapshot().selected_folder_id, FolderId::Trash);
+        state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+            request_id: new_request,
+            generation: new_generation,
+            folder_id: new_folder,
+            failure: BodyFailure::Protocol,
+        }));
+    }
 }
 
 #[test]
@@ -919,6 +1118,34 @@ fn account_switch_drops_old_mailbox_and_reader_before_body_requests() {
     assert!(snapshot.selected_message.is_none());
     assert!(matches!(snapshot.reader, ReaderState::Closed));
     assert_eq!(snapshot.account.unwrap().email, "other@example.com");
+}
+
+#[test]
+fn verified_account_switch_hides_old_mail_even_if_credential_save_then_fails() {
+    let mut state = AppState::new();
+    let id = ready(&mut state);
+    state.active_operation = Some(id);
+    state.dispatch(Action::Worker(WorkerEvent::IdentityVerified {
+        id,
+        account: AccountIdentity {
+            provider: MailProvider::Gmail,
+            email: "other@example.com".into(),
+        },
+    }));
+    assert!(state.snapshot().visible_messages.is_empty());
+    assert_eq!(state.snapshot().account.unwrap().email, "other@example.com");
+
+    state.dispatch(Action::Worker(WorkerEvent::Failed {
+        id,
+        failure: ServiceFailure {
+            kind: FailureKind::CredentialSaveFailed,
+            retryable: true,
+            preserve_mail: false,
+            cleanup_failed: false,
+            config_path: None,
+        },
+    }));
+    assert!(state.snapshot().visible_messages.is_empty());
 }
 #[test]
 fn filters_and_navigation_are_safe() {
@@ -1378,6 +1605,26 @@ fn disconnect_is_blocked_without_discarding_an_in_flight_reply() {
         ComposerState::Sending { ref draft, .. } if draft.body == "Keep this draft"
     ));
     assert!(!state.snapshot().can_disconnect);
+}
+
+#[test]
+fn reconnect_is_blocked_until_smtp_has_a_definite_outcome() {
+    let mut state = AppState::new();
+    load_replyable(&mut state);
+    state.dispatch(Action::BeginReply);
+    state.dispatch(Action::UpdateMessageBody("Still sending".into()));
+    state.dispatch(Action::SendMessage);
+
+    let connect = state.dispatch(Action::Connect);
+    assert!(connect.effects.is_empty());
+    assert_eq!(
+        connect.feedback,
+        Some("Wait for the message to finish sending before reconnecting")
+    );
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Sending { .. }
+    ));
 }
 
 #[test]

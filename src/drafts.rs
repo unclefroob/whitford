@@ -531,6 +531,29 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_or_oversized_draft_blocks_restoration_without_partial_results() {
+        for oversized in [false, true] {
+            let root = temp_root();
+            save_at(&root, "me@example.com", &draft()).unwrap();
+            let broken = account_root(&root, "me@example.com").join("draft-2");
+            ensure_private_dir(&broken).unwrap();
+            let path = broken.join("draft.json");
+            if oversized {
+                let file = fs::File::create(&path).unwrap();
+                file.set_len(MAX_DRAFT_JSON_BYTES + 1).unwrap();
+            } else {
+                fs::write(&path, b"{not valid json").unwrap();
+            }
+            let error = load_all_at(&root, "me@example.com").unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::Other
+            ));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn account_purge_removes_drafts_staged_files_and_signature_only_for_that_account() {
         let root = temp_root();
         let first = draft();

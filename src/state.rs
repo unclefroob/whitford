@@ -70,6 +70,7 @@ pub struct AppState {
 #[derive(Clone, Debug)]
 struct PendingMutation {
     request_id: MutationRequestId,
+    origin_folder_id: FolderId,
     mutation: MessageMutation,
     previous: PendingValue,
 }
@@ -665,6 +666,12 @@ impl AppState {
         }
     }
     fn start(&mut self, kind: SyncKind) -> Update {
+        if matches!(self.composer, ComposerState::Sending { .. }) {
+            return Update {
+                feedback: Some("Wait for the message to finish sending before reconnecting"),
+                ..Default::default()
+            };
+        }
         let Some(id) = self.allocate() else {
             return Update {
                 feedback: Some("Mail worker is unavailable"),
@@ -672,6 +679,18 @@ impl AppState {
             };
         };
         let mut effects = self.invalidate_server_search();
+        self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+        self.active_folder_request = None;
+        self.folder_loading = false;
+        let had_attachment_jobs = !self.attachment_jobs.is_empty();
+        self.attachment_jobs.clear();
+        let reader_was_loading = matches!(self.reader, ReaderState::Loading { .. });
+        if reader_was_loading {
+            self.reader = ReaderState::Closed;
+        }
+        if had_attachment_jobs || reader_was_loading {
+            self.bump_reader();
+        }
         self.session = SessionState::Syncing {
             kind,
             phase: if kind == SyncKind::Restore {
@@ -1242,6 +1261,7 @@ impl AppState {
         let id = match &event {
             WorkerEvent::Phase { id, .. }
             | WorkerEvent::AuthorizationRequired { id, .. }
+            | WorkerEvent::IdentityVerified { id, .. }
             | WorkerEvent::AccountPersisted { id, .. }
             | WorkerEvent::CacheLoaded { id, .. }
             | WorkerEvent::NoStoredAccount { id }
@@ -1301,6 +1321,32 @@ impl AppState {
                     effects: vec![Effect::LaunchAuthorization { id }],
                     ..Default::default()
                 }
+            }
+            WorkerEvent::IdentityVerified { account, .. } => {
+                let account_is_new = self
+                    .account
+                    .as_ref()
+                    .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
+                if account_is_new {
+                    self.pending_mutations.clear();
+                    self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                    self.server_search = ServerSearchState::Idle;
+                    self.reset_draft_session();
+                    self.send_generation = self.send_generation.wrapping_add(1);
+                    self.composer = ComposerState::Closed;
+                    self.mailbox = None;
+                    self.selected_message_id = None;
+                    self.reader = ReaderState::Closed;
+                    self.cache_usage = CacheUsage::default();
+                    self.selected_folder_id = FolderId::Inbox;
+                    self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+                    self.active_folder_request = None;
+                    self.folder_loading = false;
+                    self.bump_list();
+                    self.bump_reader();
+                }
+                self.account = Some(account);
+                Update::default()
             }
             WorkerEvent::AccountPersisted { account, .. } => {
                 let account_is_new = self
@@ -2170,6 +2216,7 @@ impl AppState {
             key,
             PendingMutation {
                 request_id,
+                origin_folder_id: self.selected_folder_id.clone(),
                 mutation: mutation.clone(),
                 previous,
             },
@@ -2211,8 +2258,9 @@ impl AppState {
             .pending_mutations
             .remove(&key)
             .expect("pending mutation exists");
+        let origin_is_visible = self.selected_folder_id == pending.origin_folder_id;
         let definite_failure = !confirmed && reconciled.is_none() && !uncertain;
-        if definite_failure {
+        if definite_failure && origin_is_visible {
             match pending.previous {
                 PendingValue::Bool(value) => {
                     if let Some(message) = self.mailbox.as_mut().and_then(|mailbox| {
@@ -2247,13 +2295,15 @@ impl AppState {
                 }
                 PendingValue::Inbox { message, index } => {
                     if let Some(mailbox) = self.mailbox.as_mut() {
-                        let index = index.min(mailbox.messages.len());
-                        mailbox.messages.insert(index, *message);
+                        if !mailbox.messages.iter().any(|item| item.id == message.id) {
+                            let index = index.min(mailbox.messages.len());
+                            mailbox.messages.insert(index, *message);
+                        }
                         mailbox.metadata.loaded_count = mailbox.messages.len();
                     }
                 }
             }
-        } else if let Some(state) = reconciled {
+        } else if origin_is_visible && let Some(state) = reconciled {
             match state {
                 Some(state) => {
                     if let Some(mailbox) = self.mailbox.as_mut() {
