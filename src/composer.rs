@@ -1,6 +1,6 @@
 use crate::model::{MessageId, ReplyAddress, ReplyContext};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 pub const MAX_RECIPIENTS: usize = 100;
 pub const MAX_SUBJECT_CHARS: usize = 512;
@@ -195,16 +195,39 @@ pub fn sanitize_html(input: &str) -> String {
                 "b",
                 "blockquote",
                 "br",
+                "caption",
+                "center",
+                "col",
+                "colgroup",
                 "div",
                 "em",
+                "font",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "hr",
                 "i",
                 "img",
                 "li",
                 "ol",
                 "p",
+                "pre",
                 "s",
+                "small",
                 "span",
                 "strong",
+                "sub",
+                "sup",
+                "table",
+                "tbody",
+                "td",
+                "tfoot",
+                "th",
+                "thead",
+                "tr",
                 "u",
                 "ul",
             ]
@@ -212,11 +235,105 @@ pub fn sanitize_html(input: &str) -> String {
             .collect(),
         )
         .add_tag_attributes("a", ["href", "title"])
-        .add_tag_attributes("img", ["src", "alt", "title"])
+        .add_tag_attributes("img", ["src", "alt", "title", "width", "height", "border"])
+        .add_generic_attributes(&[
+            "align",
+            "bgcolor",
+            "border",
+            "cellpadding",
+            "cellspacing",
+            "class",
+            "dir",
+            "height",
+            "style",
+            "valign",
+            "width",
+        ])
+        .attribute_filter(|_, attribute, value| {
+            if attribute == "style" {
+                sanitize_email_style(value).map(Cow::Owned)
+            } else {
+                Some(Cow::Borrowed(value))
+            }
+        })
         .url_schemes(["http", "https", "mailto", "cid"].into_iter().collect())
         .link_rel(None)
         .clean(input)
         .to_string()
+}
+
+fn sanitize_email_style(value: &str) -> Option<String> {
+    const SAFE_PROPERTIES: &[&str] = &[
+        "background",
+        "background-color",
+        "border",
+        "border-bottom",
+        "border-collapse",
+        "border-color",
+        "border-left",
+        "border-radius",
+        "border-right",
+        "border-spacing",
+        "border-style",
+        "border-top",
+        "border-width",
+        "color",
+        "direction",
+        "display",
+        "font",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "height",
+        "letter-spacing",
+        "line-height",
+        "margin",
+        "margin-bottom",
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "max-height",
+        "max-width",
+        "min-height",
+        "min-width",
+        "padding",
+        "padding-bottom",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "table-layout",
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-transform",
+        "vertical-align",
+        "white-space",
+        "width",
+        "word-break",
+        "word-spacing",
+        "word-wrap",
+    ];
+    let declarations = value
+        .split(';')
+        .filter_map(|declaration| {
+            let (property, value) = declaration.split_once(':')?;
+            let property = property.trim().to_ascii_lowercase();
+            let value = value.trim();
+            let unsafe_value = value.to_ascii_lowercase();
+            if !SAFE_PROPERTIES.contains(&property.as_str())
+                || unsafe_value.contains("url(")
+                || unsafe_value.contains("expression(")
+                || unsafe_value.contains("javascript:")
+                || value.chars().any(char::is_control)
+            {
+                return None;
+            }
+            Some(format!("{property}:{value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    (!declarations.is_empty()).then_some(declarations)
 }
 
 pub fn html_to_plain(input: &str) -> String {
@@ -423,6 +540,20 @@ mod tests {
         assert!(!clean.contains("onclick"));
         assert!(!clean.contains("javascript"));
         assert!(clean.contains("cid:image"));
+    }
+
+    #[test]
+    fn sanitizer_preserves_safe_email_layout_and_inline_formatting() {
+        let clean = sanitize_html(
+            r#"<table width="600" cellpadding="8" style="background-color:#fff;position:fixed;background-image:url(https://tracker.test/p)"><tr><td align="center" style="font-size:18px;color:#123456">Hello</td></tr></table>"#,
+        );
+        assert!(clean.contains("<table"));
+        assert!(clean.contains("width=\"600\""));
+        assert!(clean.contains("cellpadding=\"8\""));
+        assert!(clean.contains("background-color:#fff"));
+        assert!(clean.contains("font-size:18px;color:#123456"));
+        assert!(!clean.contains("position:fixed"));
+        assert!(!clean.contains("tracker.test"));
     }
 
     #[test]
