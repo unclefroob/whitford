@@ -32,6 +32,69 @@ fn ready(state: &mut AppState) -> OperationId {
     id
 }
 
+fn browsing_catalog() -> crate::model::FolderCatalog {
+    use crate::model::{FolderDescriptor, FolderKind};
+
+    crate::model::FolderCatalog::bounded(vec![
+        FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            display_name: "Inbox".into(),
+            kind: FolderKind::Inbox,
+        },
+        FolderDescriptor {
+            id: FolderId::Sent,
+            mailbox: "[Gmail]/Sent Mail".into(),
+            display_name: "Sent".into(),
+            kind: FolderKind::Sent,
+        },
+        FolderDescriptor {
+            id: FolderId::AllMail,
+            mailbox: "[Gmail]/All Mail".into(),
+            display_name: "All Mail".into(),
+            kind: FolderKind::AllMail,
+        },
+        FolderDescriptor {
+            id: FolderId::Trash,
+            mailbox: "[Gmail]/Trash".into(),
+            display_name: "Trash".into(),
+            kind: FolderKind::Trash,
+        },
+        FolderDescriptor {
+            id: FolderId::Starred,
+            mailbox: "[Gmail]/Starred".into(),
+            display_name: "Starred".into(),
+            kind: FolderKind::Starred,
+        },
+        FolderDescriptor {
+            id: FolderId::Label("Projects/Rust".into()),
+            mailbox: "Projects/Rust".into(),
+            display_name: "Projects/Rust".into(),
+            kind: FolderKind::Label,
+        },
+    ])
+}
+
+fn folder_snapshot(folder_id: FolderId, mailbox_name: &str, subject: &str) -> MailboxSnapshot {
+    let mut message = fixture_messages().remove(0);
+    message.folder_id = folder_id.clone();
+    message.locator.folder_id = folder_id;
+    message.locator.mailbox = mailbox_name.into();
+    message.locator.uid = 91;
+    message.subject = subject.into();
+    MailboxSnapshot {
+        messages: vec![message],
+        folder_catalog: browsing_catalog(),
+        metadata: SyncMetadata {
+            completed_at: SystemTime::UNIX_EPOCH,
+            requested_limit: 50,
+            loaded_count: 1,
+            fallback_count: 0,
+            skipped_count: 0,
+        },
+    }
+}
+
 fn body() -> Arc<crate::model::MessageBody> {
     Arc::new(crate::model::MessageBody {
         text: "Complete body".into(),
@@ -248,6 +311,104 @@ fn mutation_effect(update: Update) -> (MutationRequestId, u64, MessageId, Messag
     }
 }
 
+fn folder_effect(update: Update) -> (FolderRequestId, u64, FolderId) {
+    match update.effects.into_iter().next().expect("folder effect") {
+        Effect::SendWorker(WorkerCommand::FetchFolder {
+            request_id,
+            generation,
+            folder,
+            ..
+        }) => (request_id, generation, folder.id),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+#[test]
+fn folder_navigation_shows_cache_then_replaces_it_with_fresh_mail() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.mailbox.as_mut().unwrap().folder_catalog = browsing_catalog();
+
+    let (request_id, generation, folder_id) =
+        folder_effect(state.dispatch(Action::SelectFolder(FolderId::Sent)));
+    assert_eq!(folder_id, FolderId::Sent);
+    let loading = state.snapshot();
+    assert_eq!(loading.selected_folder_id, FolderId::Sent);
+    assert_eq!(loading.status, ViewStatus::Loading);
+    assert!(loading.visible_messages.is_empty());
+    assert_eq!(loading.folders.len(), 6);
+    assert_eq!(loading.folder_counts, vec![(FolderId::Sent, 0)]);
+
+    state.dispatch(Action::Worker(WorkerEvent::FolderCacheLoaded {
+        request_id,
+        generation,
+        folder_id: FolderId::Sent,
+        snapshot: folder_snapshot(FolderId::Sent, "[Gmail]/Sent Mail", "Cached subject"),
+    }));
+    let cached = state.snapshot();
+    assert_eq!(cached.status, ViewStatus::Ready);
+    assert_eq!(cached.visible_messages[0].subject, "Cached subject");
+    assert_eq!(cached.folder_counts, vec![(FolderId::Sent, 1)]);
+    assert!(!cached.can_mutate);
+
+    let body_request = state.dispatch(Action::SelectMessage(MessageId::gmail(1)));
+    assert!(matches!(
+        body_request.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::FetchBody { locator, .. })]
+            if locator.folder_id == FolderId::Sent
+                && locator.mailbox == "[Gmail]/Sent Mail"
+                && locator.uid == 91
+    ));
+
+    state.dispatch(Action::Worker(WorkerEvent::FolderLoaded {
+        request_id,
+        generation,
+        folder_id: FolderId::Sent,
+        snapshot: folder_snapshot(FolderId::Sent, "[Gmail]/Sent Mail", "Fresh subject"),
+    }));
+    let fresh = state.snapshot();
+    assert_eq!(fresh.status, ViewStatus::Ready);
+    assert_eq!(fresh.visible_messages[0].subject, "Fresh subject");
+    assert_eq!(fresh.visible_messages[0].id, MessageId::gmail(1));
+}
+
+#[test]
+fn rapid_folder_switch_ignores_the_superseded_request() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.mailbox.as_mut().unwrap().folder_catalog = browsing_catalog();
+
+    let (sent_request, sent_generation, _) =
+        folder_effect(state.dispatch(Action::SelectFolder(FolderId::Sent)));
+    let label_id = FolderId::Label("Projects/Rust".into());
+    let (label_request, label_generation, _) =
+        folder_effect(state.dispatch(Action::SelectFolder(label_id.clone())));
+    assert_ne!(sent_request, label_request);
+    assert_ne!(sent_generation, label_generation);
+
+    state.dispatch(Action::Worker(WorkerEvent::FolderLoaded {
+        request_id: sent_request,
+        generation: sent_generation,
+        folder_id: FolderId::Sent,
+        snapshot: folder_snapshot(FolderId::Sent, "[Gmail]/Sent Mail", "Stale Sent"),
+    }));
+    let still_loading = state.snapshot();
+    assert_eq!(still_loading.selected_folder_id, label_id);
+    assert_eq!(still_loading.status, ViewStatus::Loading);
+    assert!(still_loading.visible_messages.is_empty());
+
+    state.dispatch(Action::Worker(WorkerEvent::FolderLoaded {
+        request_id: label_request,
+        generation: label_generation,
+        folder_id: label_id.clone(),
+        snapshot: folder_snapshot(label_id.clone(), "Projects/Rust", "Rust label"),
+    }));
+    let loaded = state.snapshot();
+    assert_eq!(loaded.selected_folder_id, label_id.clone());
+    assert_eq!(loaded.visible_messages[0].subject, "Rust label");
+    assert_eq!(loaded.folder_counts, vec![(label_id, 1)]);
+}
+
 #[test]
 fn optimistic_dimensions_settle_without_clobbering_each_other() {
     let mut state = AppState::new();
@@ -422,12 +583,10 @@ fn retention_increase_after_decrease_refreshes_again() {
     assert_eq!(state.snapshot().sync_metadata.unwrap().requested_limit, 50);
 
     let update = state.dispatch(Action::SetCacheLimit(100));
-    assert!(
-        update
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
-    );
+    assert!(update.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::FetchFolder { .. })
+    )));
     assert_eq!(state.snapshot().sync_metadata.unwrap().requested_limit, 100);
 }
 
@@ -446,19 +605,12 @@ fn offline_session_classifies_missing_runtime_auth_as_offline() {
         _ => panic!(),
     };
     let refresh = state.dispatch(Action::Refresh);
-    let refresh_id = match refresh.effects[0] {
-        Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
-        _ => panic!(),
-    };
-    state.dispatch(Action::Worker(WorkerEvent::Failed {
-        id: refresh_id,
-        failure: ServiceFailure {
-            kind: FailureKind::Network,
-            retryable: true,
-            preserve_mail: true,
-            cleanup_failed: false,
-            config_path: None,
-        },
+    let (folder_request, folder_generation, folder_id) = folder_effect(refresh);
+    state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+        request_id: folder_request,
+        generation: folder_generation,
+        folder_id,
+        failure: BodyFailure::Offline,
     }));
     state.dispatch(Action::Worker(WorkerEvent::BodyFailed {
         request_id,
@@ -549,19 +701,12 @@ fn refresh_failure_preserves_mail_and_enters_offline() {
     let mut state = AppState::new();
     ready(&mut state);
     let update = state.dispatch(Action::Refresh);
-    let id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
-        _ => panic!(),
-    };
-    state.dispatch(Action::Worker(WorkerEvent::Failed {
-        id,
-        failure: ServiceFailure {
-            kind: FailureKind::Network,
-            retryable: true,
-            preserve_mail: true,
-            cleanup_failed: false,
-            config_path: None,
-        },
+    let (request_id, generation, folder_id) = folder_effect(update);
+    state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+        request_id,
+        generation,
+        folder_id,
+        failure: BodyFailure::Offline,
     }));
     assert_eq!(state.snapshot().status, ViewStatus::Offline);
     assert_eq!(state.visible_message_ids().len(), 3);
@@ -748,19 +893,12 @@ fn auth_required_retry_reconnects_and_offline_retains_rows() {
     let mut state = AppState::new();
     ready(&mut state);
     let update = state.dispatch(Action::Refresh);
-    let id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
-        _ => panic!(),
-    };
-    state.dispatch(Action::Worker(WorkerEvent::Failed {
-        id,
-        failure: ServiceFailure {
-            kind: FailureKind::AuthorizationExpired,
-            retryable: false,
-            preserve_mail: true,
-            cleanup_failed: false,
-            config_path: None,
-        },
+    let (request_id, generation, folder_id) = folder_effect(update);
+    state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+        request_id,
+        generation,
+        folder_id,
+        failure: BodyFailure::AuthorizationRequired,
     }));
     let degraded = state.snapshot();
     assert_eq!(degraded.status, ViewStatus::Degraded);
@@ -897,23 +1035,16 @@ fn retry_preserves_restore_and_refresh_operations() {
     let mut state = AppState::new();
     ready(&mut state);
     let update = state.dispatch(Action::Refresh);
-    let refresh_id = match update.effects[0] {
-        Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
-        _ => panic!(),
-    };
-    state.dispatch(Action::Worker(WorkerEvent::Failed {
-        id: refresh_id,
-        failure: ServiceFailure {
-            kind: FailureKind::Network,
-            retryable: true,
-            preserve_mail: true,
-            cleanup_failed: false,
-            config_path: None,
-        },
+    let (request_id, generation, folder_id) = folder_effect(update);
+    state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+        request_id,
+        generation,
+        folder_id,
+        failure: BodyFailure::Offline,
     }));
     assert!(matches!(
         state.dispatch(Action::Retry).effects.as_slice(),
-        [Effect::SendWorker(WorkerCommand::Refresh { .. })]
+        [Effect::SendWorker(WorkerCommand::FetchFolder { .. })]
     ));
 }
 
@@ -951,7 +1082,7 @@ fn startup_configuration_error_only_retries_saved_token_restore() {
 
 #[test]
 fn authentication_rejections_recover_with_connect() {
-    for kind in [
+    for _kind in [
         FailureKind::AuthorizationExpired,
         FailureKind::IdentityInvalid,
         FailureKind::ImapAuthenticationFailed,
@@ -959,19 +1090,12 @@ fn authentication_rejections_recover_with_connect() {
         let mut state = AppState::new();
         ready(&mut state);
         let update = state.dispatch(Action::Refresh);
-        let id = match update.effects[0] {
-            Effect::SendWorker(WorkerCommand::Refresh { id }) => id,
-            _ => panic!(),
-        };
-        state.dispatch(Action::Worker(WorkerEvent::Failed {
-            id,
-            failure: ServiceFailure {
-                kind,
-                retryable: false,
-                preserve_mail: true,
-                cleanup_failed: false,
-                config_path: None,
-            },
+        let (request_id, generation, folder_id) = folder_effect(update);
+        state.dispatch(Action::Worker(WorkerEvent::FolderFailed {
+            request_id,
+            generation,
+            folder_id,
+            failure: BodyFailure::AuthorizationRequired,
         }));
         assert!(matches!(
             state.snapshot().session,
@@ -1077,12 +1201,10 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
         generation,
     }));
     assert_eq!(complete.feedback, Some("Message sent"));
-    assert!(
-        complete
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
-    );
+    assert!(complete.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::FetchFolder { .. })
+    )));
     assert!(complete.effects.iter().any(|effect| matches!(
         effect,
         Effect::SendWorker(WorkerCommand::DeleteDraft { .. })
@@ -1239,12 +1361,10 @@ fn standalone_send_reuses_generic_smtp_submission_without_thread_headers() {
         generation,
     }));
     assert!(matches!(state.snapshot().composer, ComposerState::Closed));
-    assert!(
-        completed
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
-    );
+    assert!(completed.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::FetchFolder { .. })
+    )));
 }
 
 #[test]

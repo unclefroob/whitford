@@ -442,6 +442,107 @@ pub async fn fetch_inbox(
     .map_err(|_| GmailError::TimedOut)?
 }
 
+pub async fn fetch_folder(
+    email: &str,
+    access_token: &str,
+    folder: FolderDescriptor,
+    limit: usize,
+) -> Result<InboxFetch, GmailError> {
+    if !valid_retention_limit(limit) || !folder.is_valid() {
+        return Err(GmailError::Protocol);
+    }
+    timeout(
+        Duration::from_secs(30),
+        fetch_folder_inner(email, access_token, folder, limit),
+    )
+    .await
+    .map_err(|_| GmailError::TimedOut)?
+}
+
+async fn fetch_folder_inner(
+    email: &str,
+    access_token: &str,
+    folder: FolderDescriptor,
+    limit: usize,
+) -> Result<InboxFetch, GmailError> {
+    let mut session = authenticated_session(email, access_token).await?;
+    let mailbox = session
+        .examine(&folder.mailbox)
+        .await
+        .map_err(|_| GmailError::InboxUnavailable)?;
+    let uid_validity = mailbox.uid_validity.ok_or(GmailError::Protocol)?;
+    let Some(sequence_numbers) = newest_sequence_set(mailbox.exists, limit) else {
+        let _ = session.logout().await;
+        return Ok(InboxFetch {
+            records: Vec::new(),
+            skipped_count: 0,
+            folder_catalog: FolderCatalog::bounded(vec![folder]),
+        });
+    };
+    let expected =
+        usize::try_from(mailbox.exists.min(limit as u32)).map_err(|_| GmailError::Protocol)?;
+    let uid_fetches: Vec<_> = session
+        .fetch(&sequence_numbers, "(UID)")
+        .await
+        .map_err(|_| GmailError::Protocol)?
+        .try_collect()
+        .await
+        .map_err(|_| GmailError::Protocol)?;
+    let (uids, discovery_skipped) = discovered_uids(
+        expected,
+        limit,
+        uid_fetches.into_iter().map(|fetch| fetch.uid),
+    );
+    let Some(sequence) = uid_sequence_set(&uids) else {
+        let _ = session.logout().await;
+        return Ok(InboxFetch {
+            records: Vec::new(),
+            skipped_count: discovery_skipped,
+            folder_catalog: FolderCatalog::bounded(vec![folder]),
+        });
+    };
+    let fetches: Vec<_> = session
+        .uid_fetch(sequence, SUMMARY_FETCH_QUERY)
+        .await
+        .map_err(|_| GmailError::Protocol)?
+        .try_collect()
+        .await
+        .map_err(|_| GmailError::Protocol)?;
+    let requested = uids.into_iter().collect::<BTreeSet<_>>();
+    let candidates = fetches
+        .into_iter()
+        .map(|fetch| SummaryCandidate {
+            uid: fetch.uid,
+            x_gm_msgid: fetch.gmail_msg_id().copied(),
+            flags: MessageFlags {
+                seen: fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                flagged: fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+            },
+            internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
+            size: fetch.size,
+            header: fetch
+                .header()
+                .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
+            attachment_state: attachment_state(fetch.bodystructure()),
+            labels: user_labels(
+                fetch
+                    .gmail_labels()
+                    .into_iter()
+                    .flatten()
+                    .map(|label| label.as_ref()),
+            ),
+        })
+        .collect();
+    let _ = session.logout().await;
+    let mut result = classify_summaries(folder, uid_validity, &requested, candidates);
+    result.skipped_count = result.skipped_count.saturating_add(discovery_skipped);
+    Ok(result)
+}
+
 async fn fetch_inbox_inner(
     email: &str,
     access_token: &str,

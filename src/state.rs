@@ -2,14 +2,14 @@ use crate::{
     cache,
     composer::{self, ComposeDraft, Recipient},
     model::{
-        AccountIdentity, CacheUsage, Folder, FolderId, MailboxSnapshot, MessageBody, MessageId,
-        MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState, inbox_folder,
+        AccountIdentity, CacheUsage, Folder, FolderId, FolderKind, MailboxSnapshot, MessageBody,
+        MessageId, MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState,
     },
     smtp,
     worker::{
         BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
-        MutationRequestId, OperationId, SendFailure, SendRequestId, ServiceFailure, SyncKind,
-        WorkerCommand, WorkerEvent, WorkerPhase,
+        FolderRequestId, MutationRequestId, OperationId, SendFailure, SendRequestId,
+        ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
 use std::{
@@ -26,6 +26,11 @@ pub struct AppState {
     account: Option<AccountIdentity>,
     mailbox: Option<MailboxSnapshot>,
     selected_message_id: Option<MessageId>,
+    selected_folder_id: FolderId,
+    next_folder_request: u64,
+    folder_generation: u64,
+    active_folder_request: Option<FolderRequestId>,
+    folder_loading: bool,
     search_query: String,
     message_filter: MessageFilter,
     recovery: Option<RecoveryAction>,
@@ -72,9 +77,10 @@ enum PendingValue {
         index: usize,
     },
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RecoveryAction {
     Sync(SyncKind),
+    Folder(FolderId),
     Disconnect,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,6 +344,11 @@ impl AppState {
             account: None,
             mailbox: None,
             selected_message_id: None,
+            selected_folder_id: FolderId::Inbox,
+            next_folder_request: 1,
+            folder_generation: 1,
+            active_folder_request: None,
+            folder_loading: false,
             search_query: String::new(),
             message_filter: MessageFilter::All,
             recovery: None,
@@ -377,7 +388,7 @@ impl AppState {
             Action::Connect => self.start(SyncKind::Connect),
             Action::Refresh => {
                 if self.account.is_some() {
-                    self.start(SyncKind::Refresh)
+                    self.load_folder(self.selected_folder_id.clone())
                 } else {
                     Update {
                         feedback: Some("Connect Gmail first"),
@@ -406,8 +417,9 @@ impl AppState {
                     self.disconnect()
                 }
             }
-            Action::Retry => match self.recovery {
+            Action::Retry => match self.recovery.clone() {
                 Some(RecoveryAction::Sync(kind)) => self.start(kind),
+                Some(RecoveryAction::Folder(id)) => self.load_folder(id),
                 Some(RecoveryAction::Disconnect) => self.disconnect(),
                 None => Update {
                     feedback: Some("Restart Whitford to restore the mail service"),
@@ -487,7 +499,7 @@ impl AppState {
                 }
             }
             Action::Worker(event) => self.worker_event(event),
-            Action::SelectFolder(_) => Update::default(),
+            Action::SelectFolder(id) => self.load_folder(id),
             Action::SelectMessage(id) => self.select_message(id),
             Action::SetSearch(query) => {
                 self.search_query = query.trim().to_owned();
@@ -618,6 +630,10 @@ impl AppState {
             return Update::default();
         };
         self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+        self.active_folder_request = None;
+        self.folder_loading = false;
+        self.selected_folder_id = FolderId::Inbox;
         self.pending_mutations.clear();
         self.send_generation = self.send_generation.wrapping_add(1);
         self.reset_draft_session();
@@ -648,6 +664,24 @@ impl AppState {
     }
     fn worker_event(&mut self, event: WorkerEvent) -> Update {
         match event {
+            WorkerEvent::FolderCacheLoaded {
+                request_id,
+                generation,
+                folder_id,
+                snapshot,
+            } => self.folder_loaded(request_id, generation, folder_id, snapshot, true),
+            WorkerEvent::FolderLoaded {
+                request_id,
+                generation,
+                folder_id,
+                snapshot,
+            } => self.folder_loaded(request_id, generation, folder_id, snapshot, false),
+            WorkerEvent::FolderFailed {
+                request_id,
+                generation,
+                folder_id,
+                failure,
+            } => self.folder_failed(request_id, generation, &folder_id, failure),
             WorkerEvent::BodyLoaded {
                 request_id,
                 generation,
@@ -757,7 +791,7 @@ impl AppState {
                     _ => None,
                 };
                 self.composer = ComposerState::Closed;
-                let mut update = self.start(SyncKind::Refresh);
+                let mut update = self.load_folder(self.selected_folder_id.clone());
                 update.feedback = Some("Message sent");
                 if let Some(draft) = sent {
                     self.saved_drafts.retain(|value| value.id != draft.id);
@@ -1057,6 +1091,9 @@ impl AppState {
             | WorkerEvent::Failed { id, .. } => *id,
             WorkerEvent::BodyLoaded { .. }
             | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::FolderCacheLoaded { .. }
+            | WorkerEvent::FolderLoaded { .. }
+            | WorkerEvent::FolderFailed { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
@@ -1112,6 +1149,10 @@ impl AppState {
                     self.selected_message_id = None;
                     self.reader = ReaderState::Closed;
                     self.cache_usage = CacheUsage::default();
+                    self.selected_folder_id = FolderId::Inbox;
+                    self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+                    self.active_folder_request = None;
+                    self.folder_loading = false;
                     self.bump_list();
                     self.bump_reader();
                 }
@@ -1140,6 +1181,7 @@ impl AppState {
                 }
                 let account_email = account.email.clone();
                 self.account = Some(account);
+                self.selected_folder_id = FolderId::Inbox;
                 self.mailbox = Some(snapshot);
                 self.normalize();
                 self.bump_list();
@@ -1182,6 +1224,10 @@ impl AppState {
                     self.selected_message_id = None;
                     self.reader = ReaderState::Closed;
                     self.cache_usage = CacheUsage::default();
+                    self.selected_folder_id = FolderId::Inbox;
+                    self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+                    self.active_folder_request = None;
+                    self.folder_loading = false;
                     self.bump_reader();
                 }
                 let draft_account = account.email.clone();
@@ -1202,6 +1248,10 @@ impl AppState {
             WorkerEvent::Disconnected { .. } => {
                 self.pending_mutations.clear();
                 self.account = None;
+                self.selected_folder_id = FolderId::Inbox;
+                self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+                self.active_folder_request = None;
+                self.folder_loading = false;
                 self.mailbox = None;
                 self.selected_message_id = None;
                 self.session = SessionState::Disconnected;
@@ -1258,6 +1308,9 @@ impl AppState {
             }
             WorkerEvent::BodyLoaded { .. }
             | WorkerEvent::BodyFailed { .. }
+            | WorkerEvent::FolderCacheLoaded { .. }
+            | WorkerEvent::FolderLoaded { .. }
+            | WorkerEvent::FolderFailed { .. }
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
@@ -1319,6 +1372,7 @@ impl AppState {
             SessionState::ServiceError { .. } | SessionState::ConfigurationError { .. } => {
                 ViewStatus::Error
             }
+            _ if self.folder_loading && !has_visible_messages => ViewStatus::Loading,
             _ if !has_visible_messages
                 && (!self.search_query.is_empty() || self.message_filter != MessageFilter::All) =>
             {
@@ -1329,6 +1383,7 @@ impl AppState {
         };
         ViewSnapshot {
             can_mutate: matches!(self.session, SessionState::Ready)
+                && self.selected_folder_id == FolderId::Inbox
                 && self.selected_message().is_some(),
             label_options: self
                 .mailbox
@@ -1350,14 +1405,39 @@ impl AppState {
                         .collect()
                 })
                 .unwrap_or_default(),
-            folders: vec![inbox_folder()],
+            folders: self
+                .mailbox
+                .as_ref()
+                .map(|mailbox| {
+                    mailbox
+                        .folder_catalog
+                        .folders
+                        .iter()
+                        .map(|folder| Folder {
+                            id: folder.id.clone(),
+                            name: folder.display_name.clone(),
+                            icon: match folder.kind {
+                                FolderKind::Inbox => "mail-unread-symbolic",
+                                FolderKind::Sent => "mail-send-symbolic",
+                                FolderKind::AllMail => "mail-read-symbolic",
+                                FolderKind::Trash => "user-trash-symbolic",
+                                FolderKind::Starred => "starred-symbolic",
+                                FolderKind::Label => "tag-symbolic",
+                            },
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
-            selected_folder_id: FolderId::Inbox,
+            selected_folder_id: self.selected_folder_id.clone(),
             search_query: self.search_query.clone(),
             message_filter: self.message_filter,
             status,
-            folder_counts: vec![(FolderId::Inbox, self.folder_count(&FolderId::Inbox))],
+            folder_counts: vec![(
+                self.selected_folder_id.clone(),
+                self.folder_count(&self.selected_folder_id),
+            )],
             session: self.session.clone(),
             account: self.account.clone(),
             sync_metadata: self
@@ -1472,6 +1552,137 @@ impl AppState {
             })
         })
     }
+    fn load_folder(&mut self, id: FolderId) -> Update {
+        let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
+            return Update {
+                feedback: Some("Connect Gmail first"),
+                ..Default::default()
+            };
+        };
+        let Some(catalog) = self
+            .mailbox
+            .as_ref()
+            .map(|mailbox| mailbox.folder_catalog.clone())
+        else {
+            return Update::default();
+        };
+        let Some(folder) = catalog.find(&id).cloned() else {
+            return Update {
+                feedback: Some("That Gmail folder is unavailable"),
+                ..Default::default()
+            };
+        };
+        let switching = self.selected_folder_id != id;
+        self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
+        let request_id = FolderRequestId(self.next_folder_request);
+        self.next_folder_request = self.next_folder_request.wrapping_add(1).max(1);
+        self.active_folder_request = Some(request_id);
+        self.folder_loading = true;
+        self.selected_folder_id = id;
+        if switching {
+            let mut empty = MailboxSnapshot::empty(SystemTime::now());
+            empty.folder_catalog = catalog.clone();
+            empty.metadata.requested_limit = self.cache_limit;
+            self.mailbox = Some(empty);
+            self.selected_message_id = None;
+            self.reader = ReaderState::Closed;
+            self.bump_reader();
+        }
+        self.normalize();
+        self.bump_list();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::FetchFolder {
+                request_id,
+                generation: self.folder_generation,
+                account_email,
+                folder,
+                catalog,
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn folder_loaded(
+        &mut self,
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: FolderId,
+        snapshot: MailboxSnapshot,
+        cached: bool,
+    ) -> Update {
+        if self.active_folder_request != Some(request_id)
+            || self.folder_generation != generation
+            || self.selected_folder_id != folder_id
+        {
+            return Update::default();
+        }
+        self.mailbox = Some(snapshot);
+        self.folder_loading = cached;
+        if !cached {
+            self.active_folder_request = None;
+            self.session = SessionState::Ready;
+            self.recovery = None;
+        }
+        self.normalize();
+        self.bump_list();
+        Update::default()
+    }
+
+    fn folder_failed(
+        &mut self,
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: &FolderId,
+        failure: BodyFailure,
+    ) -> Update {
+        if self.active_folder_request != Some(request_id)
+            || self.folder_generation != generation
+            || &self.selected_folder_id != folder_id
+        {
+            return Update::default();
+        }
+        self.active_folder_request = None;
+        self.folder_loading = false;
+        self.bump_list();
+        match failure {
+            BodyFailure::Offline | BodyFailure::TimedOut => {
+                self.recovery = Some(RecoveryAction::Folder(folder_id.clone()));
+                self.session = SessionState::Offline {
+                    failure: ServiceFailure {
+                        kind: if failure == BodyFailure::TimedOut {
+                            FailureKind::SyncTimedOut
+                        } else {
+                            FailureKind::Network
+                        },
+                        retryable: true,
+                        preserve_mail: true,
+                        cleanup_failed: false,
+                        config_path: None,
+                    },
+                };
+            }
+            BodyFailure::AuthorizationRequired => {
+                self.recovery = Some(RecoveryAction::Sync(SyncKind::Connect));
+                self.session = SessionState::AuthRequired {
+                    cleanup_failed: false,
+                };
+            }
+            BodyFailure::MailboxChanged | BodyFailure::Missing | BodyFailure::Protocol => {}
+        }
+        Update {
+            feedback: Some(match failure {
+                BodyFailure::Offline => "Showing cached mail; Gmail is offline",
+                BodyFailure::TimedOut => "Showing cached mail; Gmail took too long to respond",
+                BodyFailure::AuthorizationRequired => {
+                    "Refresh Gmail authorization to load this folder"
+                }
+                BodyFailure::MailboxChanged | BodyFailure::Missing | BodyFailure::Protocol => {
+                    "Could not refresh this Gmail folder"
+                }
+            }),
+            ..Default::default()
+        }
+    }
     fn select_message(&mut self, id: MessageId) -> Update {
         if self.visible_message_ids().contains(&id) {
             self.selected_message_id = Some(id);
@@ -1488,6 +1699,12 @@ impl AppState {
         &mut self,
         build: impl FnOnce(&MessageSummary, &crate::model::FolderCatalog) -> MessageMutation,
     ) -> Update {
+        if self.selected_folder_id != FolderId::Inbox {
+            return Update {
+                feedback: Some("Inbox triage actions are available from Inbox"),
+                ..Default::default()
+            };
+        }
         if !matches!(self.session, SessionState::Ready) {
             return Update {
                 feedback: Some("Connect Gmail before changing messages"),
@@ -1725,7 +1942,7 @@ impl AppState {
         self.bump_list();
         let mut effects = vec![Effect::SendWorker(WorkerCommand::SetCacheLimit { limit })];
         if increased && self.account.is_some() {
-            let refresh = self.start(SyncKind::Refresh);
+            let refresh = self.load_folder(self.selected_folder_id.clone());
             effects.extend(refresh.effects);
         }
         Update {

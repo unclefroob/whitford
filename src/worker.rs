@@ -3,8 +3,9 @@ use crate::{
     composer::{ComposeDraft, DraftAttachment},
     config, drafts, gmail, message,
     model::{
-        AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, MessageLocator,
-        MessageMutation, ReconciledMessageState, SyncMetadata,
+        AccountIdentity, CacheUsage, FolderCatalog, FolderDescriptor, FolderId, MailProvider,
+        MailboxSnapshot, MessageBody, MessageId, MessageLocator, MessageMutation,
+        ReconciledMessageState, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -48,6 +49,20 @@ pub struct SendRequestId(pub u64);
 pub struct DraftOperationId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MutationRequestId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FolderRequestId(pub u64);
+
+fn folder_debug_kind(id: &FolderId) -> &'static str {
+    match id {
+        FolderId::Inbox => "inbox",
+        FolderId::Sent => "sent",
+        FolderId::AllMail => "all-mail",
+        FolderId::Trash => "trash",
+        FolderId::Starred => "starred",
+        FolderId::Label(_) => "label",
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncKind {
     Restore,
@@ -176,6 +191,13 @@ pub enum WorkerCommand {
     SetCacheLimit {
         limit: usize,
     },
+    FetchFolder {
+        request_id: FolderRequestId,
+        generation: u64,
+        account_email: String,
+        folder: FolderDescriptor,
+        catalog: FolderCatalog,
+    },
     FetchBody {
         request_id: BodyRequestId,
         generation: u64,
@@ -261,6 +283,17 @@ impl fmt::Debug for WorkerCommand {
             Self::SetCacheLimit { limit } => f
                 .debug_struct("SetCacheLimit")
                 .field("limit", limit)
+                .finish(),
+            Self::FetchFolder {
+                request_id,
+                generation,
+                folder,
+                ..
+            } => f
+                .debug_struct("FetchFolder")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("folder_kind", &folder_debug_kind(&folder.id))
                 .finish(),
             Self::FetchBody {
                 request_id,
@@ -365,6 +398,24 @@ pub enum WorkerEvent {
         id: OperationId,
         account: AccountIdentity,
         snapshot: MailboxSnapshot,
+    },
+    FolderCacheLoaded {
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: FolderId,
+        snapshot: MailboxSnapshot,
+    },
+    FolderLoaded {
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: FolderId,
+        snapshot: MailboxSnapshot,
+    },
+    FolderFailed {
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: FolderId,
+        failure: BodyFailure,
     },
     Disconnected {
         id: OperationId,
@@ -505,6 +556,34 @@ impl fmt::Debug for WorkerEvent {
                 .debug_struct("SyncComplete")
                 .field("id", id)
                 .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
+            Self::FolderCacheLoaded {
+                request_id,
+                folder_id,
+                snapshot,
+                ..
+            }
+            | Self::FolderLoaded {
+                request_id,
+                folder_id,
+                snapshot,
+                ..
+            } => f
+                .debug_struct("FolderLoaded")
+                .field("request_id", request_id)
+                .field("folder_kind", &folder_debug_kind(folder_id))
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
+            Self::FolderFailed {
+                request_id,
+                folder_id,
+                failure,
+                ..
+            } => f
+                .debug_struct("FolderFailed")
+                .field("request_id", request_id)
+                .field("folder_kind", &folder_debug_kind(folder_id))
+                .field("failure", failure)
                 .finish(),
             Self::Disconnected { id } => f.debug_struct("Disconnected").field("id", id).finish(),
             Self::Cancelled { id } => f.debug_struct("Cancelled").field("id", id).finish(),
@@ -695,9 +774,11 @@ async fn controller(
     let cache_io = Arc::new(Mutex::new(()));
     let metadata_lane = Arc::new(tokio::sync::Mutex::new(()));
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let folder_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
+    let mut folder_task: Option<JoinHandle<()>> = None;
     let (draft_tx, draft_rx) = mpsc::unbounded_channel();
     let draft_events = events.clone();
     let draft_task = tokio::spawn(draft_io_actor(draft_rx, draft_events));
@@ -754,6 +835,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
             break;
         };
         if let WorkerCommand::SetCacheLimit { limit } = &command {
@@ -766,6 +851,35 @@ async fn controller(
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
+            continue;
+        }
+        if let WorkerCommand::FetchFolder {
+            request_id,
+            generation,
+            account_email,
+            folder,
+            catalog,
+        } = &command
+        {
+            folder_generation.store(*generation, Ordering::Release);
+            if let Some(task) = folder_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            folder_task = Some(tokio::spawn(fetch_folder_view(
+                FolderLoadRequest {
+                    request_id: *request_id,
+                    generation: *generation,
+                    account_email: account_email.clone(),
+                    folder: folder.clone(),
+                    catalog: catalog.clone(),
+                },
+                events.clone(),
+                auth.clone(),
+                cache_io.clone(),
+                folder_generation.clone(),
+                metadata_lane.clone(),
+            )));
             continue;
         }
         if matches!(&command, WorkerCommand::MutateMessage { .. }) {
@@ -1091,7 +1205,12 @@ async fn controller(
         if let WorkerCommand::Disconnect { generation, .. } = &command {
             cache_generation.store(*generation, Ordering::Release);
             send_generation.store(*generation, Ordering::Release);
+            folder_generation.fetch_add(1, Ordering::AcqRel);
             if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some(task) = folder_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1102,7 +1221,12 @@ async fn controller(
         if matches!(command, WorkerCommand::Shutdown) {
             cache_generation.fetch_add(1, Ordering::AcqRel);
             send_generation.fetch_add(1, Ordering::AcqRel);
+            folder_generation.fetch_add(1, Ordering::AcqRel);
             if let Some(task) = body_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some(task) = folder_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1249,6 +1373,7 @@ async fn controller(
             }
             WorkerCommand::Cancel { .. }
             | WorkerCommand::SetCacheLimit { .. }
+            | WorkerCommand::FetchFolder { .. }
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::ClearBodyCache { .. }
             | WorkerCommand::SendMessage { .. }
@@ -1735,6 +1860,14 @@ struct BodyLoadRequest {
     locator: MessageLocator,
 }
 
+struct FolderLoadRequest {
+    request_id: FolderRequestId,
+    generation: u64,
+    account_email: String,
+    folder: FolderDescriptor,
+    catalog: FolderCatalog,
+}
+
 async fn guard_smtp_send<F>(send: F) -> Result<(), smtp::SmtpError>
 where
     F: Future<Output = Result<(), smtp::SmtpError>>,
@@ -1837,6 +1970,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::Disconnect { id, .. }
         | WorkerCommand::Cancel { id } => Some(*id),
         WorkerCommand::SetCacheLimit { .. }
+        | WorkerCommand::FetchFolder { .. }
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::ClearBodyCache { .. }
         | WorkerCommand::SendMessage { .. }
@@ -2168,6 +2302,140 @@ async fn complete_sync(
     Ok(())
 }
 
+async fn fetch_folder_view(
+    request: FolderLoadRequest,
+    tx: mpsc::UnboundedSender<WorkerEvent>,
+    auth: Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: Arc<Mutex<()>>,
+    generation_gate: Arc<std::sync::atomic::AtomicU64>,
+    metadata_lane: Arc<tokio::sync::Mutex<()>>,
+) {
+    let FolderLoadRequest {
+        request_id,
+        generation,
+        account_email,
+        folder,
+        catalog,
+    } = request;
+    let folder_id = folder.id.clone();
+    let cache_account = account_email.clone();
+    let cache_folder = folder_id.clone();
+    let cached = cache_blocking(cache_io.clone(), move || {
+        cache::load_folder(&cache_account, &cache_folder, cache::load_limit())
+    })
+    .await;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    if let Ok(Ok(Some(mut snapshot))) = cached {
+        // Keep navigation on the catalog discovered by the current account
+        // sync. A cached view may predate label additions or removals.
+        snapshot.folder_catalog = catalog.clone();
+        let _ = tx.send(WorkerEvent::FolderCacheLoaded {
+            request_id,
+            generation,
+            folder_id: folder_id.clone(),
+            snapshot,
+        });
+    }
+    let credentials = auth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|value| value.email.eq_ignore_ascii_case(&account_email))
+        .map(|value| Zeroizing::new(value.access_token.as_str().to_owned()));
+    let Some(access_token) = credentials else {
+        let _ = tx.send(WorkerEvent::FolderFailed {
+            request_id,
+            generation,
+            folder_id,
+            failure: BodyFailure::AuthorizationRequired,
+        });
+        return;
+    };
+    let _lane = metadata_lane.lock().await;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let limit = match cache_blocking(cache_io.clone(), cache::load_limit).await {
+        Ok(limit) => limit,
+        Err(_) => {
+            let _ = tx.send(WorkerEvent::FolderFailed {
+                request_id,
+                generation,
+                folder_id,
+                failure: BodyFailure::Protocol,
+            });
+            return;
+        }
+    };
+    let fetched =
+        match gmail::fetch_folder(&account_email, access_token.as_str(), folder, limit).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                if generation_gate.load(Ordering::Acquire) == generation {
+                    let _ = tx.send(WorkerEvent::FolderFailed {
+                        request_id,
+                        generation,
+                        folder_id,
+                        failure: map_body_failure(error),
+                    });
+                }
+                return;
+            }
+        };
+    let account = AccountIdentity {
+        provider: MailProvider::Gmail,
+        email: account_email,
+    };
+    let save_account = account.clone();
+    let save_folder = folder_id.clone();
+    let save_gate = generation_gate.clone();
+    let saved = cache_blocking(cache_io, move || {
+        if save_gate.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let (messages, fallback_count) = message::map_summaries(fetched.records);
+        let fresh = MailboxSnapshot {
+            folder_catalog: catalog,
+            metadata: SyncMetadata {
+                completed_at: SystemTime::now(),
+                requested_limit: limit,
+                loaded_count: messages.len(),
+                fallback_count,
+                skipped_count: fetched.skipped_count,
+            },
+            messages,
+        };
+        Some(
+            cache::replace_folder_and_save(&save_account, save_folder, fresh.clone(), limit)
+                .unwrap_or(fresh),
+        )
+    })
+    .await;
+    if generation_gate.load(Ordering::Acquire) != generation {
+        return;
+    }
+    match saved {
+        Ok(Some(snapshot)) => {
+            let _ = tx.send(WorkerEvent::FolderLoaded {
+                request_id,
+                generation,
+                folder_id,
+                snapshot,
+            });
+        }
+        _ => {
+            let _ = tx.send(WorkerEvent::FolderFailed {
+                request_id,
+                generation,
+                folder_id,
+                failure: BodyFailure::Protocol,
+            });
+        }
+    }
+}
+
 async fn fetch_body(
     request: BodyLoadRequest,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -2446,6 +2714,22 @@ mod tests {
             },
         };
         assert!(!format!("{body_command:?}").contains("canary@example.com"));
+        let folder_command = WorkerCommand::FetchFolder {
+            request_id: FolderRequestId(8),
+            generation: 2,
+            account_email: "folder-canary@example.com".into(),
+            folder: FolderDescriptor {
+                id: FolderId::Label("Secret label".into()),
+                mailbox: "Secret label".into(),
+                display_name: "Secret label".into(),
+                kind: crate::model::FolderKind::Label,
+            },
+            catalog: FolderCatalog::inbox_only(),
+        };
+        let folder_debug = format!("{folder_command:?}");
+        assert_eq!(command_id(&folder_command), None);
+        assert!(!folder_debug.contains("folder-canary@example.com"));
+        assert!(!folder_debug.contains("Secret label"));
         let draft = crate::composer::new_message(
             "draft-canary".into(),
             "canary@example.com",

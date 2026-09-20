@@ -104,7 +104,7 @@ pub(super) fn status_panel(status: ViewStatus) -> gtk::Box {
         ViewStatus::Loading => (
             "content-loading-symbolic",
             "Loading mail",
-            "Securely preparing your Gmail inbox…",
+            "Securely preparing this Gmail folder…",
         ),
         ViewStatus::Offline => (
             "network-offline-symbolic",

@@ -14,6 +14,7 @@ use std::{
 use adw::prelude::*;
 
 use crate::{
+    model::FolderId,
     oauth::AuthorizationUrl,
     state::{Action, AppState, ComposerState, Effect, MessageFilter},
     worker::{OperationId, WorkerCommand, WorkerEvent},
@@ -378,6 +379,7 @@ impl Ui {
                     .body("Gmail may already have accepted the previous attempt. Check Sent first; sending again can create a duplicate.")
                     .build();
                 dialog.add_response("cancel", "Cancel");
+                dialog.add_response("sent", "Open Sent");
                 dialog.add_response("resend", "Send Again");
                 dialog.set_response_appearance("resend", adw::ResponseAppearance::Destructive);
                 let weak = self.downgrade();
@@ -385,10 +387,13 @@ impl Ui {
                     Some(&self.composer_window),
                     None::<&gtk::gio::Cancellable>,
                     move |response| {
-                        if response == "resend"
-                            && let Some(ui) = weak.upgrade()
-                        {
-                            ui.dispatch(Action::ConfirmResend);
+                        if let Some(ui) = weak.upgrade() {
+                            if response == "resend" {
+                                ui.dispatch(Action::ConfirmResend);
+                            } else if response == "sent" {
+                                ui.dispatch(Action::SelectFolder(FolderId::Sent));
+                                ui.request_close_composer();
+                            }
                         }
                     },
                 );
