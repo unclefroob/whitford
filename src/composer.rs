@@ -8,9 +8,34 @@ pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ComposeKind {
+    New,
     Reply { original: MessageId },
     ReplyAll { original: MessageId },
     Forward { original: MessageId },
+}
+
+pub fn new_message(
+    id: String,
+    account_email: &str,
+    signature_html: &str,
+) -> Result<ComposeDraft, ComposeError> {
+    let html = initial_html(signature_html, "");
+    validate_html(&html)?;
+    Ok(ComposeDraft {
+        id,
+        account_email: account_email.to_owned(),
+        kind: ComposeKind::New,
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: String::new(),
+        text: html_to_plain(&html),
+        html,
+        attachments: Vec::new(),
+        inline_images: Vec::new(),
+        thread: None,
+        dirty_revision: 0,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -501,6 +526,26 @@ fn thread_headers(context: &ReplyContext) -> ThreadHeaders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_message_is_unthreaded_blank_and_signature_optional() {
+        let blank = new_message("new-1".into(), "me@example.com", "").unwrap();
+        assert_eq!(blank.kind, ComposeKind::New);
+        assert!(blank.to.is_empty() && blank.cc.is_empty() && blank.bcc.is_empty());
+        assert!(blank.subject.is_empty());
+        assert!(blank.thread.is_none());
+        assert!(blank.html.contains("<div><br></div>"));
+
+        let signed = new_message(
+            "new-2".into(),
+            "me@example.com",
+            "<b>Ryan</b><script>bad()</script>",
+        )
+        .unwrap();
+        assert!(signed.html.contains("<b>Ryan</b>"));
+        assert!(!signed.html.contains("script"));
+        assert!(signed.thread.is_none());
+    }
 
     fn address(email: &str) -> ReplyAddress {
         ReplyAddress {

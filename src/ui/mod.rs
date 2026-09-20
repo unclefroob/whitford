@@ -218,13 +218,13 @@ impl Ui {
     pub(crate) fn toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
-    pub(crate) fn send_reply(&self) {
+    pub(crate) fn send_message(&self) {
         self.flush_recipients();
         let weak = self.downgrade();
         self.composer_editor.snapshot(move |html, text| {
             if let Some(ui) = weak.upgrade() {
                 ui.dispatch(Action::UpdateHtml { html, text });
-                ui.dispatch(Action::SendReply);
+                ui.dispatch(Action::SendMessage);
             }
         });
     }
@@ -232,7 +232,7 @@ impl Ui {
         let composer = self.state.borrow().snapshot().composer;
         match &composer {
             ComposerState::Closed => self.composer_window.set_visible(false),
-            ComposerState::Sending { .. } => self.toast("Wait for the reply to finish sending"),
+            ComposerState::Sending { .. } => self.toast("Wait for the message to finish sending"),
             ComposerState::Editing { .. } | ComposerState::Failed { .. } => {
                 self.flush_recipients();
                 let weak = self.downgrade();
@@ -249,7 +249,7 @@ impl Ui {
     pub(crate) fn save_composer_then_close_app(&self) {
         let composer = self.state.borrow().snapshot().composer;
         if matches!(composer, ComposerState::Sending { .. }) {
-            self.toast("Wait for the reply to finish sending");
+            self.toast("Wait for the message to finish sending");
             return;
         }
         if matches!(composer, ComposerState::Closed) {
@@ -374,7 +374,7 @@ impl Ui {
             }
             Effect::PresentUncertainResendConfirmation => {
                 let dialog = adw::AlertDialog::builder()
-                    .heading("Send this reply again?")
+                    .heading("Send this message again?")
                     .body("Gmail may already have accepted the previous attempt. Check Sent first; sending again can create a duplicate.")
                     .build();
                 dialog.add_response("cancel", "Cancel");

@@ -114,27 +114,27 @@ pub enum ReaderState {
     },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplyDraft {
-    pub message_id: MessageId,
+pub struct ComposeSession {
+    pub source_message_id: Option<MessageId>,
     pub recipient: String,
     pub subject: String,
     pub body: String,
-    pub context: crate::model::ReplyContext,
+    pub context: Option<crate::model::ReplyContext>,
     pub compose: ComposeDraft,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComposerState {
     Closed,
     Editing {
-        draft: ReplyDraft,
+        draft: ComposeSession,
     },
     Sending {
-        draft: ReplyDraft,
+        draft: ComposeSession,
         request_id: SendRequestId,
         generation: u64,
     },
     Failed {
-        draft: ReplyDraft,
+        draft: ComposeSession,
         failure: SendFailure,
     },
 }
@@ -186,10 +186,11 @@ pub enum Action {
     SetCacheLimit(usize),
     RetryBody,
     RetryDraftRestore,
+    BeginNewMessage,
     BeginReply,
     BeginReplyAll,
     BeginForward,
-    UpdateReplyBody(String),
+    UpdateMessageBody(String),
     UpdateRecipients {
         to: Vec<Recipient>,
         cc: Vec<Recipient>,
@@ -219,8 +220,8 @@ pub enum Action {
     HideComposerAndCloseApp,
     ResumeDraft,
     DiscardDraft,
-    CancelReply,
-    SendReply,
+    CancelCompose,
+    SendMessage,
     ConfirmResend,
     RequestClearCache,
     ConfirmClearCache,
@@ -264,6 +265,7 @@ pub struct ViewSnapshot {
     pub can_reopen: bool,
     pub can_cancel: bool,
     pub can_retry: bool,
+    pub can_compose: bool,
     pub cache_limit: usize,
     pub reader: ReaderState,
     pub composer: ComposerState,
@@ -298,15 +300,16 @@ pub enum EscapeOutcome {
     HideFolders,
     None,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComposeStart {
+    New,
     Reply,
     ReplyAll,
     Forward,
 }
 #[derive(Clone, Debug)]
 enum PendingDraftIntent {
-    Compose(ComposeStart, MessageId),
+    Compose(ComposeStart, Option<MessageId>),
     ResumeLatest,
 }
 pub fn escape_outcome(c: EscapeContext) -> EscapeOutcome {
@@ -394,7 +397,9 @@ impl AppState {
             Action::ConfirmDisconnect => {
                 if matches!(self.composer, ComposerState::Sending { .. }) {
                     Update {
-                        feedback: Some("Wait for the reply to finish before disconnecting"),
+                        feedback: Some(
+                            "Wait for the message to finish sending before disconnecting",
+                        ),
                         ..Default::default()
                     }
                 } else {
@@ -522,10 +527,11 @@ impl AppState {
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
             Action::RetryBody => self.retry_body(),
             Action::RetryDraftRestore => self.retry_draft_restore(),
+            Action::BeginNewMessage => self.begin_compose(ComposeStart::New),
             Action::BeginReply => self.begin_reply(),
             Action::BeginReplyAll => self.begin_compose(ComposeStart::ReplyAll),
             Action::BeginForward => self.begin_compose(ComposeStart::Forward),
-            Action::UpdateReplyBody(body) => self.update_reply_body(body),
+            Action::UpdateMessageBody(body) => self.update_message_body(body),
             Action::UpdateRecipients { to, cc, bcc } => self.update_recipients(to, cc, bcc),
             Action::UpdateSubject(subject) => self.update_subject(subject),
             Action::UpdateHtml { html, text } => self.update_html(html, text),
@@ -545,14 +551,14 @@ impl AppState {
             Action::HideComposerAndCloseApp => self.hide_composer_and_close_app(),
             Action::ResumeDraft => self.resume_draft(),
             Action::DiscardDraft => self.discard_draft(),
-            Action::CancelReply => {
+            Action::CancelCompose => {
                 if !matches!(self.composer, ComposerState::Sending { .. }) {
                     self.composer = ComposerState::Closed;
                 }
                 Update::default()
             }
-            Action::SendReply => self.send_reply(false),
-            Action::ConfirmResend => self.send_reply(true),
+            Action::SendMessage => self.send_message(false),
+            Action::ConfirmResend => self.send_message(true),
             Action::RequestClearCache => Update {
                 effects: vec![Effect::PresentClearCacheConfirmation],
                 ..Default::default()
@@ -736,7 +742,7 @@ impl AppState {
                 self.cache_usage = usage;
                 Update::default()
             }
-            WorkerEvent::ReplySent {
+            WorkerEvent::MessageSent {
                 request_id,
                 generation,
             } => {
@@ -767,7 +773,7 @@ impl AppState {
                 }
                 update
             }
-            WorkerEvent::ReplyFailed {
+            WorkerEvent::MessageSendFailed {
                 request_id,
                 generation,
                 failure,
@@ -1054,8 +1060,8 @@ impl AppState {
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
-            | WorkerEvent::ReplySent { .. }
-            | WorkerEvent::ReplyFailed { .. }
+            | WorkerEvent::MessageSent { .. }
+            | WorkerEvent::MessageSendFailed { .. }
             | WorkerEvent::DraftsLoaded { .. }
             | WorkerEvent::DraftSaved { .. }
             | WorkerEvent::DraftDeleted { .. }
@@ -1255,8 +1261,8 @@ impl AppState {
             | WorkerEvent::CacheCleared { .. }
             | WorkerEvent::CacheClearFailed { .. }
             | WorkerEvent::CacheUsageChanged { .. }
-            | WorkerEvent::ReplySent { .. }
-            | WorkerEvent::ReplyFailed { .. }
+            | WorkerEvent::MessageSent { .. }
+            | WorkerEvent::MessageSendFailed { .. }
             | WorkerEvent::DraftsLoaded { .. }
             | WorkerEvent::DraftSaved { .. }
             | WorkerEvent::DraftDeleted { .. }
@@ -1384,6 +1390,8 @@ impl AppState {
                 | SessionState::ServiceError { failure } => failure.retryable,
                 _ => false,
             },
+            can_compose: matches!(self.session, SessionState::Ready)
+                && matches!(self.composer, ComposerState::Closed),
             cache_limit: self.cache_limit,
             reader: self.reader.clone(),
             composer: self.composer.clone(),
@@ -1816,22 +1824,28 @@ impl AppState {
         if !matches!(self.composer, ComposerState::Closed) {
             return Update::default();
         }
-        let (id, context, original_html) = match &self.reader {
-            ReaderState::Loaded { id, body } => (
-                id.clone(),
-                body.reply_context.clone(),
-                body.html
-                    .clone()
-                    .unwrap_or_else(|| format!("<div>{}</div>", escape_html(&body.text))),
-            ),
-            _ => {
-                return Update {
-                    feedback: Some("Load the message before replying"),
-                    ..Default::default()
-                };
+        let source = match start {
+            ComposeStart::New => None,
+            ComposeStart::Reply | ComposeStart::ReplyAll | ComposeStart::Forward => {
+                match &self.reader {
+                    ReaderState::Loaded { id, body } => Some((
+                        id.clone(),
+                        body.reply_context.clone(),
+                        body.html
+                            .clone()
+                            .unwrap_or_else(|| format!("<div>{}</div>", escape_html(&body.text))),
+                    )),
+                    _ => {
+                        return Update {
+                            feedback: Some("Load the message before replying or forwarding"),
+                            ..Default::default()
+                        };
+                    }
+                }
             }
         };
-        if expected_id.as_ref().is_some_and(|expected| expected != &id) {
+        let source_id = source.as_ref().map(|(id, _, _)| id.clone());
+        if expected_id != source_id && expected_id.is_some() {
             return Update {
                 feedback: Some("Reopen the message to continue composing"),
                 ..Default::default()
@@ -1839,7 +1853,7 @@ impl AppState {
         }
         match self.draft_catalog_state {
             DraftCatalogState::NotStarted | DraftCatalogState::Loading => {
-                self.pending_draft_intent = Some(PendingDraftIntent::Compose(start, id));
+                self.pending_draft_intent = Some(PendingDraftIntent::Compose(start, source_id));
                 return Update {
                     feedback: Some("Restoring local drafts before composing"),
                     ..Default::default()
@@ -1853,12 +1867,17 @@ impl AppState {
             }
             DraftCatalogState::Ready => {}
         }
-        if let Some(compose) = self
-            .saved_drafts
-            .iter()
-            .rev()
-            .find(|draft| compose_matches(&draft.kind, start, &id))
-            .cloned()
+        if start != ComposeStart::New
+            && let Some(compose) = self
+                .saved_drafts
+                .iter()
+                .rev()
+                .find(|draft| {
+                    source
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| compose_matches(&draft.kind, start, id))
+                })
+                .cloned()
         {
             self.composer = ComposerState::Editing {
                 draft: compatibility_draft(compose),
@@ -1868,15 +1887,28 @@ impl AppState {
                 ..Default::default()
             };
         }
-        let Some(message) = self
-            .mailbox
-            .as_ref()
-            .and_then(|mailbox| mailbox.messages.iter().find(|message| message.id == id))
-        else {
-            return Update::default();
+        let source_subject = if let Some(id) = source_id.as_ref() {
+            let Some(subject) = self.mailbox.as_ref().and_then(|mailbox| {
+                mailbox
+                    .messages
+                    .iter()
+                    .find(|message| &message.id == id)
+                    .map(|message| message.subject.clone())
+            }) else {
+                return Update {
+                    feedback: Some("The source message is no longer in this mailbox"),
+                    ..Default::default()
+                };
+            };
+            Some(subject)
+        } else {
+            None
         };
         let Some(account_email) = self.account.as_ref().map(|a| a.email.clone()) else {
-            return Update::default();
+            return Update {
+                feedback: Some("Connect Gmail before composing"),
+                ..Default::default()
+            };
         };
         let mut random = [0_u8; 16];
         if getrandom::fill(&mut random).is_err() {
@@ -1897,34 +1929,38 @@ impl AppState {
         } else {
             ""
         };
-        let built = match start {
-            ComposeStart::Reply => composer::new_reply(
+        let built = match (start, source.as_ref()) {
+            (ComposeStart::New, _) => composer::new_message(draft_id, &account_email, signature),
+            (ComposeStart::Reply, Some((id, context, original_html))) => composer::new_reply(
                 draft_id,
                 &account_email,
                 id.clone(),
-                &message.subject,
-                &context,
-                &original_html,
+                source_subject.as_deref().unwrap_or(""),
+                context,
+                original_html,
                 signature,
             ),
-            ComposeStart::ReplyAll => composer::new_reply_all(
+            (ComposeStart::ReplyAll, Some((id, context, original_html))) => {
+                composer::new_reply_all(
+                    draft_id,
+                    &account_email,
+                    id.clone(),
+                    source_subject.as_deref().unwrap_or(""),
+                    context,
+                    original_html,
+                    signature,
+                )
+            }
+            (ComposeStart::Forward, Some((id, context, original_html))) => composer::new_forward(
                 draft_id,
                 &account_email,
                 id.clone(),
-                &message.subject,
-                &context,
-                &original_html,
+                source_subject.as_deref().unwrap_or(""),
+                context,
+                original_html,
                 signature,
             ),
-            ComposeStart::Forward => composer::new_forward(
-                draft_id,
-                &account_email,
-                id.clone(),
-                &message.subject,
-                &context,
-                &original_html,
-                signature,
-            ),
+            _ => return Update::default(),
         };
         let Ok(compose) = built else {
             return Update {
@@ -1939,19 +1975,19 @@ impl AppState {
             .collect::<Vec<_>>()
             .join(", ");
         self.composer = ComposerState::Editing {
-            draft: ReplyDraft {
-                message_id: id,
+            draft: ComposeSession {
+                source_message_id: source.as_ref().map(|(id, _, _)| id.clone()),
                 recipient,
                 subject: compose.subject.clone(),
                 body: String::new(),
-                context,
+                context: source.map(|(_, context, _)| context),
                 compose: compose.clone(),
             },
         };
         self.upsert_saved_draft(compose.clone());
         self.queue_draft_save(compose, None)
     }
-    fn update_reply_body(&mut self, body: String) -> Update {
+    fn update_message_body(&mut self, body: String) -> Update {
         match &mut self.composer {
             ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => {
                 draft.body = body.clone();
@@ -2305,7 +2341,7 @@ impl AppState {
         }
         self.draft_catalog_state = DraftCatalogState::Ready;
         match self.pending_draft_intent.take() {
-            Some(PendingDraftIntent::Compose(start, id)) => self.begin_compose_for(start, Some(id)),
+            Some(PendingDraftIntent::Compose(start, id)) => self.begin_compose_for(start, id),
             Some(PendingDraftIntent::ResumeLatest) => self.resume_draft(),
             None => Update::default(),
         }
@@ -2317,7 +2353,7 @@ impl AppState {
     fn request_disconnect(&self) -> Update {
         if matches!(self.composer, ComposerState::Sending { .. }) {
             Update {
-                feedback: Some("Wait for the reply to finish before disconnecting"),
+                feedback: Some("Wait for the message to finish sending before disconnecting"),
                 ..Default::default()
             }
         } else {
@@ -2328,7 +2364,7 @@ impl AppState {
         }
     }
 
-    fn send_reply(&mut self, confirmed_uncertain_resend: bool) -> Update {
+    fn send_message(&mut self, confirmed_uncertain_resend: bool) -> Update {
         if !self.pending_attachment_staging.is_empty() {
             return Update {
                 feedback: Some("Wait for attachments to finish loading"),
@@ -2474,14 +2510,15 @@ fn display_recipient(value: &Recipient) -> String {
             |name| format!("{name} <{}>", value.email),
         )
 }
-fn compatibility_draft(compose: ComposeDraft) -> ReplyDraft {
-    let message_id = match &compose.kind {
+fn compatibility_draft(compose: ComposeDraft) -> ComposeSession {
+    let source_message_id = match &compose.kind {
+        composer::ComposeKind::New => None,
         composer::ComposeKind::Reply { original }
         | composer::ComposeKind::ReplyAll { original }
-        | composer::ComposeKind::Forward { original } => original.clone(),
+        | composer::ComposeKind::Forward { original } => Some(original.clone()),
     };
-    ReplyDraft {
-        message_id,
+    ComposeSession {
+        source_message_id,
         recipient: compose
             .to
             .iter()
@@ -2490,7 +2527,7 @@ fn compatibility_draft(compose: ComposeDraft) -> ReplyDraft {
             .join(", "),
         subject: compose.subject.clone(),
         body: compose.text.clone(),
-        context: Default::default(),
+        context: None,
         compose,
     }
 }
@@ -2526,13 +2563,13 @@ fn map_send_failure(error: smtp::SmtpError) -> SendFailure {
 
 fn send_failure_feedback(failure: SendFailure) -> &'static str {
     match failure {
-        SendFailure::Empty => "Write a reply before sending",
-        SendFailure::TooLarge => "Reply is too large to send",
-        SendFailure::InvalidRecipient => "This message has no valid reply address",
+        SendFailure::Empty => "Write a message before sending",
+        SendFailure::TooLarge => "Message is too large to send",
+        SendFailure::InvalidRecipient => "This message has no valid recipients",
         SendFailure::AuthorizationRequired => "Refresh Gmail authorization before sending",
-        SendFailure::Rejected => "Gmail rejected the reply",
+        SendFailure::Rejected => "Gmail rejected the message",
         SendFailure::DeliveryUncertain => "Delivery is uncertain; check Sent before retrying",
-        SendFailure::Protocol => "Could not construct or send the reply",
+        SendFailure::Protocol => "Could not construct or send the message",
     }
 }
 

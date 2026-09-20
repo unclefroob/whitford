@@ -24,13 +24,13 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "clear-cache", |ui| {
         ui.dispatch(Action::RequestClearCache)
     });
-    add_disabled(ui, "compose");
+    add(ui, "compose", |ui| ui.dispatch(Action::BeginNewMessage));
     add(ui, "reply", |ui| ui.dispatch(Action::BeginReply));
     add(ui, "reply-all", |ui| ui.dispatch(Action::BeginReplyAll));
     add(ui, "forward", |ui| ui.dispatch(Action::BeginForward));
     add(ui, "resume-draft", |ui| ui.dispatch(Action::ResumeDraft));
-    add(ui, "send-reply", Ui::send_reply);
-    add(ui, "cancel-reply", Ui::request_close_composer);
+    add(ui, "send-message", Ui::send_message);
+    add(ui, "cancel-compose", Ui::request_close_composer);
     add(ui, "focus-search", |ui| {
         ui.search.grab_focus();
     });
@@ -62,6 +62,7 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
 
     for (action, accelerators) in [
         ("win.focus-search", &["<Primary>f"]),
+        ("win.compose", &["<Primary>n"]),
         ("win.folder-next", &["<Alt>Down"]),
         ("win.folder-previous", &["<Alt>Up"]),
         ("win.message-next", &["<Primary>Down"]),

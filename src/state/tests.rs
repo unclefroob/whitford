@@ -1001,7 +1001,7 @@ fn reply_requires_loaded_context_and_prevents_duplicate_send() {
     ready(&mut state);
     assert_eq!(
         state.dispatch(Action::BeginReply).feedback,
-        Some("Load the message before replying")
+        Some("Load the message before replying or forwarding")
     );
 
     load_replyable(&mut state);
@@ -1010,8 +1010,8 @@ fn reply_requires_loaded_context_and_prevents_duplicate_send() {
         state.snapshot().composer,
         ComposerState::Editing { .. }
     ));
-    state.dispatch(Action::UpdateReplyBody("Thanks".into()));
-    let send = state.dispatch(Action::SendReply);
+    state.dispatch(Action::UpdateMessageBody("Thanks".into()));
+    let send = state.dispatch(Action::SendMessage);
     let (request_id, generation) = match send.effects.as_slice() {
         [
             Effect::SendWorker(WorkerCommand::SendMessage {
@@ -1023,12 +1023,12 @@ fn reply_requires_loaded_context_and_prevents_duplicate_send() {
         ] if submission.draft.text == "Thanks" => (*request_id, *generation),
         other => panic!("unexpected send effect: {other:?}"),
     };
-    assert!(state.dispatch(Action::SendReply).effects.is_empty());
+    assert!(state.dispatch(Action::SendMessage).effects.is_empty());
     assert!(
         matches!(state.snapshot().composer, ComposerState::Sending { request_id: current, .. } if current == request_id)
     );
 
-    state.dispatch(Action::Worker(WorkerEvent::ReplyFailed {
+    state.dispatch(Action::Worker(WorkerEvent::MessageSendFailed {
         request_id,
         generation,
         failure: SendFailure::Rejected,
@@ -1043,7 +1043,7 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    let empty = state.dispatch(Action::SendReply);
+    let empty = state.dispatch(Action::SendMessage);
     assert!(empty.effects.is_empty());
     assert!(matches!(
         state.snapshot().composer,
@@ -1053,8 +1053,8 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
         }
     ));
 
-    state.dispatch(Action::UpdateReplyBody("Hello".into()));
-    let send = state.dispatch(Action::SendReply);
+    state.dispatch(Action::UpdateMessageBody("Hello".into()));
+    let send = state.dispatch(Action::SendMessage);
     let (request_id, generation) = match send.effects[0] {
         Effect::SendWorker(WorkerCommand::SendMessage {
             request_id,
@@ -1063,7 +1063,7 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
         }) => (request_id, generation),
         _ => panic!(),
     };
-    state.dispatch(Action::Worker(WorkerEvent::ReplySent {
+    state.dispatch(Action::Worker(WorkerEvent::MessageSent {
         request_id: SendRequestId(request_id.0 + 1),
         generation,
     }));
@@ -1072,7 +1072,7 @@ fn reply_rejects_empty_and_ignores_stale_completion_then_refreshes_on_success() 
         ComposerState::Sending { .. }
     ));
 
-    let complete = state.dispatch(Action::Worker(WorkerEvent::ReplySent {
+    let complete = state.dispatch(Action::Worker(WorkerEvent::MessageSent {
         request_id,
         generation,
     }));
@@ -1095,8 +1095,8 @@ fn uncertain_reply_requires_explicit_resend_confirmation() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    state.dispatch(Action::UpdateReplyBody("Hello".into()));
-    let send = state.dispatch(Action::SendReply);
+    state.dispatch(Action::UpdateMessageBody("Hello".into()));
+    let send = state.dispatch(Action::SendMessage);
     let (request_id, generation) = match send.effects[0] {
         Effect::SendWorker(WorkerCommand::SendMessage {
             request_id,
@@ -1105,14 +1105,14 @@ fn uncertain_reply_requires_explicit_resend_confirmation() {
         }) => (request_id, generation),
         _ => panic!(),
     };
-    state.dispatch(Action::Worker(WorkerEvent::ReplyFailed {
+    state.dispatch(Action::Worker(WorkerEvent::MessageSendFailed {
         request_id,
         generation,
         failure: SendFailure::DeliveryUncertain,
     }));
 
     assert!(matches!(
-        state.dispatch(Action::SendReply).effects.as_slice(),
+        state.dispatch(Action::SendMessage).effects.as_slice(),
         [Effect::PresentUncertainResendConfirmation]
     ));
     assert!(matches!(
@@ -1133,13 +1133,13 @@ fn disconnect_is_blocked_without_discarding_an_in_flight_reply() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    state.dispatch(Action::UpdateReplyBody("Keep this draft".into()));
-    state.dispatch(Action::SendReply);
+    state.dispatch(Action::UpdateMessageBody("Keep this draft".into()));
+    state.dispatch(Action::SendMessage);
 
     let request = state.dispatch(Action::RequestDisconnect);
     assert_eq!(
         request.feedback,
-        Some("Wait for the reply to finish before disconnecting")
+        Some("Wait for the message to finish sending before disconnecting")
     );
     assert!(request.effects.is_empty());
     let confirm = state.dispatch(Action::ConfirmDisconnect);
@@ -1181,11 +1181,98 @@ fn reply_all_and_forward_create_distinct_generic_drafts() {
 }
 
 #[test]
+fn standalone_compose_is_blank_unthreaded_and_does_not_need_an_open_message() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    finish_draft_restore(&mut state, Vec::new());
+    state.reader = ReaderState::Closed;
+
+    let update = state.dispatch(Action::BeginNewMessage);
+    assert!(matches!(
+        update.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::SaveDraft { .. })]
+    ));
+    let ComposerState::Editing { draft } = state.snapshot().composer else {
+        panic!("composer did not open")
+    };
+    assert_eq!(draft.compose.kind, crate::composer::ComposeKind::New);
+    assert!(draft.source_message_id.is_none());
+    assert!(draft.context.is_none());
+    assert!(draft.compose.to.is_empty());
+    assert!(draft.compose.subject.is_empty());
+    assert!(draft.compose.thread.is_none());
+    assert!(!state.snapshot().can_compose);
+}
+
+#[test]
+fn standalone_send_reuses_generic_smtp_submission_without_thread_headers() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    finish_draft_restore(&mut state, Vec::new());
+    state.dispatch(Action::BeginNewMessage);
+    state.dispatch(Action::UpdateRecipients {
+        to: vec![crate::composer::Recipient {
+            name: Some("Friend".into()),
+            email: "friend@example.com".into(),
+        }],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+    });
+    state.dispatch(Action::UpdateSubject("Hello".into()));
+    state.dispatch(Action::UpdateMessageBody("A standalone message".into()));
+
+    let sent = state.dispatch(Action::SendMessage);
+    let (request_id, generation, submission) = match sent.effects.into_iter().next().unwrap() {
+        Effect::SendWorker(WorkerCommand::SendMessage {
+            request_id,
+            generation,
+            submission,
+        }) => (request_id, generation, submission),
+        other => panic!("unexpected effect: {other:?}"),
+    };
+    assert_eq!(submission.draft.kind, crate::composer::ComposeKind::New);
+    assert!(submission.draft.thread.is_none());
+    assert_eq!(submission.draft.to[0].email, "friend@example.com");
+
+    let completed = state.dispatch(Action::Worker(WorkerEvent::MessageSent {
+        request_id,
+        generation,
+    }));
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+    assert!(
+        completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Refresh { .. })))
+    );
+}
+
+#[test]
+fn repeated_new_message_actions_create_isolated_drafts() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    finish_draft_restore(&mut state, Vec::new());
+    state.dispatch(Action::BeginNewMessage);
+    let first = match state.snapshot().composer {
+        ComposerState::Editing { draft } => draft.compose.id,
+        _ => panic!(),
+    };
+    state.dispatch(Action::CancelCompose);
+    state.dispatch(Action::BeginNewMessage);
+    let second = match state.snapshot().composer {
+        ComposerState::Editing { draft } => draft.compose.id,
+        _ => panic!(),
+    };
+    assert_ne!(first, second);
+    assert_eq!(state.saved_drafts.len(), 2);
+}
+
+#[test]
 fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    state.dispatch(Action::UpdateReplyBody("kept locally".into()));
+    state.dispatch(Action::UpdateMessageBody("kept locally".into()));
     let hidden = state.dispatch(Action::HideComposer);
     let (operation_id, draft_id, revision) = hidden
         .effects
@@ -1230,7 +1317,7 @@ fn staging_blocks_send_until_the_attachment_finishes_or_fails() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    state.dispatch(Action::UpdateReplyBody("with a file".into()));
+    state.dispatch(Action::UpdateMessageBody("with a file".into()));
     let stage = state.dispatch(Action::StageAttachment {
         source: "/tmp/report.pdf".into(),
         display_name: "report.pdf".into(),
@@ -1247,7 +1334,7 @@ fn staging_blocks_send_until_the_attachment_finishes_or_fails() {
         })
         .expect("stage operation");
     assert_eq!(state.snapshot().pending_attachment_staging, 1);
-    let blocked = state.dispatch(Action::SendReply);
+    let blocked = state.dispatch(Action::SendMessage);
     assert_eq!(
         blocked.feedback,
         Some("Wait for attachments to finish loading")
@@ -1265,7 +1352,7 @@ fn staging_blocks_send_until_the_attachment_finishes_or_fails() {
     }));
     assert_eq!(state.snapshot().pending_attachment_staging, 0);
     assert!(matches!(
-        state.dispatch(Action::SendReply).effects.as_slice(),
+        state.dispatch(Action::SendMessage).effects.as_slice(),
         [Effect::SendWorker(WorkerCommand::SendMessage { .. })]
     ));
 }
@@ -1275,7 +1362,7 @@ fn close_waits_for_acknowledged_save_and_failure_keeps_composer_visible() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
-    state.dispatch(Action::UpdateReplyBody("must survive".into()));
+    state.dispatch(Action::UpdateMessageBody("must survive".into()));
     let closing = state.dispatch(Action::HideComposerAndCloseApp);
     let operation_id = closing
         .effects

@@ -4,7 +4,7 @@ use crate::{
     config, drafts, gmail, message,
     model::{
         AccountIdentity, CacheUsage, MailboxSnapshot, MessageBody, MessageId, MessageLocator,
-        MessageMutation, ReconciledMessageState, ReplyContext, SyncMetadata,
+        MessageMutation, ReconciledMessageState, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -113,13 +113,6 @@ pub enum SendFailure {
     DeliveryUncertain,
     Protocol,
 }
-pub struct ReplySubmission {
-    pub account_email: String,
-    pub subject: String,
-    pub context: ReplyContext,
-    pub body: String,
-}
-
 /// A generic composer submission. It intentionally carries only private staged
 /// file references; attachment bytes are loaded on the blocking worker lane.
 pub struct ComposeSubmission {
@@ -193,11 +186,6 @@ pub enum WorkerCommand {
     ClearBodyCache {
         operation_id: CacheOperationId,
         generation: u64,
-    },
-    SendReply {
-        request_id: SendRequestId,
-        generation: u64,
-        submission: Box<ReplySubmission>,
     },
     SendMessage {
         request_id: SendRequestId,
@@ -290,16 +278,6 @@ impl fmt::Debug for WorkerCommand {
                 .debug_struct("ClearBodyCache")
                 .field("operation_id", operation_id)
                 .field("generation", generation)
-                .finish(),
-            Self::SendReply {
-                request_id,
-                generation,
-                ..
-            } => f
-                .debug_struct("SendReply")
-                .field("request_id", request_id)
-                .field("generation", generation)
-                .field("content", &"[REDACTED]")
                 .finish(),
             Self::SendMessage {
                 request_id,
@@ -425,11 +403,11 @@ pub enum WorkerEvent {
     CacheUsageChanged {
         usage: CacheUsage,
     },
-    ReplySent {
+    MessageSent {
         request_id: SendRequestId,
         generation: u64,
     },
-    ReplyFailed {
+    MessageSendFailed {
         request_id: SendRequestId,
         generation: u64,
         failure: SendFailure,
@@ -581,20 +559,20 @@ impl fmt::Debug for WorkerEvent {
                 .field("body_bytes", &usage.body_bytes)
                 .field("body_count", &usage.body_count)
                 .finish(),
-            Self::ReplySent {
+            Self::MessageSent {
                 request_id,
                 generation,
             } => f
-                .debug_struct("ReplySent")
+                .debug_struct("MessageSent")
                 .field("request_id", request_id)
                 .field("generation", generation)
                 .finish(),
-            Self::ReplyFailed {
+            Self::MessageSendFailed {
                 request_id,
                 generation,
                 failure,
             } => f
-                .debug_struct("ReplyFailed")
+                .debug_struct("MessageSendFailed")
                 .field("request_id", request_id)
                 .field("generation", generation)
                 .field("failure", failure)
@@ -965,7 +943,7 @@ async fn controller(
             if let Some(task) = send_task.take() {
                 if !task.is_finished() {
                     send_task = Some(task);
-                    let _ = events.send(WorkerEvent::ReplyFailed {
+                    let _ = events.send(WorkerEvent::MessageSendFailed {
                         request_id,
                         generation,
                         failure: SendFailure::Protocol,
@@ -999,95 +977,18 @@ async fn controller(
                             .await
                             .map_err(|_| smtp::SmtpError::Build)??;
                     let message = smtp::build_message(&submission)?;
-                    smtp::send_reply(&email, token.as_str(), message).await
+                    smtp::send_message(&email, token.as_str(), message).await
                 })
                 .await;
                 if gate.load(Ordering::Acquire) != generation {
                     return;
                 }
                 let event = match result {
-                    Ok(()) => WorkerEvent::ReplySent {
+                    Ok(()) => WorkerEvent::MessageSent {
                         request_id,
                         generation,
                     },
-                    Err(error) => WorkerEvent::ReplyFailed {
-                        request_id,
-                        generation,
-                        failure: map_send_failure(error),
-                    },
-                };
-                let _ = tx.send(event);
-            }));
-            continue;
-        }
-        if matches!(&command, WorkerCommand::SendReply { .. }) {
-            let WorkerCommand::SendReply {
-                request_id,
-                generation,
-                submission,
-            } = command
-            else {
-                unreachable!();
-            };
-            if let Some(task) = send_task.take() {
-                if !task.is_finished() {
-                    send_task = Some(task);
-                    let _ = events.send(WorkerEvent::ReplyFailed {
-                        request_id,
-                        generation,
-                        failure: SendFailure::Protocol,
-                    });
-                    continue;
-                }
-                let _ = task.await;
-            }
-            send_generation.store(generation, Ordering::Release);
-            let credentials = auth
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-                .filter(|value| value.email.eq_ignore_ascii_case(&submission.account_email))
-                .map(|value| {
-                    (
-                        value.email.clone(),
-                        Zeroizing::new(value.access_token.as_str().to_owned()),
-                    )
-                });
-            let tx = events.clone();
-            let ReplySubmission {
-                account_email: _,
-                subject,
-                context,
-                body,
-            } = *submission;
-            let gate = send_generation.clone();
-            send_task = Some(tokio::spawn(async move {
-                let result = guard_smtp_send(async move {
-                    if let Some((email, token)) = credentials {
-                        match smtp::build_reply(
-                            &email,
-                            &subject,
-                            &context,
-                            smtp::ReplyKind::Reply,
-                            &body,
-                        ) {
-                            Ok(message) => smtp::send_reply(&email, token.as_str(), message).await,
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        Err(smtp::SmtpError::Authentication)
-                    }
-                })
-                .await;
-                if gate.load(Ordering::Acquire) != generation {
-                    return;
-                }
-                let event = match result {
-                    Ok(()) => WorkerEvent::ReplySent {
-                        request_id,
-                        generation,
-                    },
-                    Err(error) => WorkerEvent::ReplyFailed {
+                    Err(error) => WorkerEvent::MessageSendFailed {
                         request_id,
                         generation,
                         failure: map_send_failure(error),
@@ -1350,7 +1251,6 @@ async fn controller(
             | WorkerCommand::SetCacheLimit { .. }
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::ClearBodyCache { .. }
-            | WorkerCommand::SendReply { .. }
             | WorkerCommand::SendMessage { .. }
             | WorkerCommand::LoadDrafts { .. }
             | WorkerCommand::SaveDraft { .. }
@@ -1939,7 +1839,6 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         WorkerCommand::SetCacheLimit { .. }
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::ClearBodyCache { .. }
-        | WorkerCommand::SendReply { .. }
         | WorkerCommand::SendMessage { .. }
         | WorkerCommand::LoadDrafts { .. }
         | WorkerCommand::SaveDraft { .. }
@@ -2547,19 +2446,19 @@ mod tests {
             },
         };
         assert!(!format!("{body_command:?}").contains("canary@example.com"));
-        let send_command = WorkerCommand::SendReply {
+        let draft = crate::composer::new_message(
+            "draft-canary".into(),
+            "canary@example.com",
+            "<b>secret body</b>",
+        )
+        .unwrap();
+        let send_command = WorkerCommand::SendMessage {
             request_id: SendRequestId(5),
             generation: 1,
-            submission: Box::new(ReplySubmission {
-                account_email: "canary@example.com".into(),
-                subject: "secret subject".into(),
-                context: ReplyContext::default(),
-                body: "secret body".into(),
-            }),
+            submission: Box::new(ComposeSubmission { draft }),
         };
         let debug = format!("{send_command:?}");
         assert!(!debug.contains("canary@example.com"));
-        assert!(!debug.contains("secret subject"));
         assert!(!debug.contains("secret body"));
         let event = WorkerEvent::Failed {
             id: OperationId(3),

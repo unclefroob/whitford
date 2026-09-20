@@ -276,7 +276,7 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
     expand.update_property(&[gtk::accessible::Property::Label("Expand composer")]);
     let refresh = gtk::Button::with_label("Refresh Gmail");
     let progress = gtk::Spinner::builder().visible(false).build();
-    progress.update_property(&[gtk::accessible::Property::Label("Sending reply")]);
+    progress.update_property(&[gtk::accessible::Property::Label("Sending message")]);
     let draft_status = gtk::Label::builder()
         .xalign(0.0)
         .hexpand(true)
@@ -349,7 +349,7 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
         .propagate_natural_width(true)
         .build();
     let composer = adw::Window::builder()
-        .title("Reply — Whitford")
+        .title("Compose — Whitford")
         .default_width(560)
         .default_height(520)
         .modal(false)
@@ -409,7 +409,7 @@ pub(super) fn connect_signals(ui: &Ui) {
         let weak_ui = ui.downgrade();
         move |_| {
             if let Some(ui) = weak_ui.upgrade() {
-                ui.send_reply();
+                ui.send_message();
             }
         }
     });
@@ -646,7 +646,7 @@ pub(super) fn connect_signals(ui: &Ui) {
             } else if key == gtk::gdk::Key::Return
                 && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
             {
-                ui.send_reply();
+                ui.send_message();
                 gtk::glib::Propagation::Stop
             } else {
                 gtk::glib::Propagation::Proceed
@@ -889,6 +889,18 @@ fn build_folder_pane(
     sync.append(&sync_title);
     sync.append(&sync_detail);
     pane.append(&account);
+    pane.append(
+        &gtk::Button::builder()
+            .label("Compose")
+            .icon_name("mail-message-new-symbolic")
+            .action_name("win.compose")
+            .tooltip_text("Write a new message (Ctrl+N)")
+            .margin_start(16)
+            .margin_end(16)
+            .margin_bottom(12)
+            .css_classes(["suggested-action", "whitford-compose"])
+            .build(),
+    );
     pane.append(&connect);
     pane.append(&account_actions);
     pane.append(&recovery_actions);

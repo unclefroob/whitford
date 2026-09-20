@@ -251,7 +251,7 @@ pub fn validate_reply(
 /// Network failures are deliberately reported as uncertain: SMTP may have
 /// accepted DATA before the connection was lost, so callers must not retry
 /// automatically.
-pub async fn send_reply(
+pub async fn send_message(
     account_email: &str,
     access_token: &str,
     message: Message,

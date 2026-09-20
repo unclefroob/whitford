@@ -41,6 +41,7 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "reopen-authorization", snapshot.can_reopen);
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
+    set_action_enabled(ui, "compose", snapshot.can_compose);
     for action in ["archive", "mark-read", "delete", "star", "toggle-label"] {
         set_action_enabled(ui, action, snapshot.can_mutate);
     }
@@ -271,8 +272,10 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
         ui.composer_draft_status.remove_css_class("error");
     }
     if sending && !was_sending {
-        ui.composer_window
-            .announce("Sending reply", gtk::AccessibleAnnouncementPriority::Medium);
+        ui.composer_window.announce(
+            "Sending message",
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
     }
     ui.composer_refresh
         .set_visible(matches!(failure, Some(SendFailure::AuthorizationRequired)));
@@ -319,15 +322,15 @@ fn reply_subject_label(subject: &str) -> String {
 
 fn send_failure_text(failure: SendFailure) -> &'static str {
     match failure {
-        SendFailure::Empty => "Write a reply before sending.",
-        SendFailure::TooLarge => "This reply is too large to send.",
-        SendFailure::InvalidRecipient => "The reply address is invalid.",
+        SendFailure::Empty => "Write a message before sending.",
+        SendFailure::TooLarge => "This message is too large to send.",
+        SendFailure::InvalidRecipient => "Check the recipient addresses.",
         SendFailure::AuthorizationRequired => "Refresh Gmail authorization, then try again.",
-        SendFailure::Rejected => "Gmail rejected this reply. Your draft has been kept.",
+        SendFailure::Rejected => "Gmail rejected this message. Your draft has been kept.",
         SendFailure::DeliveryUncertain => {
             "Delivery may have succeeded. Check Sent before trying again."
         }
-        SendFailure::Protocol => "Whitford could not send this reply. Your draft has been kept.",
+        SendFailure::Protocol => "Whitford could not send this message. Your draft has been kept.",
     }
 }
 
