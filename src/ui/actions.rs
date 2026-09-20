@@ -18,6 +18,9 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     });
     add(ui, "retry", |ui| ui.dispatch(Action::Retry));
     add(ui, "retry-body", |ui| ui.dispatch(Action::RetryBody));
+    add(ui, "retry-drafts", |ui| {
+        ui.dispatch(Action::RetryDraftRestore)
+    });
     add(ui, "clear-cache", |ui| {
         ui.dispatch(Action::RequestClearCache)
     });

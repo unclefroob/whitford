@@ -96,6 +96,25 @@ pub fn delete(account_email: &str, draft_id: &str) -> io::Result<()> {
     }
 }
 
+/// Removes every local draft artifact for one account, including staged
+/// attachments and the account signature. Missing account data is already
+/// clean and therefore succeeds.
+pub fn purge_account(account_email: &str) -> io::Result<()> {
+    purge_account_at(&drafts_root()?, account_email)
+}
+
+fn purge_account_at(root: &Path, account_email: &str) -> io::Result<()> {
+    if account_email.trim().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty account"));
+    }
+    let account = account_root(root, account_email);
+    match fs::remove_dir_all(account) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn staged_path(account_email: &str, draft_id: &str, staged_file: &str) -> io::Result<PathBuf> {
     validate_id(draft_id)?;
     validate_leaf(staged_file)?;
@@ -145,12 +164,6 @@ fn save_at(root: &Path, account_email: &str, draft: &ComposeDraft) -> io::Result
         ));
     }
     atomic_write(&directory.join("draft.json"), &bytes)?;
-    for entry in fs::read_dir(&account)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && entry.file_name() != std::ffi::OsStr::new(&draft.id) {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
     Ok(())
 }
 
@@ -496,6 +509,69 @@ mod tests {
                 & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saves_multiple_drafts_without_deleting_siblings() {
+        let root = temp_root();
+        let first = draft();
+        let mut second = draft();
+        second.id = "draft-2".into();
+        second.subject = "Another message".into();
+
+        save_at(&root, "me@example.com", &first).unwrap();
+        save_at(&root, "me@example.com", &second).unwrap();
+
+        let loaded = load_all_at(&root, "me@example.com").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|value| value.id == first.id));
+        assert!(loaded.iter().any(|value| value.id == second.id));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_purge_removes_drafts_staged_files_and_signature_only_for_that_account() {
+        let root = temp_root();
+        let first = draft();
+        save_at(&root, "me@example.com", &first).unwrap();
+        save_signature_at(
+            &root,
+            "me@example.com",
+            &SignaturePreference {
+                html: "<b>Private</b>".into(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, b"secret attachment").unwrap();
+        stage_file_at(
+            &root,
+            "me@example.com",
+            &first.id,
+            &source,
+            "secret.txt",
+            "text/plain",
+        )
+        .unwrap();
+
+        let mut other = draft();
+        other.account_email = "other@example.com".into();
+        save_at(&root, "other@example.com", &other).unwrap();
+
+        purge_account_at(&root, "me@example.com").unwrap();
+
+        assert!(load_all_at(&root, "me@example.com").unwrap().is_empty());
+        assert_eq!(
+            load_signature_at(&root, "me@example.com").unwrap(),
+            SignaturePreference::default()
+        );
+        assert_eq!(
+            load_all_at(&root, "other@example.com").unwrap(),
+            vec![other]
+        );
+        purge_account_at(&root, "me@example.com").unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

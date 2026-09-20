@@ -331,7 +331,7 @@ impl Ui {
                 });
             }
             Effect::PresentDisconnectConfirmation => {
-                let dialog = adw::AlertDialog::builder().heading("Disconnect Gmail?").body("This removes Whitford’s saved authorization from Secret Service and deletes its local mail cache. Revoke Google access separately in your Google Account.").build();
+                let dialog = adw::AlertDialog::builder().heading("Disconnect Gmail?").body("This removes this account’s local drafts, staged attachments, signature settings, downloaded mail cache, and saved authorization from Secret Service. Revoke Google access separately in your Google Account.").build();
                 dialog.add_response("cancel", "Cancel");
                 dialog.add_response("disconnect", "Disconnect");
                 dialog.set_response_appearance("disconnect", adw::ResponseAppearance::Destructive);

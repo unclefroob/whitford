@@ -11,7 +11,8 @@ use super::{
 use crate::{
     config,
     state::{
-        Action, ComposerState, MessageFilter, ReaderState, SessionState, ViewSnapshot, ViewStatus,
+        Action, ComposerState, DraftCatalogState, MessageFilter, ReaderState, SessionState,
+        ViewSnapshot, ViewStatus,
     },
     worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
@@ -40,6 +41,11 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     set_action_enabled(ui, "reopen-authorization", snapshot.can_reopen);
     set_action_enabled(ui, "cancel-authorization", snapshot.can_cancel);
     set_action_enabled(ui, "retry", snapshot.can_retry);
+    set_action_enabled(
+        ui,
+        "retry-drafts",
+        snapshot.draft_catalog_state == DraftCatalogState::Failed,
+    );
     let can_reply = matches!(snapshot.session, SessionState::Ready)
         && matches!(&snapshot.reader, ReaderState::Loaded { body, .. } if !(if body.reply_context.reply_to.is_empty() { &body.reply_context.from } else { &body.reply_context.reply_to }).is_empty())
         && matches!(snapshot.composer, ComposerState::Closed);
@@ -723,16 +729,10 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
                 )),
             ));
         }
-        SessionState::ServiceError { failure }
-            if failure.kind == FailureKind::DisconnectFailed
-                && snapshot.sync_metadata.is_some() =>
-        {
+        SessionState::ServiceError { failure } if failure.kind == FailureKind::DisconnectFailed => {
             banners.push((
-                "Disconnect incomplete — showing retained mail".to_owned(),
-                format!(
-                    "Last successful sync: {}. Retry secure cleanup; revoke access in Google Account connections if it keeps failing.",
-                    last_sync(snapshot)
-                ),
+                "Disconnect cleanup incomplete".to_owned(),
+                "Local mail remains hidden. Retry removing Whitford’s local account data and saved authorization; revoke access in Google Account connections if it keeps failing.".to_owned(),
                 failure.retryable.then_some((
                     "Retry cleanup",
                     "win.retry",
@@ -741,6 +741,17 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
             ));
         }
         _ => {}
+    }
+    if snapshot.draft_catalog_state == DraftCatalogState::Failed {
+        banners.push((
+            "Local drafts could not be restored".to_owned(),
+            "Whitford has not changed them. Retry recovery before composing.".to_owned(),
+            Some((
+                "Retry",
+                "win.retry-drafts",
+                "Retry restoring local drafts and signature",
+            )),
+        ));
     }
     if let Some(detail) = partial_sync_detail(snapshot) {
         banners.push((
@@ -832,7 +843,7 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
         }
         SessionState::Disconnecting => (
             "Disconnecting…".into(),
-            "Removing the saved authorization securely.".into(),
+            "Removing local drafts, staged attachments, signature settings, cached mail, and then saved authorization.".into(),
             false,
         ),
         SessionState::ConfigurationError { failure } => {
@@ -840,8 +851,8 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
             (failure_title, failure_detail, false)
         }
         SessionState::ServiceError { failure } if failure.kind == crate::worker::FailureKind::DisconnectFailed => (
-            "Saved authorization was not removed".into(),
-            "Retry secure cleanup. Your mail remains loaded; revoke Whitford separately in Google Account connections if needed.".into(),
+            "Disconnect cleanup was incomplete".into(),
+            "Your mail is hidden. Retry secure cleanup; revoke Whitford separately in Google Account connections if needed.".into(),
             false,
         ),
         SessionState::ServiceError { failure } => {
@@ -969,8 +980,8 @@ fn failure_presentation(failure: &ServiceFailure) -> (String, String) {
             "Whitford removed any partial saved authorization. Unlock Secret Service and retry the connection; no plaintext fallback is used.",
         ),
         FailureKind::DisconnectFailed => (
-            "Saved authorization was not removed",
-            "Retry secure cleanup. Mail remains stale and visible; revoke Whitford in Google Account connections if cleanup keeps failing.",
+            "Disconnect cleanup was incomplete",
+            "Retry removing local account data and saved authorization. Mail remains hidden; revoke Whitford in Google Account connections if cleanup keeps failing.",
         ),
         FailureKind::TlsFailed => (
             "Secure Gmail connection failed",

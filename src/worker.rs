@@ -172,6 +172,8 @@ pub enum WorkerCommand {
     Disconnect {
         id: OperationId,
         generation: u64,
+        draft_generation: u64,
+        account_email: String,
     },
     Cancel {
         id: OperationId,
@@ -201,19 +203,23 @@ pub enum WorkerCommand {
     },
     LoadDrafts {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     SaveDraft {
         operation_id: DraftOperationId,
+        generation: u64,
         draft: Box<ComposeDraft>,
     },
     DeleteDraft {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
     },
     StageAttachment {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         source: std::path::PathBuf,
@@ -223,16 +229,19 @@ pub enum WorkerCommand {
     },
     RemoveStaged {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         staged_file: String,
     },
     LoadSignature {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     SaveSignature {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         preference: drafts::SignaturePreference,
     },
@@ -244,7 +253,7 @@ impl fmt::Debug for WorkerCommand {
             Self::Restore { id } => f.debug_tuple("Restore").field(id).finish(),
             Self::Connect { id } => f.debug_tuple("Connect").field(id).finish(),
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
-            Self::Disconnect { id, generation } => f
+            Self::Disconnect { id, generation, .. } => f
                 .debug_struct("Disconnect")
                 .field("id", id)
                 .field("generation", generation)
@@ -396,22 +405,26 @@ pub enum WorkerEvent {
     },
     DraftsLoaded {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         drafts: Vec<ComposeDraft>,
     },
     DraftSaved {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         revision: u64,
     },
     DraftDeleted {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
     },
     AttachmentStaged {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         attachment: DraftAttachment,
@@ -419,19 +432,23 @@ pub enum WorkerEvent {
     },
     StagedRemoved {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     SignatureLoaded {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         preference: drafts::SignaturePreference,
     },
     SignatureSaved {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     DraftOperationFailed {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
 }
@@ -708,29 +725,36 @@ async fn controller(
             let operation = match command {
                 WorkerCommand::LoadDrafts {
                     operation_id,
+                    generation,
                     account_email,
                 } => DraftIo::Load {
                     operation_id,
+                    generation,
                     account_email,
                 },
                 WorkerCommand::SaveDraft {
                     operation_id,
+                    generation,
                     draft,
                 } => DraftIo::Save {
                     operation_id,
+                    generation,
                     draft,
                 },
                 WorkerCommand::DeleteDraft {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                 } => DraftIo::Delete {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                 },
                 WorkerCommand::StageAttachment {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                     source,
@@ -739,6 +763,7 @@ async fn controller(
                     inline,
                 } => DraftIo::Stage {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                     source,
@@ -748,34 +773,50 @@ async fn controller(
                 },
                 WorkerCommand::RemoveStaged {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                     staged_file,
                 } => DraftIo::RemoveStaged {
                     operation_id,
+                    generation,
                     account_email,
                     draft_id,
                     staged_file,
                 },
                 WorkerCommand::LoadSignature {
                     operation_id,
+                    generation,
                     account_email,
                 } => DraftIo::LoadSignature {
                     operation_id,
+                    generation,
                     account_email,
                 },
                 WorkerCommand::SaveSignature {
                     operation_id,
+                    generation,
                     account_email,
                     preference,
                 } => DraftIo::SaveSignature {
                     operation_id,
+                    generation,
                     account_email,
                     preference,
                 },
                 _ => unreachable!(),
             };
             if let Err(error) = draft_tx.send(operation) {
+                let generation = match &error.0 {
+                    DraftIo::Load { generation, .. }
+                    | DraftIo::Save { generation, .. }
+                    | DraftIo::Delete { generation, .. }
+                    | DraftIo::Stage { generation, .. }
+                    | DraftIo::RemoveStaged { generation, .. }
+                    | DraftIo::LoadSignature { generation, .. }
+                    | DraftIo::SaveSignature { generation, .. }
+                    | DraftIo::PurgeAccount { generation, .. } => *generation,
+                };
                 let account_email = match &error.0 {
                     DraftIo::Load { account_email, .. }
                     | DraftIo::Delete { account_email, .. }
@@ -784,6 +825,7 @@ async fn controller(
                     | DraftIo::LoadSignature { account_email, .. }
                     | DraftIo::SaveSignature { account_email, .. } => account_email.clone(),
                     DraftIo::Save { draft, .. } => draft.account_email.clone(),
+                    DraftIo::PurgeAccount { account_email, .. } => account_email.clone(),
                 };
                 let operation_id = match error.0 {
                     DraftIo::Load { operation_id, .. }
@@ -793,9 +835,11 @@ async fn controller(
                     | DraftIo::RemoveStaged { operation_id, .. }
                     | DraftIo::LoadSignature { operation_id, .. }
                     | DraftIo::SaveSignature { operation_id, .. } => operation_id,
+                    DraftIo::PurgeAccount { .. } => DraftOperationId(0),
                 };
                 let _ = events.send(WorkerEvent::DraftOperationFailed {
                     operation_id,
+                    generation,
                     account_email,
                 });
             }
@@ -1052,15 +1096,24 @@ async fn controller(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
         }
+        let disconnecting = matches!(command, WorkerCommand::Disconnect { .. });
         let cleanup_failed = if let Some(current) = active.take() {
             let Active { task, cleanup, .. } = current;
-            abort_with_cleanup(task, &cleanup, async {
-                matches!(
-                    timeout(KEYRING_TIMEOUT, secrets::delete()).await,
-                    Ok(Ok(()))
-                )
-            })
-            .await
+            if disconnecting {
+                // Disconnect owns credential deletion and must perform it only
+                // after every local account artifact has been purged.
+                task.abort();
+                let _ = task.await;
+                false
+            } else {
+                abort_with_cleanup(task, &cleanup, async {
+                    matches!(
+                        timeout(KEYRING_TIMEOUT, secrets::delete()).await,
+                        Ok(Ok(()))
+                    )
+                })
+                .await
+            }
         } else {
             false
         };
@@ -1083,23 +1136,47 @@ async fn controller(
         let id = command_id(&command).unwrap_or(OperationId(0));
         let cleanup = Arc::new(AtomicBool::new(false));
         let task = match command {
-            WorkerCommand::Disconnect { id, .. } => {
+            WorkerCommand::Disconnect {
+                id,
+                draft_generation,
+                account_email,
+                ..
+            } => {
                 let tx = events.clone();
                 let cache_io = cache_io.clone();
+                let draft_tx = draft_tx.clone();
                 tokio::spawn(async move {
                     emit_phase(&tx, id, WorkerPhase::Disconnecting);
-                    match timeout(KEYRING_TIMEOUT, secrets::delete()).await {
-                        Ok(Ok(())) => {
-                            if matches!(
-                                cache_blocking(cache_io, cache::clear_mailbox).await,
-                                Ok(Ok(()))
-                            ) {
-                                let _ = tx.send(WorkerEvent::Disconnected { id });
-                            } else {
-                                fail_cleanup(&tx, id, true);
-                            }
+                    let local_cleanup = async {
+                        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                        if draft_tx
+                            .send(DraftIo::PurgeAccount {
+                                generation: draft_generation,
+                                account_email,
+                                result: result_tx,
+                            })
+                            .is_err()
+                        {
+                            return false;
                         }
-                        Ok(Err(_)) | Err(_) => fail_cleanup(&tx, id, true),
+                        if !matches!(timeout(KEYRING_TIMEOUT, result_rx).await, Ok(Ok(Ok(())))) {
+                            return false;
+                        }
+                        matches!(
+                            cache_blocking(cache_io, cache::clear_all_mail).await,
+                            Ok(Ok(()))
+                        )
+                    };
+                    let token_cleanup = async {
+                        matches!(
+                            timeout(KEYRING_TIMEOUT, secrets::delete()).await,
+                            Ok(Ok(()))
+                        )
+                    };
+                    if cleanup_token_last(local_cleanup, token_cleanup).await {
+                        let _ = tx.send(WorkerEvent::Disconnected { id });
+                    } else {
+                        fail_cleanup(&tx, id, false);
                     }
                 })
             }
@@ -1173,19 +1250,23 @@ async fn controller(
 enum DraftIo {
     Load {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     Save {
         operation_id: DraftOperationId,
+        generation: u64,
         draft: Box<ComposeDraft>,
     },
     Delete {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
     },
     Stage {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         source: std::path::PathBuf,
@@ -1195,18 +1276,26 @@ enum DraftIo {
     },
     RemoveStaged {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         draft_id: String,
         staged_file: String,
     },
     LoadSignature {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
     },
     SaveSignature {
         operation_id: DraftOperationId,
+        generation: u64,
         account_email: String,
         preference: drafts::SignaturePreference,
+    },
+    PurgeAccount {
+        generation: u64,
+        account_email: String,
+        result: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
 }
 
@@ -1236,9 +1325,26 @@ async fn draft_io_actor(
                 &mut batch[index],
                 DraftIo::Load {
                     operation_id: DraftOperationId(0),
+                    generation: 0,
                     account_email: String::new(),
                 },
             );
+            if let DraftIo::PurgeAccount {
+                account_email,
+                result,
+                ..
+            } = operation
+            {
+                let outcome = if account_email.is_empty() {
+                    Ok(())
+                } else {
+                    tokio::task::spawn_blocking(move || drafts::purge_account(&account_email))
+                        .await
+                        .unwrap_or_else(|_| Err(std::io::Error::other("draft purge task failed")))
+                };
+                let _ = result.send(outcome);
+                continue;
+            }
             handle_draft_io(operation, &events).await;
         }
     }
@@ -1253,6 +1359,7 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
         | DraftIo::RemoveStaged { operation_id, .. }
         | DraftIo::LoadSignature { operation_id, .. }
         | DraftIo::SaveSignature { operation_id, .. } => *operation_id,
+        DraftIo::PurgeAccount { .. } => unreachable!(),
     };
     let account_email = match &operation {
         DraftIo::Load { account_email, .. }
@@ -1262,11 +1369,23 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
         | DraftIo::LoadSignature { account_email, .. }
         | DraftIo::SaveSignature { account_email, .. } => account_email.clone(),
         DraftIo::Save { draft, .. } => draft.account_email.clone(),
+        DraftIo::PurgeAccount { .. } => unreachable!(),
+    };
+    let generation = match &operation {
+        DraftIo::Load { generation, .. }
+        | DraftIo::Save { generation, .. }
+        | DraftIo::Delete { generation, .. }
+        | DraftIo::Stage { generation, .. }
+        | DraftIo::RemoveStaged { generation, .. }
+        | DraftIo::LoadSignature { generation, .. }
+        | DraftIo::SaveSignature { generation, .. } => *generation,
+        DraftIo::PurgeAccount { .. } => unreachable!(),
     };
     let failure_account = account_email.clone();
     let result = tokio::task::spawn_blocking(move || match operation {
         DraftIo::Load {
             operation_id,
+            generation,
             account_email,
         } => drafts::load_all(&account_email).map(|mut drafts| {
             for draft in &mut drafts {
@@ -1275,12 +1394,14 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
             }
             WorkerEvent::DraftsLoaded {
                 operation_id,
+                generation,
                 account_email,
                 drafts,
             }
         }),
         DraftIo::Save {
             operation_id,
+            generation,
             mut draft,
         } => {
             draft.html = crate::composer::sanitize_html(&draft.html);
@@ -1288,6 +1409,7 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
             drafts::save(&draft.account_email, &draft)?;
             Ok(WorkerEvent::DraftSaved {
                 operation_id,
+                generation,
                 account_email: draft.account_email.clone(),
                 draft_id: draft.id.clone(),
                 revision: draft.dirty_revision,
@@ -1295,18 +1417,21 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
         }
         DraftIo::Delete {
             operation_id,
+            generation,
             account_email,
             draft_id,
         } => {
             drafts::delete(&account_email, &draft_id)?;
             Ok(WorkerEvent::DraftDeleted {
                 operation_id,
+                generation,
                 account_email,
                 draft_id,
             })
         }
         DraftIo::Stage {
             operation_id,
+            generation,
             account_email,
             draft_id,
             source,
@@ -1323,6 +1448,7 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
             )?;
             Ok(WorkerEvent::AttachmentStaged {
                 operation_id,
+                generation,
                 account_email,
                 draft_id,
                 attachment,
@@ -1331,6 +1457,7 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
         }
         DraftIo::RemoveStaged {
             operation_id,
+            generation,
             account_email,
             draft_id,
             staged_file,
@@ -1338,30 +1465,36 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
             drafts::remove_staged(&account_email, &draft_id, &staged_file)?;
             Ok(WorkerEvent::StagedRemoved {
                 operation_id,
+                generation,
                 account_email,
             })
         }
         DraftIo::LoadSignature {
             operation_id,
+            generation,
             account_email,
         } => {
             drafts::load_signature(&account_email).map(|preference| WorkerEvent::SignatureLoaded {
                 operation_id,
+                generation,
                 account_email,
                 preference,
             })
         }
         DraftIo::SaveSignature {
             operation_id,
+            generation,
             account_email,
             preference,
         } => {
             drafts::save_signature(&account_email, &preference)?;
             Ok(WorkerEvent::SignatureSaved {
                 operation_id,
+                generation,
                 account_email,
             })
         }
+        DraftIo::PurgeAccount { .. } => unreachable!(),
     })
     .await;
     match result {
@@ -1371,6 +1504,7 @@ async fn handle_draft_io(operation: DraftIo, events: &mpsc::UnboundedSender<Work
         _ => {
             let _ = events.send(WorkerEvent::DraftOperationFailed {
                 operation_id,
+                generation,
                 account_email: failure_account,
             });
         }
@@ -1505,6 +1639,17 @@ async fn abort_with_cleanup<F: Future<Output = bool>>(
         cleanup_required.store(false, Ordering::Release);
     }
     !cleaned
+}
+
+async fn cleanup_token_last<Local, Token>(local_cleanup: Local, token_cleanup: Token) -> bool
+where
+    Local: Future<Output = bool>,
+    Token: Future<Output = bool>,
+{
+    if !local_cleanup.await {
+        return false;
+    }
+    token_cleanup.await
 }
 
 async fn save_with_cleanup<Save, SaveFuture, Cleanup, CleanupFuture>(
@@ -2444,6 +2589,50 @@ mod tests {
             let task = tokio::spawn(std::future::pending::<()>());
             assert!(abort_with_cleanup(task, &persisted, async { false }).await);
             assert!(persisted.load(Ordering::Acquire));
+        });
+    }
+    #[test]
+    fn disconnect_cleanup_deletes_token_only_after_local_data() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let local_calls = calls.clone();
+            let token_calls = calls.clone();
+            assert!(
+                cleanup_token_last(
+                    async move {
+                        local_calls.lock().unwrap().push("local");
+                        true
+                    },
+                    async move {
+                        token_calls.lock().unwrap().push("token");
+                        true
+                    },
+                )
+                .await
+            );
+            assert_eq!(*calls.lock().unwrap(), ["local", "token"]);
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let local_calls = calls.clone();
+            let token_calls = calls.clone();
+            assert!(
+                !cleanup_token_last(
+                    async move {
+                        local_calls.lock().unwrap().push("local");
+                        false
+                    },
+                    async move {
+                        token_calls.lock().unwrap().push("token");
+                        true
+                    },
+                )
+                .await
+            );
+            assert_eq!(*calls.lock().unwrap(), ["local"]);
         });
     }
     #[test]

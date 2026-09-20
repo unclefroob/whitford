@@ -52,6 +52,7 @@ fn reply_body() -> Arc<crate::model::MessageBody> {
 
 fn load_replyable(state: &mut AppState) {
     ready(state);
+    finish_draft_restore(state, Vec::new());
     let id = MessageId::gmail(1, 1);
     let update = state.dispatch(Action::SelectMessage(id.clone()));
     let (request_id, generation) = match update.effects[0] {
@@ -70,6 +71,156 @@ fn load_replyable(state: &mut AppState) {
         usage: Default::default(),
         saved: true,
     }));
+}
+
+fn finish_draft_restore(state: &mut AppState, drafts: Vec<crate::composer::ComposeDraft>) {
+    let operation_id = state.pending_draft_load.expect("draft restore operation");
+    let signature_operation_id = state
+        .pending_signature_load
+        .expect("signature restore operation");
+    let generation = state.draft_generation;
+    state.dispatch(Action::Worker(WorkerEvent::DraftsLoaded {
+        operation_id,
+        generation,
+        account_email: "person@example.com".into(),
+        drafts,
+    }));
+    state.dispatch(Action::Worker(WorkerEvent::SignatureLoaded {
+        operation_id: signature_operation_id,
+        generation,
+        account_email: "person@example.com".into(),
+        preference: crate::drafts::SignaturePreference::default(),
+    }));
+}
+
+#[test]
+fn composing_waits_for_draft_restore_then_runs_the_queued_intent() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let id = MessageId::gmail(1, 1);
+    let update = state.dispatch(Action::SelectMessage(id.clone()));
+    let (request_id, generation) = match update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id,
+        generation,
+        message_id: id,
+        body: reply_body(),
+        usage: Default::default(),
+        saved: true,
+    }));
+
+    let queued = state.dispatch(Action::BeginReply);
+    assert_eq!(
+        queued.feedback,
+        Some("Restoring local drafts before composing")
+    );
+    assert!(queued.effects.is_empty());
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+
+    finish_draft_restore(&mut state, Vec::new());
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { .. }
+    ));
+}
+
+#[test]
+fn draft_restore_failure_blocks_writes_and_can_be_retried() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let operation_id = state.pending_draft_load.expect("draft restore operation");
+    let generation = state.draft_generation;
+    let failed = state.dispatch(Action::Worker(WorkerEvent::DraftOperationFailed {
+        operation_id,
+        generation,
+        account_email: "person@example.com".into(),
+    }));
+    assert_eq!(failed.feedback, Some("Could not restore local drafts"));
+
+    let retry = state.dispatch(Action::RetryDraftRestore);
+    assert!(retry.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendWorker(WorkerCommand::LoadDrafts { generation: current, .. })
+            if *current == generation.wrapping_add(1)
+    )));
+    let stale = crate::composer::new_forward(
+        "stale-draft".into(),
+        "person@example.com",
+        MessageId::gmail(1, 1),
+        "Stale",
+        &Default::default(),
+        "<p>stale</p>",
+        "",
+    )
+    .unwrap();
+    state.dispatch(Action::Worker(WorkerEvent::DraftsLoaded {
+        operation_id,
+        generation,
+        account_email: "person@example.com".into(),
+        drafts: vec![stale],
+    }));
+    assert!(state.saved_drafts.is_empty());
+}
+
+#[test]
+fn restored_drafts_resume_only_the_exact_message_and_compose_kind() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let id = MessageId::gmail(1, 1);
+    let update = state.dispatch(Action::SelectMessage(id.clone()));
+    let (request_id, generation) = match update.effects[0] {
+        Effect::SendWorker(WorkerCommand::FetchBody {
+            request_id,
+            generation,
+            ..
+        }) => (request_id, generation),
+        _ => panic!(),
+    };
+    let loaded_body = reply_body();
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id,
+        generation,
+        message_id: id.clone(),
+        body: loaded_body.clone(),
+        usage: Default::default(),
+        saved: true,
+    }));
+    let reply = crate::composer::new_reply(
+        "reply-one".into(),
+        "person@example.com",
+        id.clone(),
+        "Subject",
+        &loaded_body.reply_context,
+        "<p>Original</p>",
+        "",
+    )
+    .unwrap();
+    let forward = crate::composer::new_forward(
+        "forward-one".into(),
+        "person@example.com",
+        id,
+        "Subject",
+        &loaded_body.reply_context,
+        "<p>Original</p>",
+        "",
+    )
+    .unwrap();
+    finish_draft_restore(&mut state, vec![reply, forward]);
+
+    let resumed = state.dispatch(Action::BeginReply);
+    assert_eq!(
+        resumed.feedback,
+        Some("Resumed the matching draft saved on this device")
+    );
+    assert!(matches!(state.snapshot().composer,
+        ComposerState::Editing { draft } if draft.compose.id == "reply-one"));
 }
 
 #[test]
@@ -301,7 +452,7 @@ fn refresh_failure_preserves_mail_and_enters_offline() {
     assert_eq!(state.visible_message_ids().len(), 3);
 }
 #[test]
-fn disconnect_only_clears_after_success() {
+fn disconnect_hides_local_mail_immediately_and_keeps_account_for_cleanup_retry() {
     let mut state = AppState::new();
     ready(&mut state);
     let update = state.dispatch(Action::ConfirmDisconnect);
@@ -309,6 +460,9 @@ fn disconnect_only_clears_after_success() {
         Effect::SendWorker(WorkerCommand::Disconnect { id, .. }) => id,
         _ => panic!(),
     };
+    assert!(state.snapshot().visible_messages.is_empty());
+    assert!(state.snapshot().selected_message.is_none());
+    assert!(state.snapshot().account.is_some());
     state.dispatch(Action::Worker(WorkerEvent::Failed {
         id,
         failure: ServiceFailure {
@@ -335,8 +489,13 @@ fn failed_disconnect_retry_keeps_worker_and_reducer_generations_aligned() {
     let mut state = AppState::new();
     ready(&mut state);
     let first = state.dispatch(Action::ConfirmDisconnect);
-    let (first_id, first_generation) = match first.effects[0] {
-        Effect::SendWorker(WorkerCommand::Disconnect { id, generation }) => (id, generation),
+    let (first_id, first_generation, first_draft_generation) = match first.effects[0] {
+        Effect::SendWorker(WorkerCommand::Disconnect {
+            id,
+            generation,
+            draft_generation,
+            ..
+        }) => (id, generation, draft_generation),
         _ => panic!(),
     };
     state.dispatch(Action::Worker(WorkerEvent::Failed {
@@ -351,18 +510,23 @@ fn failed_disconnect_retry_keeps_worker_and_reducer_generations_aligned() {
     }));
 
     let open = state.dispatch(Action::SelectMessage(MessageId::gmail(1, 1)));
-    assert!(matches!(
-        open.effects.as_slice(),
-        [Effect::SendWorker(WorkerCommand::FetchBody { generation, account_email, .. })]
-            if *generation == first_generation && account_email == "person@example.com"
-    ));
+    assert!(open.effects.is_empty());
+    assert!(state.snapshot().visible_messages.is_empty());
 
     let retry = state.dispatch(Action::Retry);
-    let second_generation = match retry.effects[0] {
-        Effect::SendWorker(WorkerCommand::Disconnect { generation, .. }) => generation,
+    let (second_generation, second_draft_generation) = match retry.effects[0] {
+        Effect::SendWorker(WorkerCommand::Disconnect {
+            generation,
+            draft_generation,
+            ..
+        }) => (generation, draft_generation),
         _ => panic!(),
     };
     assert_eq!(second_generation, first_generation.wrapping_add(1));
+    assert_eq!(
+        second_draft_generation,
+        first_draft_generation.wrapping_add(1)
+    );
 }
 
 #[test]
@@ -514,7 +678,7 @@ fn auth_required_retry_reconnects_and_offline_retains_rows() {
 }
 
 #[test]
-fn failed_disconnect_is_degraded_and_keeps_reader_content() {
+fn failed_disconnect_keeps_local_mail_hidden_and_offers_cleanup_retry() {
     let mut state = AppState::new();
     ready(&mut state);
     let update = state.dispatch(Action::ConfirmDisconnect);
@@ -533,9 +697,9 @@ fn failed_disconnect_is_degraded_and_keeps_reader_content() {
         },
     }));
     let snapshot = state.snapshot();
-    assert_eq!(snapshot.status, ViewStatus::Degraded);
-    assert_eq!(snapshot.visible_messages.len(), 3);
-    assert!(snapshot.selected_message.is_some());
+    assert_eq!(snapshot.status, ViewStatus::Error);
+    assert!(snapshot.visible_messages.is_empty());
+    assert!(snapshot.selected_message.is_none());
     assert!(snapshot.can_retry);
 }
 
@@ -915,6 +1079,7 @@ fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
             Effect::SendWorker(WorkerCommand::SaveDraft {
                 operation_id,
                 draft,
+                ..
             }) => Some((*operation_id, draft.id.clone(), draft.dirty_revision)),
             _ => None,
         })
@@ -926,6 +1091,7 @@ fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
     assert!(state.snapshot().composer_close_pending);
     let saved = state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
         operation_id,
+        generation: state.draft_generation,
         account_email: "person@example.com".into(),
         draft_id,
         revision,
@@ -979,6 +1145,7 @@ fn staging_blocks_send_until_the_attachment_finishes_or_fails() {
 
     state.dispatch(Action::Worker(WorkerEvent::DraftOperationFailed {
         operation_id,
+        generation: state.draft_generation,
         account_email: "person@example.com".into(),
     }));
     assert_eq!(state.snapshot().pending_attachment_staging, 0);
@@ -1010,6 +1177,7 @@ fn close_waits_for_acknowledged_save_and_failure_keeps_composer_visible() {
 
     state.dispatch(Action::Worker(WorkerEvent::DraftOperationFailed {
         operation_id,
+        generation: state.draft_generation,
         account_email: "person@example.com".into(),
     }));
     let snapshot = state.snapshot();
@@ -1025,12 +1193,14 @@ fn close_waits_for_acknowledged_save_and_failure_keeps_composer_visible() {
             Effect::SendWorker(WorkerCommand::SaveDraft {
                 operation_id,
                 draft,
+                ..
             }) => Some((*operation_id, draft.id.clone(), draft.dirty_revision)),
             _ => None,
         })
         .expect("retry save");
     let saved = state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
         operation_id,
+        generation: state.draft_generation,
         account_email: "person@example.com".into(),
         draft_id,
         revision,
@@ -1074,6 +1244,7 @@ fn inline_stage_creates_cid_marker_and_resume_summary_is_exposed() {
     state.dispatch(Action::Worker(WorkerEvent::AttachmentStaged {
         account_email: "person@example.com".into(),
         operation_id: DraftOperationId(77),
+        generation: state.draft_generation,
         draft_id,
         attachment: crate::composer::DraftAttachment {
             id: "image-1".into(),
@@ -1155,7 +1326,7 @@ fn oversized_editor_snapshot_is_rejected_without_replacing_the_draft() {
 }
 
 #[test]
-fn beginning_another_message_resumes_the_single_saved_draft() {
+fn beginning_another_kind_creates_an_isolated_draft() {
     let mut state = AppState::new();
     load_replyable(&mut state);
     state.dispatch(Action::BeginReply);
@@ -1171,38 +1342,40 @@ fn beginning_another_message_resumes_the_single_saved_draft() {
             Effect::SendWorker(WorkerCommand::SaveDraft {
                 operation_id,
                 draft,
+                ..
             }) => Some((*operation_id, draft.dirty_revision)),
             _ => None,
         })
         .expect("close save");
     state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
         operation_id,
+        generation: state.draft_generation,
         account_email: "person@example.com".into(),
         draft_id: original_id.clone(),
         revision,
     }));
     let update = state.dispatch(Action::BeginForward);
-    assert_eq!(
-        update.feedback,
-        Some("Resumed the draft already saved on this device")
-    );
+    assert_eq!(update.feedback, None);
     assert!(matches!(state.snapshot().composer,
-        ComposerState::Editing { draft } if draft.compose.id == original_id));
+        ComposerState::Editing { ref draft } if draft.compose.id != original_id));
+    assert_eq!(state.saved_drafts.len(), 2);
 }
 
 #[test]
 fn stale_cross_account_draft_and_signature_events_are_ignored() {
     let mut state = AppState::new();
-    load_replyable(&mut state);
+    ready(&mut state);
     let draft_op = state.pending_draft_load.expect("draft load");
     let signature_op = state.pending_signature_load.expect("signature load");
     state.dispatch(Action::Worker(WorkerEvent::DraftsLoaded {
         operation_id: draft_op,
+        generation: state.draft_generation,
         account_email: "other@example.com".into(),
         drafts: vec![],
     }));
     state.dispatch(Action::Worker(WorkerEvent::SignatureLoaded {
         operation_id: signature_op,
+        generation: state.draft_generation,
         account_email: "other@example.com".into(),
         preference: crate::drafts::SignaturePreference {
             html: "<b>Other account</b>".into(),
