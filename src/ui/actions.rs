@@ -2,12 +2,22 @@ use adw::prelude::*;
 use gtk::gio;
 
 use super::Ui;
-use crate::state::{Action, EscapeContext, EscapeOutcome, Surface, escape_outcome};
+use crate::state::{Action, EscapeContext, EscapeOutcome, escape_outcome};
 
 pub(super) fn install(ui: &Ui, application: &adw::Application) {
-    add(ui, "compose", |ui| {
-        ui.toast("Compose is available in a later milestone")
+    add(ui, "connect", |ui| ui.dispatch(Action::Connect));
+    add(ui, "refresh", |ui| ui.dispatch(Action::Refresh));
+    add(ui, "cancel-authorization", |ui| {
+        ui.dispatch(Action::CancelAuthorization)
     });
+    add(ui, "reopen-authorization", |ui| {
+        ui.dispatch(Action::ReopenAuthorization)
+    });
+    add(ui, "disconnect", |ui| {
+        ui.dispatch(Action::RequestDisconnect)
+    });
+    add(ui, "retry", |ui| ui.dispatch(Action::Retry));
+    add_disabled(ui, "compose");
     add(ui, "focus-search", |ui| {
         ui.search.grab_focus();
     });
@@ -17,61 +27,40 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "message-previous", |ui| {
         ui.dispatch(Action::SelectPrevious)
     });
-    add(ui, "archive", |ui| ui.dispatch(Action::ArchiveSelected));
-    add(ui, "reply", |ui| {
-        ui.toast("Reply is available in a later milestone")
-    });
-    add(ui, "reply-all", |ui| {
-        ui.toast("Reply all is available in a later milestone")
-    });
-    add(ui, "forward", |ui| {
-        ui.toast("Forward is available in a later milestone")
-    });
-    add(ui, "mark-read", |ui| {
-        ui.toast("Read status is fixture-only in this milestone")
-    });
-    add(ui, "delete", |ui| {
-        ui.toast("Delete is available in a later milestone")
-    });
-    add(ui, "label", |ui| {
-        ui.toast("Labels are available in a later milestone")
-    });
-    add(ui, "star", |ui| {
-        ui.toast("Starring is available in a later milestone")
-    });
-    add(ui, "download", |ui| {
-        ui.toast("Attachment download is available in a later milestone")
-    });
+    for name in [
+        "archive",
+        "reply",
+        "reply-all",
+        "forward",
+        "mark-read",
+        "delete",
+        "label",
+        "star",
+        "download",
+    ] {
+        add_disabled(ui, name);
+    }
     add(ui, "toggle-folders", |ui| {
         ui.outer.set_show_sidebar(!ui.outer.shows_sidebar())
     });
     add(ui, "back", handle_back);
-    add(ui, "demo-online", |ui| {
-        ui.dispatch(Action::SetSurface(Surface::Online))
-    });
-    add(ui, "demo-loading", |ui| {
-        ui.dispatch(Action::SetSurface(Surface::Loading))
-    });
-    add(ui, "demo-offline", |ui| {
-        ui.dispatch(Action::SetSurface(Surface::Offline))
-    });
 
     for (action, accelerators) in [
-        ("win.compose", &["<Primary>n"][..]),
         ("win.focus-search", &["<Primary>f"]),
         ("win.folder-next", &["<Alt>Down"]),
         ("win.folder-previous", &["<Alt>Up"]),
         ("win.message-next", &["<Primary>Down"]),
         ("win.message-previous", &["<Primary>Up"]),
-        ("win.archive", &["Delete"]),
-        ("win.reply", &["<Primary>r"]),
         ("win.back", &["Escape"]),
-        ("win.demo-online", &["<Primary><Shift>1"]),
-        ("win.demo-loading", &["<Primary><Shift>2"]),
-        ("win.demo-offline", &["<Primary><Shift>3"]),
     ] {
         application.set_accels_for_action(action, accelerators);
     }
+}
+
+fn add_disabled(ui: &Ui, name: &str) {
+    let action = gio::SimpleAction::new(name, None);
+    action.set_enabled(false);
+    ui.window.add_action(&action);
 }
 
 fn add(ui: &Ui, name: &str, handler: impl Fn(&Ui) + 'static) {

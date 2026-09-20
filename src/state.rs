@@ -1,43 +1,40 @@
-use crate::model::{FixtureError, FixtureSet, Folder, FolderId, FolderKind, Message, MessageId};
+use crate::{
+    model::{AccountIdentity, Folder, FolderId, INBOX_FOLDER, MailboxSnapshot, Message, MessageId},
+    worker::{
+        FailureKind, OperationId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+    },
+};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
-    fixtures: FixtureSet,
-    selected_folder_id: FolderId,
+    session: SessionState,
+    active_operation: Option<OperationId>,
+    next_operation: u64,
+    account: Option<AccountIdentity>,
+    mailbox: Option<MailboxSnapshot>,
     selected_message_id: Option<MessageId>,
     search_query: String,
     message_filter: MessageFilter,
-    surface: Surface,
+    recovery: Option<RecoveryAction>,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    SelectFolder(FolderId),
-    SelectMessage(MessageId),
-    SetSearch(String),
-    SetFilter(MessageFilter),
-    SelectNext,
-    SelectPrevious,
-    ArchiveSelected,
-    SetSurface(Surface),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryAction {
+    Sync(SyncKind),
+    Disconnect,
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Transition {
-    pub folders_changed: bool,
-    pub list_changed: bool,
-    pub reader_changed: bool,
-    pub feedback: Option<&'static str>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionState {
+    Disconnected,
+    Authorizing { deadline: SystemTime },
+    Syncing { kind: SyncKind, phase: WorkerPhase },
+    Ready,
+    Offline { failure: ServiceFailure },
+    AuthRequired { cleanup_failed: bool },
+    Disconnecting,
+    ConfigurationError { failure: ServiceFailure },
+    ServiceError { failure: ServiceFailure },
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Surface {
-    #[default]
-    Online,
-    Loading,
-    Offline,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MessageFilter {
     #[default]
@@ -45,16 +42,49 @@ pub enum MessageFilter {
     Unread,
     Attachments,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewStatus {
-    Ready,
+    Disconnected,
     Loading,
+    Ready,
     Offline,
-    EmptyFolder,
+    Degraded,
+    EmptyInbox,
     NoSearchResults,
+    Error,
 }
-
+#[derive(Debug)]
+pub enum Action {
+    Startup,
+    Connect,
+    Refresh,
+    CancelAuthorization,
+    ReopenAuthorization,
+    RequestDisconnect,
+    ConfirmDisconnect,
+    Retry,
+    SelectFolder(FolderId),
+    SelectMessage(MessageId),
+    SetSearch(String),
+    SetFilter(MessageFilter),
+    SelectNext,
+    SelectPrevious,
+    BrowserLaunchFailed(OperationId),
+    WorkerUnavailable,
+    Worker(WorkerEvent),
+}
+#[derive(Debug)]
+pub enum Effect {
+    SendWorker(WorkerCommand),
+    LaunchAuthorization { id: OperationId },
+    ClearAuthorization { id: OperationId },
+    PresentDisconnectConfirmation,
+}
+#[derive(Default, Debug)]
+pub struct Update {
+    pub feedback: Option<&'static str>,
+    pub effects: Vec<Effect>,
+}
 #[derive(Clone, Debug)]
 pub struct ViewSnapshot {
     pub folders: Vec<Folder>,
@@ -63,18 +93,24 @@ pub struct ViewSnapshot {
     pub selected_folder_id: FolderId,
     pub search_query: String,
     pub message_filter: MessageFilter,
-    pub surface: Surface,
     pub status: ViewStatus,
     pub folder_counts: Vec<(FolderId, usize)>,
+    pub session: SessionState,
+    pub account: Option<AccountIdentity>,
+    pub sync_metadata: Option<crate::model::SyncMetadata>,
+    pub can_connect: bool,
+    pub can_refresh: bool,
+    pub can_disconnect: bool,
+    pub can_reopen: bool,
+    pub can_cancel: bool,
+    pub can_retry: bool,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EscapeContext {
     pub search_active: bool,
     pub reader_visible: bool,
     pub folders_visible: bool,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EscapeOutcome {
     ClearSearch,
@@ -82,299 +118,485 @@ pub enum EscapeOutcome {
     HideFolders,
     None,
 }
-
-pub fn escape_outcome(context: EscapeContext) -> EscapeOutcome {
-    if context.search_active {
+pub fn escape_outcome(c: EscapeContext) -> EscapeOutcome {
+    if c.search_active {
         EscapeOutcome::ClearSearch
-    } else if context.reader_visible {
+    } else if c.reader_visible {
         EscapeOutcome::ShowMessageList
-    } else if context.folders_visible {
+    } else if c.folders_visible {
         EscapeOutcome::HideFolders
     } else {
         EscapeOutcome::None
     }
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl AppState {
-    pub fn new(fixtures: FixtureSet) -> Result<Self, FixtureError> {
-        fixtures.validate()?;
-        let selected_folder_id = fixtures
-            .folders
-            .first()
-            .map_or(FolderId::INBOX, |folder| folder.id);
-        let mut state = Self {
-            fixtures,
-            selected_folder_id,
+    pub fn new() -> Self {
+        Self {
+            session: SessionState::Disconnected,
+            active_operation: None,
+            next_operation: 1,
+            account: None,
+            mailbox: None,
             selected_message_id: None,
             search_query: String::new(),
             message_filter: MessageFilter::All,
-            surface: Surface::Online,
-        };
-        state.normalize_selection(None);
-        Ok(state)
+            recovery: None,
+        }
     }
-
-    pub fn dispatch(&mut self, action: Action) -> Transition {
+    pub fn dispatch(&mut self, action: Action) -> Update {
         match action {
-            Action::SelectFolder(id) => self.select_folder(id),
+            Action::Startup => self.start(SyncKind::Restore),
+            Action::Connect => self.start(SyncKind::Connect),
+            Action::Refresh => {
+                if self.account.is_some() {
+                    self.start(SyncKind::Refresh)
+                } else {
+                    Update {
+                        feedback: Some("Connect Gmail first"),
+                        ..Default::default()
+                    }
+                }
+            }
+            Action::CancelAuthorization => self.cancel(),
+            Action::ReopenAuthorization => {
+                self.active_operation
+                    .map_or_else(Update::default, |id| Update {
+                        effects: vec![Effect::LaunchAuthorization { id }],
+                        ..Default::default()
+                    })
+            }
+            Action::RequestDisconnect => Update {
+                effects: vec![Effect::PresentDisconnectConfirmation],
+                ..Default::default()
+            },
+            Action::ConfirmDisconnect => self.disconnect(),
+            Action::Retry => match self.recovery {
+                Some(RecoveryAction::Sync(kind)) => self.start(kind),
+                Some(RecoveryAction::Disconnect) => self.disconnect(),
+                None => Update {
+                    feedback: Some("Restart Whitford to restore the mail service"),
+                    ..Default::default()
+                },
+            },
+            Action::BrowserLaunchFailed(id) => {
+                if self.active_operation == Some(id) {
+                    self.session = SessionState::ServiceError {
+                        failure: ServiceFailure {
+                            kind: FailureKind::BrowserLaunchFailed,
+                            retryable: true,
+                            preserve_mail: false,
+                            cleanup_failed: false,
+                            config_path: None,
+                        },
+                    };
+                    let cancel = self
+                        .allocate()
+                        .map(|new_id| Effect::SendWorker(WorkerCommand::Cancel { id: new_id }));
+                    self.active_operation = None;
+                    Update {
+                        feedback: Some("Could not open your browser"),
+                        effects: cancel
+                            .into_iter()
+                            .chain([Effect::ClearAuthorization { id }])
+                            .collect(),
+                    }
+                } else {
+                    Update::default()
+                }
+            }
+            Action::WorkerUnavailable => {
+                self.active_operation = None;
+                self.recovery = None;
+                let failure = ServiceFailure {
+                    kind: FailureKind::WorkerUnavailable,
+                    retryable: false,
+                    preserve_mail: self.mailbox.is_some(),
+                    cleanup_failed: false,
+                    config_path: None,
+                };
+                self.session = if self.mailbox.is_some() {
+                    SessionState::Offline { failure }
+                } else {
+                    SessionState::ServiceError { failure }
+                };
+                Update {
+                    feedback: Some("The mail worker stopped unexpectedly"),
+                    ..Default::default()
+                }
+            }
+            Action::Worker(event) => self.worker_event(event),
+            Action::SelectFolder(_) => Update::default(),
             Action::SelectMessage(id) => self.select_message(id),
-            Action::SetSearch(query) => self.set_search(query),
-            Action::SetFilter(filter) => self.set_filter(filter),
-            Action::SelectNext => self.move_selection(1),
-            Action::SelectPrevious => self.move_selection(-1),
-            Action::ArchiveSelected => self.archive_selected(),
-            Action::SetSurface(surface) => {
-                self.surface = surface;
-                Transition {
-                    list_changed: true,
-                    reader_changed: true,
-                    ..Transition::default()
+            Action::SetSearch(query) => {
+                self.search_query = query.trim().to_owned();
+                self.normalize();
+                Update::default()
+            }
+            Action::SetFilter(filter) => {
+                self.message_filter = filter;
+                self.normalize();
+                Update::default()
+            }
+            Action::SelectNext => {
+                self.move_selection(1);
+                Update::default()
+            }
+            Action::SelectPrevious => {
+                self.move_selection(-1);
+                Update::default()
+            }
+        }
+    }
+    fn start(&mut self, kind: SyncKind) -> Update {
+        let Some(id) = self.allocate() else {
+            return Update {
+                feedback: Some("Mail worker is unavailable"),
+                ..Default::default()
+            };
+        };
+        self.session = SessionState::Syncing {
+            kind,
+            phase: if kind == SyncKind::Restore {
+                WorkerPhase::OpeningKeyring
+            } else {
+                WorkerPhase::LoadingConfiguration
+            },
+        };
+        self.recovery = Some(RecoveryAction::Sync(kind));
+        let command = match kind {
+            SyncKind::Restore => WorkerCommand::Restore { id },
+            SyncKind::Connect => WorkerCommand::Connect { id },
+            SyncKind::Refresh => WorkerCommand::Refresh { id },
+        };
+        Update {
+            effects: vec![Effect::SendWorker(command)],
+            ..Default::default()
+        }
+    }
+    fn cancel(&mut self) -> Update {
+        let old = self.active_operation;
+        let Some(id) = self.allocate() else {
+            return Update::default();
+        };
+        self.session = SessionState::Disconnected;
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::Cancel { id })]
+                .into_iter()
+                .chain(old.map(|id| Effect::ClearAuthorization { id }))
+                .collect(),
+            ..Default::default()
+        }
+    }
+    fn disconnect(&mut self) -> Update {
+        let Some(id) = self.allocate() else {
+            return Update::default();
+        };
+        self.session = SessionState::Disconnecting;
+        self.recovery = Some(RecoveryAction::Disconnect);
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::Disconnect { id })],
+            ..Default::default()
+        }
+    }
+    fn allocate(&mut self) -> Option<OperationId> {
+        let current = self.next_operation;
+        self.next_operation = self.next_operation.checked_add(1)?;
+        let id = OperationId(current);
+        self.active_operation = Some(id);
+        Some(id)
+    }
+    fn worker_event(&mut self, event: WorkerEvent) -> Update {
+        let id = match &event {
+            WorkerEvent::Phase { id, .. }
+            | WorkerEvent::AuthorizationRequired { id, .. }
+            | WorkerEvent::AccountPersisted { id, .. }
+            | WorkerEvent::NoStoredAccount { id }
+            | WorkerEvent::SyncComplete { id, .. }
+            | WorkerEvent::Disconnected { id }
+            | WorkerEvent::Cancelled { id }
+            | WorkerEvent::Failed { id, .. } => *id,
+        };
+        if self.active_operation != Some(id) {
+            return Update::default();
+        }
+        match event {
+            WorkerEvent::Phase { phase, .. } => {
+                if phase == WorkerPhase::WaitingForBrowser
+                    && matches!(self.session, SessionState::Authorizing { .. })
+                {
+                    return Update::default();
+                }
+                let kind = match self.session {
+                    SessionState::Syncing { kind, .. } => kind,
+                    _ => SyncKind::Connect,
+                };
+                self.session = SessionState::Syncing { kind, phase };
+                Update::default()
+            }
+            WorkerEvent::AuthorizationRequired { deadline, .. } => {
+                self.session = SessionState::Authorizing { deadline };
+                Update {
+                    effects: vec![Effect::LaunchAuthorization { id }],
+                    ..Default::default()
+                }
+            }
+            WorkerEvent::AccountPersisted { account, .. } => {
+                self.account = Some(account);
+                self.session = SessionState::Syncing {
+                    kind: SyncKind::Connect,
+                    phase: WorkerPhase::ConnectingImap,
+                };
+                Update::default()
+            }
+            WorkerEvent::Cancelled { .. }
+                if matches!(
+                    self.session,
+                    SessionState::ServiceError {
+                        failure: ServiceFailure {
+                            kind: FailureKind::BrowserLaunchFailed,
+                            ..
+                        }
+                    }
+                ) =>
+            {
+                self.active_operation = None;
+                Update::default()
+            }
+            WorkerEvent::NoStoredAccount { .. } | WorkerEvent::Cancelled { .. } => {
+                self.session = SessionState::Disconnected;
+                self.active_operation = None;
+                self.recovery = None;
+                Update::default()
+            }
+            WorkerEvent::SyncComplete {
+                account, snapshot, ..
+            } => {
+                self.account = Some(account);
+                self.mailbox = Some(snapshot);
+                self.session = SessionState::Ready;
+                self.active_operation = None;
+                self.recovery = None;
+                self.normalize();
+                Update {
+                    effects: vec![Effect::ClearAuthorization { id }],
+                    ..Default::default()
+                }
+            }
+            WorkerEvent::Disconnected { .. } => {
+                self.account = None;
+                self.mailbox = None;
+                self.selected_message_id = None;
+                self.session = SessionState::Disconnected;
+                self.active_operation = None;
+                self.recovery = None;
+                Update::default()
+            }
+            WorkerEvent::Failed { failure, .. } => {
+                if matches!(
+                    failure.kind,
+                    FailureKind::AuthorizationExpired
+                        | FailureKind::IdentityInvalid
+                        | FailureKind::ImapAuthenticationFailed
+                        | FailureKind::CredentialSaveFailed
+                ) {
+                    self.recovery = Some(RecoveryAction::Sync(SyncKind::Connect));
+                } else if failure.kind == FailureKind::DisconnectFailed {
+                    self.recovery = Some(RecoveryAction::Disconnect);
+                }
+                self.session = if failure.kind == FailureKind::DisconnectFailed {
+                    SessionState::ServiceError { failure }
+                } else if matches!(
+                    failure.kind,
+                    FailureKind::AuthorizationExpired
+                        | FailureKind::IdentityInvalid
+                        | FailureKind::ImapAuthenticationFailed
+                ) {
+                    SessionState::AuthRequired {
+                        cleanup_failed: failure.cleanup_failed,
+                    }
+                } else if failure.preserve_mail && self.mailbox.is_some() {
+                    SessionState::Offline { failure }
+                } else if failure.kind.is_configuration() {
+                    SessionState::ConfigurationError { failure }
+                } else {
+                    SessionState::ServiceError { failure }
+                };
+                self.active_operation = None;
+                Update {
+                    effects: vec![Effect::ClearAuthorization { id }],
+                    ..Default::default()
                 }
             }
         }
     }
-
     pub fn snapshot(&self) -> ViewSnapshot {
-        ViewSnapshot {
-            folders: self.fixtures.folders.clone(),
-            visible_messages: self.visible_messages().into_iter().cloned().collect(),
-            selected_message: self.selected_message().cloned(),
-            selected_folder_id: self.selected_folder_id,
-            search_query: self.search_query.clone(),
-            message_filter: self.message_filter,
-            surface: self.surface,
-            status: self.status(),
-            folder_counts: self
-                .fixtures
-                .folders
-                .iter()
-                .map(|folder| (folder.id, self.folder_count(folder.id)))
-                .collect(),
-        }
-    }
-
-    pub fn selected_folder_id(&self) -> FolderId {
-        self.selected_folder_id
-    }
-    pub fn selected_message_id(&self) -> Option<MessageId> {
-        self.selected_message_id
-    }
-
-    pub fn selected_message(&self) -> Option<&Message> {
-        let id = self.selected_message_id?;
-        self.fixtures
-            .messages
-            .iter()
-            .find(|message| message.id == id)
-    }
-
-    pub fn visible_message_ids(&self) -> Vec<MessageId> {
-        self.visible_messages()
+        let visible = self
+            .visible_messages()
             .into_iter()
-            .map(|message| message.id)
-            .collect()
-    }
-
-    pub fn visible_messages(&self) -> Vec<&Message> {
-        let query = self.search_query.trim().to_lowercase();
-        self.fixtures
-            .messages
-            .iter()
-            .filter(|message| {
-                self.message_in_selected_folder(message)
-                    && self.message_matches_filter(message)
-                    && (query.is_empty()
-                        || message.sender.to_lowercase().contains(&query)
-                        || message.subject.to_lowercase().contains(&query)
-                        || message
-                            .preview
-                            .is_some_and(|preview| preview.to_lowercase().contains(&query)))
-            })
-            .collect()
-    }
-
-    pub fn folder_count(&self, id: FolderId) -> usize {
-        let Some(folder) = self.fixtures.folders.iter().find(|folder| folder.id == id) else {
-            return 0;
-        };
-        match folder.kind {
-            FolderKind::Mailbox if id == FolderId::INBOX => self
-                .fixtures
-                .messages
-                .iter()
-                .filter(|message| message.folder_id == id && message.unread)
-                .count(),
-            FolderKind::Mailbox => self
-                .fixtures
-                .messages
-                .iter()
-                .filter(|message| message.folder_id == id)
-                .count(),
-            FolderKind::Starred => self
-                .fixtures
-                .messages
-                .iter()
-                .filter(|message| message.starred)
-                .count(),
-        }
-    }
-
-    pub fn status(&self) -> ViewStatus {
-        match self.surface {
-            Surface::Loading => ViewStatus::Loading,
-            Surface::Offline => ViewStatus::Offline,
-            Surface::Online
-                if self.visible_messages().is_empty()
-                    && (!self.search_query.is_empty()
-                        || self.message_filter != MessageFilter::All) =>
+            .cloned()
+            .collect::<Vec<_>>();
+        let status = match self.session {
+            SessionState::Disconnected
+            | SessionState::AuthRequired { .. }
+            | SessionState::ConfigurationError { .. }
+                if self.mailbox.is_none() =>
+            {
+                ViewStatus::Disconnected
+            }
+            SessionState::Syncing { .. }
+            | SessionState::Authorizing { .. }
+            | SessionState::Disconnecting
+                if self.mailbox.is_none() =>
+            {
+                ViewStatus::Loading
+            }
+            SessionState::Offline { .. } => ViewStatus::Offline,
+            SessionState::AuthRequired { .. } => ViewStatus::Degraded,
+            SessionState::ServiceError { ref failure }
+                if failure.kind == FailureKind::DisconnectFailed && self.mailbox.is_some() =>
+            {
+                ViewStatus::Degraded
+            }
+            SessionState::ServiceError { .. } | SessionState::ConfigurationError { .. } => {
+                ViewStatus::Error
+            }
+            _ if visible.is_empty()
+                && (!self.search_query.is_empty() || self.message_filter != MessageFilter::All) =>
             {
                 ViewStatus::NoSearchResults
             }
-            Surface::Online if self.visible_messages().is_empty() => ViewStatus::EmptyFolder,
-            Surface::Online => ViewStatus::Ready,
-        }
-    }
-
-    fn message_in_selected_folder(&self, message: &Message) -> bool {
-        self.fixtures
-            .folders
-            .iter()
-            .find(|folder| folder.id == self.selected_folder_id)
-            .is_some_and(|folder| match folder.kind {
-                FolderKind::Mailbox => message.folder_id == folder.id,
-                FolderKind::Starred => message.starred,
-            })
-    }
-
-    fn message_matches_filter(&self, message: &Message) -> bool {
-        match self.message_filter {
-            MessageFilter::All => true,
-            MessageFilter::Unread => message.unread,
-            MessageFilter::Attachments => !message.attachments.is_empty(),
-        }
-    }
-
-    fn select_folder(&mut self, id: FolderId) -> Transition {
-        if !self.fixtures.folders.iter().any(|folder| folder.id == id) {
-            return Transition {
-                feedback: Some("Folder is unavailable"),
-                ..Transition::default()
-            };
-        }
-        self.selected_folder_id = id;
-        self.search_query.clear();
-        self.message_filter = MessageFilter::All;
-        self.normalize_selection(None);
-        Transition {
-            folders_changed: true,
-            list_changed: true,
-            reader_changed: true,
-            ..Transition::default()
-        }
-    }
-
-    fn select_message(&mut self, id: MessageId) -> Transition {
-        if !self.visible_message_ids().contains(&id) {
-            return Transition {
-                feedback: Some("Message is unavailable"),
-                ..Transition::default()
-            };
-        }
-        self.selected_message_id = Some(id);
-        Transition {
-            reader_changed: true,
-            ..Transition::default()
-        }
-    }
-
-    fn set_search(&mut self, query: String) -> Transition {
-        self.search_query = query.trim().to_owned();
-        self.normalize_selection(None);
-        Transition {
-            list_changed: true,
-            reader_changed: true,
-            ..Transition::default()
-        }
-    }
-
-    fn set_filter(&mut self, filter: MessageFilter) -> Transition {
-        self.message_filter = filter;
-        self.normalize_selection(None);
-        Transition {
-            list_changed: true,
-            reader_changed: true,
-            ..Transition::default()
-        }
-    }
-
-    fn move_selection(&mut self, direction: isize) -> Transition {
-        let visible = self.visible_message_ids();
-        if visible.is_empty() {
-            return Transition::default();
-        }
-        let current = self
-            .selected_message_id
-            .and_then(|id| visible.iter().position(|candidate| *candidate == id));
-        let index = match (current, direction) {
-            (Some(index), step) => index.saturating_add_signed(step).min(visible.len() - 1),
-            (None, step) if step < 0 => visible.len() - 1,
-            (None, _) => 0,
+            _ if visible.is_empty() => ViewStatus::EmptyInbox,
+            _ => ViewStatus::Ready,
         };
-        self.selected_message_id = Some(visible[index]);
-        Transition {
-            reader_changed: true,
-            ..Transition::default()
+        ViewSnapshot {
+            folders: vec![INBOX_FOLDER.clone()],
+            visible_messages: visible,
+            selected_message: self.selected_message().cloned(),
+            selected_folder_id: FolderId::Inbox,
+            search_query: self.search_query.clone(),
+            message_filter: self.message_filter,
+            status,
+            folder_counts: vec![(FolderId::Inbox, self.folder_count(FolderId::Inbox))],
+            session: self.session.clone(),
+            account: self.account.clone(),
+            sync_metadata: self
+                .mailbox
+                .as_ref()
+                .map(|mailbox| mailbox.metadata.clone()),
+            can_connect: matches!(
+                self.session,
+                SessionState::Disconnected | SessionState::AuthRequired { .. }
+            ) || (self.account.is_none()
+                && matches!(
+                    self.session,
+                    SessionState::ServiceError { ref failure }
+                        if !matches!(failure.kind, FailureKind::DisconnectFailed | FailureKind::WorkerUnavailable)
+                )),
+            can_refresh: self.account.is_some()
+                && matches!(
+                    self.session,
+                    SessionState::Ready | SessionState::Offline { .. }
+                ),
+            can_disconnect: self.account.is_some()
+                && !matches!(self.session, SessionState::Disconnecting),
+            can_reopen: matches!(self.session, SessionState::Authorizing { .. }),
+            can_cancel: matches!(self.session, SessionState::Authorizing { .. }),
+            can_retry: match &self.session {
+                SessionState::AuthRequired { .. } => true,
+                SessionState::Offline { failure }
+                | SessionState::ConfigurationError { failure }
+                | SessionState::ServiceError { failure } => failure.retryable,
+                _ => false,
+            },
         }
     }
-
-    fn archive_selected(&mut self) -> Transition {
-        let Some(id) = self.selected_message_id else {
-            return Transition {
-                feedback: Some("No message selected"),
-                ..Transition::default()
-            };
-        };
-        let preferred = self
-            .visible_message_ids()
-            .iter()
-            .position(|candidate| *candidate == id);
-        let Some(message) = self
-            .fixtures
+    pub fn selected_message_id(&self) -> Option<MessageId> {
+        self.selected_message_id.clone()
+    }
+    pub fn selected_message(&self) -> Option<&Message> {
+        let id = self.selected_message_id.as_ref()?;
+        self.mailbox
+            .as_ref()?
             .messages
-            .iter_mut()
-            .find(|message| message.id == id)
-        else {
-            self.normalize_selection(None);
-            return Transition {
+            .iter()
+            .find(|message| &message.id == id)
+    }
+    pub fn visible_message_ids(&self) -> Vec<MessageId> {
+        self.visible_messages()
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect()
+    }
+    pub fn folder_count(&self, _: FolderId) -> usize {
+        self.mailbox
+            .as_ref()
+            .map_or(0, |m| m.messages.iter().filter(|m| m.unread).count())
+    }
+    fn visible_messages(&self) -> Vec<&Message> {
+        let query = self.search_query.to_lowercase();
+        self.mailbox
+            .as_ref()
+            .map(|mailbox| {
+                mailbox
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        (query.is_empty()
+                            || m.sender.to_lowercase().contains(&query)
+                            || m.subject.to_lowercase().contains(&query)
+                            || m.preview
+                                .as_ref()
+                                .is_some_and(|p| p.to_lowercase().contains(&query)))
+                            && match self.message_filter {
+                                MessageFilter::All => true,
+                                MessageFilter::Unread => m.unread,
+                                MessageFilter::Attachments => !m.attachments.is_empty(),
+                            }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn select_message(&mut self, id: MessageId) -> Update {
+        if self.visible_message_ids().contains(&id) {
+            self.selected_message_id = Some(id);
+            Update::default()
+        } else {
+            Update {
                 feedback: Some("Message is unavailable"),
-                list_changed: true,
-                reader_changed: true,
-                ..Transition::default()
-            };
-        };
-        message.folder_id = FolderId::ARCHIVE;
-        self.normalize_selection(preferred);
-        Transition {
-            folders_changed: true,
-            list_changed: true,
-            reader_changed: true,
-            feedback: Some("Message archived"),
+                ..Default::default()
+            }
         }
     }
-
-    fn normalize_selection(&mut self, preferred: Option<usize>) {
+    fn normalize(&mut self) {
         let visible = self.visible_message_ids();
         if self
             .selected_message_id
-            .is_some_and(|id| visible.contains(&id))
+            .as_ref()
+            .is_none_or(|id| !visible.contains(id))
         {
+            self.selected_message_id = visible.first().cloned();
+        }
+    }
+    fn move_selection(&mut self, step: isize) {
+        let visible = self.visible_message_ids();
+        if visible.is_empty() {
             return;
         }
-        self.selected_message_id = if visible.is_empty() {
-            None
-        } else {
-            Some(visible[preferred.unwrap_or(0).min(visible.len() - 1)])
-        };
+        let index = self
+            .selected_message_id
+            .as_ref()
+            .and_then(|id| visible.iter().position(|item| item == id))
+            .unwrap_or(0)
+            .saturating_add_signed(step)
+            .min(visible.len() - 1);
+        self.selected_message_id = Some(visible[index].clone());
     }
 }
 

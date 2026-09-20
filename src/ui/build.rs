@@ -6,7 +6,14 @@ use gtk::glib::value::ToValue;
 use super::Ui;
 use crate::state::{Action, AppState, MessageFilter};
 
-pub(super) fn build(application: &adw::Application, state: Rc<RefCell<AppState>>) -> Ui {
+pub(super) fn build(
+    application: &adw::Application,
+    state: Rc<RefCell<AppState>>,
+    worker: tokio::sync::mpsc::UnboundedSender<crate::worker::WorkerCommand>,
+    authorization: Rc<
+        RefCell<Option<(crate::worker::OperationId, crate::oauth::AuthorizationUrl)>>,
+    >,
+) -> Ui {
     let folders = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["whitford-folder-list"])
@@ -16,21 +23,21 @@ pub(super) fn build(application: &adw::Application, state: Rc<RefCell<AppState>>
         .css_classes(["whitford-message-list"])
         .build();
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search mail")
+        .placeholder_text("Search loaded messages")
         .hexpand(true)
         .css_classes(["whitford-search"])
         .build();
     search.update_property(&[
-        gtk::accessible::Property::Label("Search mail"),
+        gtk::accessible::Property::Label("Search loaded messages"),
         gtk::accessible::Property::KeyShortcuts("Control+F"),
     ]);
 
     let list_menu = sidebar_button();
     let reader_menu = sidebar_button();
     let (folder_pane, sync_title, sync_detail) = build_folder_pane(&folders);
-    let (message_page, list_header, filter_buttons) =
+    let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &search, &list_menu);
-    let (reader_page, reader) = build_reader_page(&reader_menu);
+    let (reader_page, reader, reader_banner) = build_reader_page(&reader_menu);
 
     let inner = adw::NavigationSplitView::builder()
         .sidebar(&message_page)
@@ -69,22 +76,28 @@ pub(super) fn build(application: &adw::Application, state: Rc<RefCell<AppState>>
         &[list_menu, reader_menu],
         &list_header,
     );
-    let state_owner = state.clone();
-    window.connect_destroy(move |_| drop(state_owner.borrow()));
+    let shutdown = worker.clone();
+    window.connect_destroy(move |_| {
+        let _ = shutdown.send(crate::worker::WorkerCommand::Shutdown);
+    });
 
     Ui {
         window,
         state,
         folders,
         messages,
+        list_banner,
         search,
         reader,
+        reader_banner,
         outer,
         inner,
         toast_overlay,
         sync_title,
         sync_detail,
         filter_buttons,
+        worker,
+        authorization,
     }
 }
 
@@ -122,28 +135,77 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .margin_bottom(18)
         .build();
     let name = gtk::Label::builder()
-        .label("Personal")
+        .label("Gmail developer preview")
         .xalign(0.0)
         .css_classes(["title-3"])
         .build();
     let address = gtk::Label::builder()
-        .label("alex@northfield.dev")
+        .label("Read-only · newest 50 messages")
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
     account.append(&name);
     account.append(&address);
 
-    let compose = gtk::Button::builder()
-        .label("Compose")
-        .icon_name("document-edit-symbolic")
-        .action_name("win.compose")
-        .tooltip_text("Compose a message (Ctrl+N)")
+    let connect = gtk::Button::builder()
+        .label("Connect Gmail")
+        .icon_name("network-server-symbolic")
+        .action_name("win.connect")
+        .tooltip_text("Authorize a Gmail account")
         .margin_start(16)
         .margin_end(16)
         .margin_bottom(18)
         .css_classes(["suggested-action", "whitford-compose"])
         .build();
+    let account_actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_bottom(18)
+        .build();
+    account_actions.append(
+        &gtk::Button::builder()
+            .label("Refresh")
+            .action_name("win.refresh")
+            .hexpand(true)
+            .build(),
+    );
+    account_actions.append(
+        &gtk::Button::builder()
+            .label("Disconnect")
+            .action_name("win.disconnect")
+            .hexpand(true)
+            .build(),
+    );
+    let recovery_actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_bottom(18)
+        .build();
+    recovery_actions.append(
+        &gtk::Button::builder()
+            .label("Retry")
+            .action_name("win.retry")
+            .hexpand(true)
+            .build(),
+    );
+    recovery_actions.append(
+        &gtk::Button::builder()
+            .label("Reopen Browser")
+            .action_name("win.reopen-authorization")
+            .hexpand(true)
+            .build(),
+    );
+    recovery_actions.append(
+        &gtk::Button::builder()
+            .label("Cancel")
+            .action_name("win.cancel-authorization")
+            .hexpand(true)
+            .build(),
+    );
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(folders)
@@ -156,19 +218,25 @@ fn build_folder_pane(folders: &gtk::ListBox) -> (gtk::Box, gtk::Label, gtk::Labe
         .margin_bottom(22)
         .build();
     let sync_title = gtk::Label::builder()
-        .label("●  All caught up")
+        .label("Not connected")
         .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(["whitford-online"])
         .build();
     let sync_detail = gtk::Label::builder()
-        .label("Last sync: 2 minutes ago")
+        .label("Place google-oauth.json in the Whitford XDG config directory.")
         .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(["dim-label", "caption"])
         .build();
     sync.append(&sync_title);
     sync.append(&sync_detail);
     pane.append(&account);
-    pane.append(&compose);
+    pane.append(&connect);
+    pane.append(&account_actions);
+    pane.append(&recovery_actions);
     pane.append(&scroll);
     pane.append(&sync);
     (pane, sync_title, sync_detail)
@@ -182,6 +250,7 @@ fn build_message_page(
     adw::NavigationPage,
     adw::HeaderBar,
     Vec<(MessageFilter, gtk::Button)>,
+    gtk::Box,
 ) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -231,6 +300,11 @@ fn build_message_page(
     search_box.append(&filters);
     content.append(&search_box);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let list_banner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .visible(false)
+        .build();
+    content.append(&list_banner);
     content.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(true)
@@ -242,10 +316,11 @@ fn build_message_page(
         adw::NavigationPage::with_tag(&toolbar, "Messages", "messages"),
         header,
         filter_buttons,
+        list_banner,
     )
 }
 
-fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box) {
+fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box, gtk::Box) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_show_title(false);
@@ -278,15 +353,25 @@ fn build_reader_page(menu: &gtk::Button) -> (adw::NavigationPage, gtk::Box) {
         .margin_bottom(32)
         .css_classes(["whitford-reader"])
         .build();
-    toolbar.set_content(Some(
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let reader_banner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .visible(false)
+        .build();
+    content.append(&reader_banner);
+    content.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(true)
             .child(&reader)
             .build(),
-    ));
+    );
+    toolbar.set_content(Some(&content));
     (
         adw::NavigationPage::with_tag(&toolbar, "Message", "reader"),
         reader,
+        reader_banner,
     )
 }
 

@@ -5,8 +5,10 @@ sdk: org.gnome.Sdk
 command: whitford
 finish-args:
   - --share=ipc
+  - --share=network
   - --socket=wayland
   - --device=dri
+  - --talk-name=org.freedesktop.secrets
 modules:
   - name: whitford
     buildsystem: simple

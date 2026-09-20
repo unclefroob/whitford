@@ -2,12 +2,13 @@
 <component type="desktop-application">
   <id>dev.whitford.Whitford</id>
   <name>Whitford</name>
-  <summary>A focused native mail shell for Wayland</summary>
+  <summary>A read-only Gmail developer preview for Wayland</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <description>
-    <p>Whitford is a keyboard-friendly, adaptive desktop mail shell built with GTK and libadwaita.</p>
-    <p>This preview uses local fixtures and does not yet connect to mail accounts.</p>
+    <p>Whitford is a keyboard-friendly, adaptive Gmail reader built with GTK and libadwaita.</p>
+    <p>This developer preview connects read-only to Gmail and loads the newest 50 INBOX messages.</p>
+    <p>Connection requires a local Google OAuth Desktop client configuration; setup instructions are included in the project README.</p>
   </description>
   <launchable type="desktop-id">dev.whitford.Whitford.desktop</launchable>
   <developer id="dev.whitford"><name>Whitford contributors</name></developer>

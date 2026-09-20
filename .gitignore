@@ -1,2 +1,14 @@
 /target/
 
+# Local OAuth credentials and token artifacts must never enter source control.
+google-oauth.json
+**/google-oauth.json
+*.oauth.json
+*.oauth-token
+*.refresh-token
+client_secret*.json
+google-oauth*.json
+.secrets/
+.credentials/
+.env
+.env.*
