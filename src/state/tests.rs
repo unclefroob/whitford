@@ -121,11 +121,27 @@ fn unified_reader_load_is_account_scoped_and_ignores_a_same_id_other_account() {
             mailbox: Some(inbox_snapshot(messages)),
         });
     }
+    // A retained legacy projection must never win over a unified selection.
+    // This mirrors switching from the original account's cached inbox to a
+    // second account in the unified inbox.
+    let stale = fixture_messages().remove(0);
+    state.mailbox = Some(inbox_snapshot(vec![stale.clone()]));
+    state.selected_message_id = Some(stale.id.clone());
+    state.reader = ReaderState::Loaded {
+        id: stale.id,
+        body: reply_body(),
+    };
     let selected = crate::model::AccountMessageId {
         account_id: first.clone(),
         message_id: MessageId::gmail(77),
     };
     let update = state.dispatch(Action::SelectAccountMessage(selected.clone()));
+    let selected_snapshot = state.snapshot();
+    assert!(selected_snapshot.selected_message.is_none());
+    assert_eq!(
+        selected_snapshot.selected_account_message,
+        Some(selected.clone())
+    );
     let (request_id, generation) = match update.effects.as_slice() {
         [
             Effect::SendWorker(WorkerCommand::FetchAccountBody {

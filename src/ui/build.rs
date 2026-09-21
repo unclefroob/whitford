@@ -803,16 +803,14 @@ pub(super) fn connect_signals(ui: &Ui) {
                 return;
             };
             let item = object.borrow::<MessageListItem>();
-            let account_scoped = item.account_message_id.is_some();
             if let Some(id) = &item.account_message_id {
                 ui.dispatch(Action::SelectAccountMessage(id.clone()));
             } else {
                 ui.dispatch(Action::SelectMessage(item.message.id.clone()));
             }
-            // Account-scoped body loading is not on the legacy worker protocol
-            // yet.  Keep the user in the list instead of opening an empty
-            // reader pane; selecting still provides the scoped state identity.
-            if !account_scoped && ui.inner.is_collapsed() {
+            // Both legacy and account-scoped body fetches now populate the
+            // reader, including on narrow layouts.
+            if ui.inner.is_collapsed() {
                 ui.inner.set_show_content(true);
             }
         }

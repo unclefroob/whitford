@@ -2925,6 +2925,10 @@ impl AppState {
                 ..Default::default()
             };
         }
+        // The legacy projection can remain populated while unified inbox is
+        // active.  Clear its selection before opening the scoped message so
+        // the reader never renders a stale title/body from another account.
+        self.selected_message_id = None;
         self.selected_account_message = Some(id);
         self.bump_list();
         self.open_selected_account()
