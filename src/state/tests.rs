@@ -8,6 +8,256 @@ fn account() -> AccountIdentity {
         email: "person@example.com".into(),
     }
 }
+
+#[test]
+fn background_tick_is_separate_from_foreground_and_duplicate_events_notify_once() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let scheduled = state.arm_background_sync(std::time::Duration::from_secs(60));
+    let generation = match scheduled {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    let update = state.dispatch(Action::BackgroundSyncTimer {
+        schedule_generation: generation,
+    });
+    let request_id = match &update.effects[0] {
+        Effect::SendWorker(WorkerCommand::BackgroundSync { request_id, .. }) => *request_id,
+        other => panic!("unexpected effect: {other:?}"),
+    };
+    let mut snapshot = state.mailbox.clone().unwrap();
+    let mut message = fixture_messages().remove(0);
+    message.id = MessageId::gmail(999);
+    message.unread = true;
+    snapshot.messages.push(message);
+    let update = state.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot,
+        new_unread_ids: vec![MessageId::gmail(999)],
+    }));
+    assert!(
+        update
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+    // The same worker event is stale after its request is cleared and cannot
+    // produce a second desktop notification.
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: account().email,
+                snapshot: state.mailbox.clone().unwrap(),
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .is_empty()
+    );
+}
+
+fn begin_background_sync(state: &mut AppState) -> BackgroundSyncRequestId {
+    let generation = match state.arm_background_sync(std::time::Duration::from_secs(60)) {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    match &state
+        .dispatch(Action::BackgroundSyncTimer {
+            schedule_generation: generation,
+        })
+        .effects[0]
+    {
+        Effect::SendWorker(WorkerCommand::BackgroundSync { request_id, .. }) => *request_id,
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+#[test]
+fn background_notification_dedup_is_scoped_to_the_account() {
+    let mut state = AppState::new();
+    let first_id = ready(&mut state);
+    let request_id = begin_background_sync(&mut state);
+    let initial = state.mailbox.clone().unwrap();
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: account().email,
+                snapshot: initial,
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+
+    let other = AccountIdentity {
+        provider: MailProvider::Gmail,
+        email: "other@example.com".into(),
+    };
+    let connect = state.dispatch(Action::Connect);
+    let connect_id = match connect.effects[0] {
+        Effect::SendWorker(WorkerCommand::Connect { id }) => id,
+        _ => panic!(),
+    };
+    assert_ne!(connect_id, first_id);
+    state.dispatch(Action::Worker(WorkerEvent::IdentityVerified {
+        id: connect_id,
+        account: other.clone(),
+    }));
+    state.dispatch(Action::Worker(WorkerEvent::SyncComplete {
+        id: connect_id,
+        account: other.clone(),
+        snapshot: MailboxSnapshot {
+            messages: fixture_messages(),
+            folder_catalog: crate::model::FolderCatalog::inbox_only(),
+            metadata: SyncMetadata {
+                completed_at: SystemTime::UNIX_EPOCH,
+                requested_limit: 50,
+                loaded_count: 3,
+                fallback_count: 0,
+                skipped_count: 0,
+            },
+        },
+    }));
+    let request_id = begin_background_sync(&mut state);
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: other.email,
+                snapshot: state.mailbox.clone().unwrap(),
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+}
+
+#[test]
+fn background_completion_does_not_publish_over_active_search_or_reader() {
+    let mut searching = AppState::new();
+    ready(&mut searching);
+    searching.mailbox = Some(folder_snapshot(FolderId::Inbox, "INBOX", "Inbox"));
+    let request_id = begin_background_sync(&mut searching);
+    searching.dispatch(Action::SetSearch("anything".into()));
+    searching.dispatch(Action::SubmitServerSearch);
+    let before = searching.mailbox.clone().unwrap();
+    searching.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot: MailboxSnapshot {
+            messages: Vec::new(),
+            ..before.clone()
+        },
+        new_unread_ids: Vec::new(),
+    }));
+    assert!(matches!(
+        searching.server_search,
+        ServerSearchState::Loading { .. }
+    ));
+    assert_eq!(searching.mailbox, Some(before));
+
+    let mut reading = AppState::new();
+    ready(&mut reading);
+    let request_id = begin_background_sync(&mut reading);
+    reading.dispatch(Action::SelectMessage(MessageId::gmail(1)));
+    let before = reading.mailbox.clone().unwrap();
+    reading.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot: MailboxSnapshot {
+            messages: Vec::new(),
+            ..before.clone()
+        },
+        new_unread_ids: Vec::new(),
+    }));
+    assert!(matches!(reading.reader, ReaderState::Loading { .. }));
+    assert_eq!(reading.mailbox, Some(before));
+}
+
+#[test]
+fn background_timer_and_terminal_failure_ignore_stale_or_late_work() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let stale_generation = match state.arm_background_sync(std::time::Duration::from_secs(60)) {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    let _current = state.arm_background_sync(std::time::Duration::from_secs(60));
+    assert!(
+        state
+            .dispatch(Action::BackgroundSyncTimer {
+                schedule_generation: stale_generation,
+            })
+            .effects
+            .is_empty()
+    );
+
+    let request_id = begin_background_sync(&mut state);
+    let failure = ServiceFailure {
+        kind: FailureKind::AuthorizationExpired,
+        retryable: false,
+        preserve_mail: true,
+        cleanup_failed: false,
+        config_path: None,
+    };
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncFailed {
+                request_id,
+                failure,
+            }))
+            .effects
+            .is_empty()
+    );
+    assert_eq!(
+        state.snapshot().background_sync_status,
+        BackgroundSyncStatus::Paused
+    );
+
+    let mut late = AppState::new();
+    ready(&mut late);
+    let late_request = begin_background_sync(&mut late);
+    let disconnect = late.dispatch(Action::ConfirmDisconnect);
+    assert!(
+        disconnect
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Disconnect { .. })))
+    );
+    assert!(
+        late.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+            request_id: late_request,
+            account_email: account().email,
+            snapshot: MailboxSnapshot {
+                messages: fixture_messages(),
+                folder_catalog: crate::model::FolderCatalog::inbox_only(),
+                metadata: SyncMetadata {
+                    completed_at: SystemTime::UNIX_EPOCH,
+                    requested_limit: 50,
+                    loaded_count: 3,
+                    fallback_count: 0,
+                    skipped_count: 0,
+                },
+            },
+            new_unread_ids: vec![MessageId::gmail(1000)],
+        }))
+        .effects
+        .is_empty()
+    );
+}
 fn ready(state: &mut AppState) -> OperationId {
     let update = state.dispatch(Action::Connect);
     let id = match &update.effects[0] {
@@ -300,6 +550,13 @@ fn startup_is_disconnected_then_restore_is_an_effect() {
 
 fn mutation_effect(update: Update) -> (MutationRequestId, u64, MessageId, MessageMutation) {
     match update.effects.into_iter().next().expect("mutation effect") {
+        Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+            request_id,
+            generation,
+            message_id,
+            mutation,
+            ..
+        }) => (request_id, generation, message_id, mutation),
         Effect::SendWorker(WorkerCommand::MutateMessage {
             request_id,
             generation,
@@ -456,7 +713,7 @@ fn folder_navigation_shows_cache_then_replaces_it_with_fresh_mail() {
     assert_eq!(cached.status, ViewStatus::Ready);
     assert_eq!(cached.visible_messages[0].subject, "Cached subject");
     assert_eq!(cached.folder_counts, vec![(FolderId::Sent, 1)]);
-    assert!(!cached.can_mutate);
+    assert!(cached.can_mutate, "a cached folder row remains actionable");
 
     let body_request = state.dispatch(Action::SelectMessage(MessageId::gmail(1)));
     assert!(matches!(
@@ -591,6 +848,8 @@ fn archive_reconciliation_restores_authoritative_inbox_membership() {
         state: Some(ReconciledMessageState {
             unread: true,
             starred: true,
+            in_inbox: true,
+            in_trash: false,
             labels: vec!["Work".into()],
         }),
     }));
@@ -604,6 +863,226 @@ fn archive_reconciliation_restores_authoritative_inbox_membership() {
         .unwrap();
     assert!(restored.unread && restored.starred);
     assert_eq!(restored.labels, ["Work"]);
+}
+
+#[test]
+fn archive_reconciliation_does_not_restore_an_authoritatively_archived_inbox_row() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) = mutation_effect(state.dispatch(Action::Archive));
+    state.dispatch(Action::Worker(WorkerEvent::MutationReconciled {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        state: Some(ReconciledMessageState {
+            unread: false,
+            starred: false,
+            in_inbox: false,
+            in_trash: false,
+            labels: Vec::new(),
+        }),
+    }));
+    assert!(!state.visible_message_ids().contains(&message_id));
+}
+
+#[test]
+fn confirmed_archive_can_be_undone_with_the_catalog_aware_restore_command() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (forward_request, generation, message_id, _) =
+        mutation_effect(state.dispatch(Action::Archive));
+    assert!(!state.visible_message_ids().contains(&message_id));
+    let available = state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: forward_request,
+        generation,
+        message_id: message_id.clone(),
+    }));
+    assert_eq!(
+        available.feedback,
+        Some("Message changed — Undo is available")
+    );
+
+    let undo = state.dispatch(Action::UndoMessageOperation);
+    let (undo_request, undo_generation) = match undo.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+                request_id,
+                generation,
+                message_id: id,
+                mutation: MessageMutation::RestoreArchive { inbox_mailbox },
+                catalog,
+                ..
+            }),
+        ] => {
+            assert_eq!(id, &message_id);
+            assert_eq!(inbox_mailbox, "INBOX");
+            assert!(catalog.find(&FolderId::AllMail).is_some());
+            (*request_id, *generation)
+        }
+        effect => panic!("expected catalog-aware archive restore, got {effect:?}"),
+    };
+    assert!(state.visible_message_ids().contains(&message_id));
+    let completed = state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: undo_request,
+        generation: undo_generation,
+        message_id,
+    }));
+    assert_eq!(completed.feedback, Some("Message action undone"));
+}
+
+#[test]
+fn undo_requested_before_archive_confirmation_waits_then_dispatches_inverse() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (forward_request, generation, message_id, _) =
+        mutation_effect(state.dispatch(Action::Archive));
+    let waiting = state.dispatch(Action::UndoMessageOperation);
+    assert!(waiting.effects.is_empty());
+    assert!(state.visible_message_ids().contains(&message_id));
+
+    let dispatched = state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: forward_request,
+        generation,
+        message_id: message_id.clone(),
+    }));
+    assert!(matches!(
+        dispatched.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+            mutation: MessageMutation::RestoreArchive { .. },
+            ..
+        })]
+    ));
+    assert!(state.visible_message_ids().contains(&message_id));
+}
+
+#[test]
+fn uncertain_forward_after_preconfirmation_undo_keeps_the_forward_presentation() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (request_id, generation, message_id, _) = mutation_effect(state.dispatch(Action::Archive));
+    state.dispatch(Action::UndoMessageOperation);
+    assert!(state.visible_message_ids().contains(&message_id));
+    state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id,
+        generation,
+        message_id: message_id.clone(),
+        uncertain: true,
+    }));
+    assert!(
+        !state.visible_message_ids().contains(&message_id),
+        "an uncertain forward must not leave the optimistic Undo row visible"
+    );
+}
+
+#[test]
+fn confirmed_trash_can_be_undone_with_the_original_labels() {
+    let mut state = ready_for_search();
+    let message_id = MessageId::gmail(2);
+    state
+        .mailbox
+        .as_mut()
+        .unwrap()
+        .messages
+        .iter_mut()
+        .find(|message| message.id == message_id)
+        .unwrap()
+        .labels = vec!["Projects/Rust".into()];
+    state.selected_message_id = Some(message_id.clone());
+    let (forward_request, generation, _, _) = mutation_effect(state.dispatch(Action::MoveToTrash));
+    state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: forward_request,
+        generation,
+        message_id: message_id.clone(),
+    }));
+    let undo = state.dispatch(Action::UndoMessageOperation);
+    assert!(matches!(
+        undo.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+            mutation: MessageMutation::RestoreFromTrash {
+                inbox_mailbox,
+                trash_mailbox,
+                restore_inbox,
+                labels,
+            }, ..
+        })] if inbox_mailbox == "INBOX"
+            && trash_mailbox == "[Gmail]/Trash"
+            && *restore_inbox
+            && labels == &vec!["Projects/Rust".to_owned()]
+    ));
+    assert!(state.visible_message_ids().contains(&message_id));
+}
+
+#[test]
+fn trash_undo_keeps_a_non_inbox_message_out_of_inbox() {
+    let mut state = ready_for_search();
+    let message_id = MessageId::gmail(2);
+    let message = state
+        .mailbox
+        .as_mut()
+        .unwrap()
+        .messages
+        .iter_mut()
+        .find(|message| message.id == message_id)
+        .unwrap();
+    message.folder_id = FolderId::AllMail;
+    message.locator.folder_id = FolderId::AllMail;
+    message.locator.mailbox = "[Gmail]/All Mail".into();
+    message.in_inbox = false;
+    state.selected_message_id = Some(message_id.clone());
+    let (forward_request, generation, _, _) = mutation_effect(state.dispatch(Action::MoveToTrash));
+    state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: forward_request,
+        generation,
+        message_id,
+    }));
+    let undo = state.dispatch(Action::UndoMessageOperation);
+    assert!(matches!(
+        undo.effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+            mutation: MessageMutation::RestoreFromTrash {
+                restore_inbox: false,
+                ..
+            },
+            ..
+        })]
+    ));
+}
+
+#[test]
+fn failed_undo_reinstates_the_confirmed_archive_presentation() {
+    let mut state = ready_for_search();
+    state.selected_message_id = Some(MessageId::gmail(2));
+    let (forward_request, generation, message_id, _) =
+        mutation_effect(state.dispatch(Action::Archive));
+    state.dispatch(Action::Worker(WorkerEvent::MutationConfirmed {
+        request_id: forward_request,
+        generation,
+        message_id: message_id.clone(),
+    }));
+    let undo = state.dispatch(Action::UndoMessageOperation);
+    let (undo_request, undo_generation) = match undo.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+                request_id,
+                generation,
+                ..
+            }),
+        ] => (*request_id, *generation),
+        effect => panic!("expected undo request, got {effect:?}"),
+    };
+    assert!(state.visible_message_ids().contains(&message_id));
+    let failed = state.dispatch(Action::Worker(WorkerEvent::MutationFailed {
+        request_id: undo_request,
+        generation: undo_generation,
+        message_id: message_id.clone(),
+        uncertain: false,
+    }));
+    assert_eq!(
+        failed.feedback,
+        Some("Gmail could not undo the message action")
+    );
+    assert!(!state.visible_message_ids().contains(&message_id));
 }
 
 fn load_folder_for_test(state: &mut AppState, id: FolderId, mailbox: &str, subject: &str) {
@@ -720,6 +1199,8 @@ fn reconciliation_after_navigation_never_inserts_an_inbox_row_into_trash() {
         state: Some(ReconciledMessageState {
             unread: true,
             starred: false,
+            in_inbox: true,
+            in_trash: false,
             labels: vec!["Work".into()],
         }),
     }));
@@ -2144,6 +2625,158 @@ fn submitted_search_uses_discovered_all_mail_and_results_stay_ephemeral() {
         }
     );
     assert_eq!(state.mailbox.as_ref().unwrap().messages, authoritative);
+}
+
+#[test]
+fn server_search_message_opens_and_replies_without_current_folder_membership() {
+    let mut state = ready_for_search();
+    finish_draft_restore(&mut state, Vec::new());
+    state.dispatch(Action::SetSearch("from:sender".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    let mut hit = folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Search-only subject")
+        .messages
+        .remove(0);
+    hit.id = MessageId::gmail(99);
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: vec![hit.clone()],
+        truncated: false,
+        skipped_count: 0,
+    }));
+
+    let opened = state.dispatch(Action::SelectMessage(hit.id.clone()));
+    let (body_request, body_generation) = match opened.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::FetchBody {
+                request_id,
+                generation,
+                locator,
+                ..
+            }),
+        ] => {
+            assert_eq!(locator.folder_id, FolderId::AllMail);
+            (*request_id, *generation)
+        }
+        effect => panic!("expected a cache-first body request, got {effect:?}"),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::BodyLoaded {
+        request_id: body_request,
+        generation: body_generation,
+        message_id: hit.id,
+        body: reply_body(),
+        usage: Default::default(),
+        saved: true,
+    }));
+
+    assert!(state.dispatch(Action::BeginReply).feedback.is_none());
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { ref draft } if draft.subject == "Re: Search-only subject"
+    ));
+}
+
+#[test]
+fn server_search_rows_are_mutable_and_optimistic_updates_reach_all_visible_copies() {
+    let mut state = ready_for_search();
+    state.dispatch(Action::SetSearch("from:alice".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    let hit = folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Search hit")
+        .messages
+        .remove(0);
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: vec![hit.clone()],
+        truncated: false,
+        skipped_count: 0,
+    }));
+    state.selected_message_id = Some(hit.id.clone());
+
+    let (_, _, message_id, mutation) = mutation_effect(state.dispatch(Action::ToggleStar));
+    assert_eq!(message_id, hit.id);
+    assert!(matches!(mutation, MessageMutation::SetStarred(true)));
+    assert!(state.snapshot().can_mutate);
+    assert!(state.snapshot().selected_message.unwrap().starred);
+    assert!(matches!(
+        state.server_search,
+        ServerSearchState::Loaded { ref messages, .. } if messages[0].starred
+    ));
+}
+
+#[test]
+fn server_search_loading_clears_stale_selection_and_reader_actions() {
+    let mut state = ready_for_search();
+    let id = MessageId::gmail(1);
+    state.selected_message_id = Some(id.clone());
+    state.reader = ReaderState::Loaded {
+        id,
+        body: reply_body(),
+    };
+    state.dispatch(Action::SetSearch("from:alice".into()));
+    state.dispatch(Action::SubmitServerSearch);
+    assert!(state.selected_message_id().is_none());
+    assert!(matches!(state.snapshot().reader, ReaderState::Closed));
+    assert!(!state.snapshot().can_mutate);
+    assert!(state.dispatch(Action::Archive).effects.is_empty());
+}
+
+#[test]
+fn server_search_from_trash_uses_the_search_hit_not_the_selected_folder_for_eligibility() {
+    let mut state = ready_for_search();
+    load_folder_for_test(&mut state, FolderId::Trash, "[Gmail]/Trash", "Trash only");
+    assert_eq!(state.snapshot().selected_folder_id, FolderId::Trash);
+    state.dispatch(Action::SetSearch("in:anywhere".into()));
+    let submitted = state.dispatch(Action::SubmitServerSearch);
+    let (request_id, generation) = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SendWorker(WorkerCommand::SearchGmail {
+                request_id,
+                generation,
+                ..
+            }) => Some((*request_id, *generation)),
+            _ => None,
+        })
+        .unwrap();
+    let hit = folder_snapshot(FolderId::AllMail, "[Gmail]/All Mail", "Search hit")
+        .messages
+        .remove(0);
+    state.dispatch(Action::Worker(WorkerEvent::SearchLoaded {
+        request_id,
+        generation,
+        messages: vec![hit.clone()],
+        truncated: false,
+        skipped_count: 0,
+    }));
+    state.selected_message_id = Some(hit.id.clone());
+    assert!(state.snapshot().can_archive);
+    assert!(mutation_effect(state.dispatch(Action::Archive)).3 == MessageMutation::Archive);
 }
 
 #[test]

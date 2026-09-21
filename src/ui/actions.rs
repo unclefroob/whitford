@@ -52,6 +52,9 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "archive", |ui| ui.dispatch(Action::Archive));
     add(ui, "mark-read", |ui| ui.dispatch(Action::ToggleRead));
     add(ui, "delete", |ui| ui.dispatch(Action::MoveToTrash));
+    add(ui, "undo-message-operation", |ui| {
+        ui.dispatch(Action::UndoMessageOperation)
+    });
     add(ui, "star", |ui| ui.dispatch(Action::ToggleStar));
     let label = gio::SimpleAction::new("toggle-label", Some(&String::static_variant_type()));
     let weak_ui = ui.downgrade();

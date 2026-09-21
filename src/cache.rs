@@ -21,7 +21,8 @@ pub const ATTACHMENT_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CACHED_FOLDER_VIEWS: usize = 8;
 pub const MAX_SUMMARIES_PER_FOLDER: usize = 500;
 const MAX_CACHE_JSON_BYTES: u64 = 128 * 1024 * 1024;
-const MAILBOX_VERSION: u8 = 3;
+const MAILBOX_VERSION: u8 = 4;
+const PREVIOUS_MAILBOX_VERSION: u8 = 3;
 const BODY_VERSION: u8 = 5;
 const MANIFEST_VERSION: u8 = 3;
 const ACCOUNT_CLEANUP_VERSION: u8 = 1;
@@ -38,6 +39,26 @@ struct StoredMailbox {
     account_email: String,
     folder_catalog: FolderCatalog,
     views: Vec<StoredFolderView>,
+    /// v3 caches deliberately deserialize as uninitialized.  The first successful
+    /// Inbox write then becomes a baseline rather than announcing historic mail.
+    #[serde(default)]
+    inbox_watermark: InboxWatermark,
+}
+
+/// Durable, bounded Inbox delivery baseline.  This is intentionally identities only:
+/// neither subjects nor addresses are needed to decide whether to notify.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct InboxWatermark {
+    initialized: bool,
+    observed_ids: Vec<MessageId>,
+}
+
+/// Result of atomically replacing the Inbox cache and advancing its notification
+/// baseline.  The worker owns turning `new_unread_ids` into a background event.
+#[derive(Clone, Debug)]
+pub struct BackgroundInboxCommit {
+    pub snapshot: MailboxSnapshot,
+    pub new_unread_ids: Vec<MessageId>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -147,6 +168,17 @@ pub fn replace_and_save(
     replace_and_save_at(&cache_root(), account, fresh, limit)
 }
 
+/// Replaces the authoritative Inbox view and advances the durable notification
+/// watermark in the same cache commit.  The first write after a migration is a
+/// baseline, so restoring an old cache can never generate a notification storm.
+pub fn replace_inbox_and_save_with_notification_gate(
+    account: &AccountIdentity,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<BackgroundInboxCommit> {
+    replace_inbox_and_save_with_notification_gate_at(&cache_root(), account, fresh, limit)
+}
+
 pub fn replace_folder_and_save(
     account: &AccountIdentity,
     folder_id: FolderId,
@@ -162,6 +194,17 @@ pub fn persist_confirmed_mutation(
     id: &MessageId,
     mutation: &MessageMutation,
 ) -> io::Result<()> {
+    persist_confirmed_message_mutation(account_email, id, mutation)
+}
+
+/// Applies a confirmed Gmail mutation to every cached folder projection containing the
+/// canonical message ID. This deliberately does not assume that the action originated in
+/// Inbox: Gmail IDs can legitimately appear in several cached views with different locators.
+pub fn persist_confirmed_message_mutation(
+    account_email: &str,
+    id: &MessageId,
+    mutation: &MessageMutation,
+) -> io::Result<()> {
     persist_confirmed_mutation_at(&cache_root(), account_email, id, mutation)
 }
 
@@ -172,19 +215,67 @@ fn persist_confirmed_mutation_at(
     mutation: &MessageMutation,
 ) -> io::Result<()> {
     mutate_stored_mailbox_at(cache, account_email, |view| {
-        if matches!(
-            mutation,
-            MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
-        ) && view.folder_id == FolderId::Inbox
-        {
-            view.messages.retain(|message| &message.id != id);
-        } else if let Some(message) = view.messages.iter_mut().find(|message| &message.id == id) {
-            mutation.apply(message);
+        for message in &mut view.messages {
+            if &message.id == id {
+                match mutation {
+                    MessageMutation::Archive => message.in_inbox = false,
+                    MessageMutation::MoveToTrash { .. } => {
+                        message.in_inbox = false;
+                        message.in_trash = true;
+                    }
+                    MessageMutation::RestoreArchive { .. } => {
+                        message.in_inbox = true;
+                        message.in_trash = false;
+                    }
+                    MessageMutation::RestoreFromTrash { restore_inbox, .. } => {
+                        message.in_inbox = *restore_inbox;
+                        message.in_trash = false;
+                    }
+                    MessageMutation::SetRead(_)
+                    | MessageMutation::SetStarred(_)
+                    | MessageMutation::SetLabel { .. } => {}
+                }
+            }
+        }
+        match mutation {
+            // Archive removes only the Inbox projection. All Mail/label views remain useful
+            // local representations of the same canonical Gmail message.
+            MessageMutation::Archive if view.folder_id == FolderId::Inbox => {
+                view.messages.retain(|message| &message.id != id);
+            }
+            // Gmail MOVE to Trash makes every non-Trash cached projection stale. We cannot
+            // synthesize a new Trash row without an authoritative Trash locator.
+            MessageMutation::MoveToTrash { .. } if view.folder_id != FolderId::Trash => {
+                view.messages.retain(|message| &message.id != id);
+            }
+            // An Undo confirmation carries no authoritative locator/summary with which to
+            // synthesize a previously evicted Inbox or Trash cache row. Leave existing views
+            // intact and let the next folder refresh repopulate them; this never marks an
+            // unconfirmed local Undo as durable.
+            MessageMutation::RestoreArchive { .. } | MessageMutation::RestoreFromTrash { .. } => {}
+            _ => {
+                for message in &mut view.messages {
+                    if &message.id == id {
+                        mutation.apply(message);
+                    }
+                }
+            }
         }
     })
 }
 
 pub fn persist_reconciled_inbox(
+    account_email: &str,
+    id: &MessageId,
+    state: Option<&ReconciledMessageState>,
+) -> io::Result<()> {
+    persist_reconciled_message_state(account_email, id, state)
+}
+
+/// Compatibility state supplied by the current worker is authoritative for Inbox membership.
+/// Attribute updates apply to every cached representation; absence removes only Inbox, not an
+/// unrelated All Mail/label cache row.
+pub fn persist_reconciled_message_state(
     account_email: &str,
     id: &MessageId,
     state: Option<&ReconciledMessageState>,
@@ -201,13 +292,16 @@ fn persist_reconciled_inbox_at(
     mutate_stored_mailbox_at(cache, account_email, |view| {
         if state.is_none() && view.folder_id == FolderId::Inbox {
             view.messages.retain(|message| &message.id != id);
-        } else if let (Some(state), Some(message)) = (
-            state,
-            view.messages.iter_mut().find(|message| &message.id == id),
-        ) {
-            message.unread = state.unread;
-            message.starred = state.starred;
-            message.labels = state.labels.clone();
+        } else if let Some(state) = state {
+            for message in &mut view.messages {
+                if &message.id == id {
+                    message.unread = state.unread;
+                    message.starred = state.starred;
+                    message.in_inbox = state.in_inbox;
+                    message.in_trash = state.in_trash;
+                    message.labels = state.labels.clone();
+                }
+            }
         }
     })
 }
@@ -570,6 +664,63 @@ fn replace_and_save_at(
     replace_folder_and_save_at(cache, account, FolderId::Inbox, fresh, limit, now_unix())
 }
 
+fn replace_inbox_and_save_with_notification_gate_at(
+    cache: &Path,
+    account: &AccountIdentity,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<BackgroundInboxCommit> {
+    validate_limit(limit)?;
+    validate_account_email(&account.email)?;
+    let previous = match read_json::<StoredMailbox>(&mailbox_path(cache)) {
+        Ok(Some(value))
+            if valid_stored_mailbox(&value)
+                && value.account_email.eq_ignore_ascii_case(&account.email) =>
+        {
+            Some(value)
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+        Err(error) => return Err(error),
+    };
+    let observed = previous
+        .as_ref()
+        .filter(|stored| stored.inbox_watermark.initialized)
+        .map(|stored| {
+            stored
+                .inbox_watermark
+                .observed_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let new_unread_ids = fresh
+        .messages
+        .iter()
+        .filter(|message| {
+            message.folder_id == FolderId::Inbox
+                && message.unread
+                && !observed.contains(&message.id)
+        })
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let snapshot = replace_and_save_at(cache, account, fresh, limit)?;
+    // No prior initialized watermark means the just-written authoritative IDs are
+    // a startup/migration baseline, never a source of notifications.
+    Ok(BackgroundInboxCommit {
+        snapshot,
+        new_unread_ids: if previous
+            .as_ref()
+            .is_some_and(|stored| stored.inbox_watermark.initialized)
+        {
+            new_unread_ids
+        } else {
+            Vec::new()
+        },
+    })
+}
+
 fn replace_folder_and_save_at(
     cache: &Path,
     account: &AccountIdentity,
@@ -628,12 +779,24 @@ fn replace_folder_and_save_at(
             account_email: account.email.clone(),
             folder_catalog: fresh.folder_catalog.clone(),
             views: Vec::new(),
+            inbox_watermark: InboxWatermark::default(),
         });
+    stored.version = MAILBOX_VERSION;
     stored.folder_catalog = fresh.folder_catalog.clone();
     stored.views.retain(|view| {
         view.folder_id != folder_id && stored.folder_catalog.find(&view.folder_id).is_some()
     });
     stored.views.push(view);
+    if folder_id == FolderId::Inbox {
+        stored.inbox_watermark = InboxWatermark {
+            initialized: true,
+            observed_ids: fresh
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
+        };
+    }
     stored.views.sort_by(|left, right| {
         right
             .last_accessed_unix
@@ -1018,7 +1181,7 @@ fn folder_key(id: &FolderId) -> String {
 }
 
 fn valid_stored_mailbox(stored: &StoredMailbox) -> bool {
-    if stored.version != MAILBOX_VERSION
+    if !(stored.version == MAILBOX_VERSION || stored.version == PREVIOUS_MAILBOX_VERSION)
         || stored.account_email.trim().is_empty()
         || stored.account_email.len() > 320
         || stored.account_email.chars().any(char::is_control)
@@ -1033,30 +1196,44 @@ fn valid_stored_mailbox(stored: &StoredMailbox) -> bool {
         return false;
     }
     let mut folders = HashSet::new();
-    stored.views.iter().all(|view| {
-        let mut ids = HashSet::new();
-        is_valid_limit(view.requested_limit)
-            && view.messages.len() <= MAX_SUMMARIES_PER_FOLDER
-            && folders.insert(view.folder_id.clone())
-            && stored.folder_catalog.find(&view.folder_id).is_some()
-            && view.messages.iter().all(|message| {
-                message.id.gmail_value().is_some()
-                    && ids.insert(message.id.clone())
-                    && message.labels.len() <= crate::model::MAX_MESSAGE_LABELS
-                    && message.labels.iter().all(|label| {
-                        !label.is_empty()
-                            && label.len() <= crate::model::MAX_FOLDER_MAILBOX_BYTES
-                            && !label.chars().any(char::is_control)
-                    })
-                    && message.folder_id == view.folder_id
-                    && message.locator.folder_id == view.folder_id
-                    && message.locator.is_valid()
-                    && stored
-                        .folder_catalog
-                        .find(&view.folder_id)
-                        .is_some_and(|folder| folder.mailbox == message.locator.mailbox)
-            })
-    })
+    stored.inbox_watermark.observed_ids.len() <= MAX_SUMMARIES_PER_FOLDER
+        && stored
+            .inbox_watermark
+            .observed_ids
+            .iter()
+            .all(|id| id.gmail_value().is_some())
+        && {
+            let mut watermark_ids = HashSet::new();
+            stored
+                .inbox_watermark
+                .observed_ids
+                .iter()
+                .all(|id| watermark_ids.insert(id.clone()))
+        }
+        && stored.views.iter().all(|view| {
+            let mut ids = HashSet::new();
+            is_valid_limit(view.requested_limit)
+                && view.messages.len() <= MAX_SUMMARIES_PER_FOLDER
+                && folders.insert(view.folder_id.clone())
+                && stored.folder_catalog.find(&view.folder_id).is_some()
+                && view.messages.iter().all(|message| {
+                    message.id.gmail_value().is_some()
+                        && ids.insert(message.id.clone())
+                        && message.labels.len() <= crate::model::MAX_MESSAGE_LABELS
+                        && message.labels.iter().all(|label| {
+                            !label.is_empty()
+                                && label.len() <= crate::model::MAX_FOLDER_MAILBOX_BYTES
+                                && !label.chars().any(char::is_control)
+                        })
+                        && message.folder_id == view.folder_id
+                        && message.locator.folder_id == view.folder_id
+                        && message.locator.is_valid()
+                        && stored
+                            .folder_catalog
+                            .find(&view.folder_id)
+                            .is_some_and(|folder| folder.mailbox == message.locator.mailbox)
+                })
+        })
 }
 
 fn snapshot_from_stored(catalog: &FolderCatalog, stored: &StoredFolderView) -> MailboxSnapshot {
@@ -1371,6 +1548,8 @@ mod tests {
             received_at_unix: Some(i64::from(uid)),
             unread: false,
             starred: false,
+            in_inbox: true,
+            in_trash: false,
             labels: Vec::new(),
             attachment_state: AttachmentState::Known(Vec::new()),
             used_fallback: false,
@@ -1840,6 +2019,7 @@ mod tests {
                     last_accessed_unix: 100,
                     messages: fresh.messages,
                 }],
+                inbox_watermark: InboxWatermark::default(),
             },
         )
         .unwrap();
@@ -2094,5 +2274,140 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![MessageId::gmail(2)]
         );
+    }
+
+    #[test]
+    fn confirmed_archive_updates_inbox_without_evicting_all_mail_projection() {
+        let root = TestRoot::new();
+        let catalog = crate::model::FolderCatalog::bounded(vec![
+            crate::model::FolderDescriptor {
+                id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                display_name: "Inbox".into(),
+                kind: crate::model::FolderKind::Inbox,
+            },
+            crate::model::FolderDescriptor {
+                id: FolderId::AllMail,
+                mailbox: "[Gmail]/All Mail".into(),
+                display_name: "All Mail".into(),
+                kind: crate::model::FolderKind::AllMail,
+            },
+        ]);
+        let mut inbox = snapshot(&[1]);
+        inbox.folder_catalog = catalog.clone();
+        replace_folder_and_save_at(&root.0, &account(), FolderId::Inbox, inbox, 50, 1).unwrap();
+
+        let mut all_mail = snapshot(&[1]);
+        all_mail.folder_catalog = catalog;
+        all_mail.messages[0].folder_id = FolderId::AllMail;
+        all_mail.messages[0].locator.folder_id = FolderId::AllMail;
+        all_mail.messages[0].locator.mailbox = "[Gmail]/All Mail".into();
+        replace_folder_and_save_at(&root.0, &account(), FolderId::AllMail, all_mail, 50, 2)
+            .unwrap();
+
+        persist_confirmed_mutation_at(
+            &root.0,
+            EMAIL,
+            &MessageId::gmail(1),
+            &MessageMutation::Archive,
+        )
+        .unwrap();
+        assert!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Inbox, 50, 3)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            load_folder_from(&root.0, EMAIL, &FolderId::AllMail, 50, 3)
+                .unwrap()
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>(),
+            vec![MessageId::gmail(1)]
+        );
+    }
+
+    #[test]
+    fn notification_gate_baselines_then_emits_only_new_unread_ids() {
+        let root = TestRoot::new();
+        let mut initial = snapshot(&[1, 2]);
+        initial.messages[0].unread = true;
+        let first =
+            replace_inbox_and_save_with_notification_gate_at(&root.0, &account(), initial, 50)
+                .unwrap();
+        assert!(first.new_unread_ids.is_empty());
+
+        let mut next = snapshot(&[1, 2, 3, 4]);
+        next.messages
+            .iter_mut()
+            .find(|m| m.id == MessageId::gmail(3))
+            .unwrap()
+            .unread = true;
+        // A newly delivered, already-read message must not be announced.
+        next.messages
+            .iter_mut()
+            .find(|m| m.id == MessageId::gmail(4))
+            .unwrap()
+            .unread = false;
+        let commit =
+            replace_inbox_and_save_with_notification_gate_at(&root.0, &account(), next, 50)
+                .unwrap();
+        assert_eq!(commit.new_unread_ids, vec![MessageId::gmail(3)]);
+
+        // A known ID toggling unread is not a new delivery.
+        let mut reread = commit.snapshot;
+        reread
+            .messages
+            .iter_mut()
+            .find(|m| m.id == MessageId::gmail(1))
+            .unwrap()
+            .unread = true;
+        assert!(
+            replace_inbox_and_save_with_notification_gate_at(&root.0, &account(), reread, 50,)
+                .unwrap()
+                .new_unread_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v3_missing_watermark_migrates_as_a_silent_baseline() {
+        let root = TestRoot::new();
+        let fresh = snapshot(&[1]);
+        write_private_json(
+            &mailbox_path(&root.0),
+            &serde_json::json!({
+                "version": PREVIOUS_MAILBOX_VERSION,
+                "account_email": EMAIL,
+                "folder_catalog": fresh.folder_catalog,
+                "views": [{
+                    "folder_id": "Inbox", "completed_at_unix": 100,
+                    "requested_limit": 50, "skipped_count": 0, "last_accessed_unix": 100,
+                    "messages": fresh.messages,
+                }],
+            }),
+        )
+        .unwrap();
+        let mut incoming = snapshot(&[1, 2]);
+        incoming
+            .messages
+            .iter_mut()
+            .for_each(|message| message.unread = true);
+        assert!(
+            replace_inbox_and_save_with_notification_gate_at(&root.0, &account(), incoming, 50,)
+                .unwrap()
+                .new_unread_ids
+                .is_empty()
+        );
+        let stored = read_json::<StoredMailbox>(&mailbox_path(&root.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.version, MAILBOX_VERSION);
+        assert!(stored.inbox_watermark.initialized);
+        assert_eq!(stored.inbox_watermark.observed_ids.len(), 2);
     }
 }

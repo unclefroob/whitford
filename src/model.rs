@@ -247,6 +247,13 @@ pub struct MessageSummary {
     pub received_at_unix: Option<i64>,
     pub unread: bool,
     pub starred: bool,
+    /// Gmail system-label membership, retained separately from user labels.
+    /// These flags are authoritative when a message was fetched or reconciled
+    /// through a virtual folder such as All Mail or Starred.
+    #[serde(default)]
+    pub in_inbox: bool,
+    #[serde(default)]
+    pub in_trash: bool,
     #[serde(default)]
     pub labels: Vec<String>,
     pub attachment_state: AttachmentState,
@@ -266,8 +273,29 @@ pub enum MessageMutation {
     SetRead(bool),
     SetStarred(bool),
     Archive,
-    MoveToTrash { mailbox: String },
-    SetLabel { mailbox: String, applied: bool },
+    MoveToTrash {
+        mailbox: String,
+    },
+    /// The compensating operation for Archive. `inbox_mailbox` is a
+    /// catalog-derived guard, not an IMAP path to synthesize.
+    RestoreArchive {
+        inbox_mailbox: String,
+    },
+    /// The compensating operation for moving a message to Trash. Gmail labels
+    /// are restored before `\\Trash` is removed so the message cannot vanish
+    /// from every visible IMAP mailbox mid-operation.
+    RestoreFromTrash {
+        inbox_mailbox: String,
+        trash_mailbox: String,
+        /// Captured before the forward trash action. A Sent/All Mail message
+        /// must not acquire Inbox membership merely because it is undone.
+        restore_inbox: bool,
+        labels: Vec<String>,
+    },
+    SetLabel {
+        mailbox: String,
+        applied: bool,
+    },
 }
 
 impl MessageMutation {
@@ -275,7 +303,10 @@ impl MessageMutation {
         match self {
             Self::SetRead(_) => MutationDimension::Read,
             Self::SetStarred(_) => MutationDimension::Starred,
-            Self::Archive | Self::MoveToTrash { .. } => MutationDimension::Inbox,
+            Self::Archive
+            | Self::MoveToTrash { .. }
+            | Self::RestoreArchive { .. }
+            | Self::RestoreFromTrash { .. } => MutationDimension::Inbox,
             Self::SetLabel { mailbox, .. } => MutationDimension::Label(mailbox.clone()),
         }
     }
@@ -293,7 +324,10 @@ impl MessageMutation {
                     message.labels.truncate(MAX_MESSAGE_LABELS);
                 }
             }
-            Self::Archive | Self::MoveToTrash { .. } => {}
+            Self::Archive
+            | Self::MoveToTrash { .. }
+            | Self::RestoreArchive { .. }
+            | Self::RestoreFromTrash { .. } => {}
         }
     }
 }
@@ -302,6 +336,8 @@ impl MessageMutation {
 pub struct ReconciledMessageState {
     pub unread: bool,
     pub starred: bool,
+    pub in_inbox: bool,
+    pub in_trash: bool,
     pub labels: Vec<String>,
 }
 
@@ -409,6 +445,8 @@ pub fn fixture_messages() -> Vec<MessageSummary> {
             received_at_unix: Some(1_700_000_000 + i64::from(uid)),
             unread,
             starred: false,
+            in_inbox: true,
+            in_trash: false,
             labels: Vec::new(),
             attachment_state: AttachmentState::Known(if attachment {
                 vec![Attachment {
@@ -481,5 +519,20 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn restore_mutations_share_the_serialized_inbox_dimension() {
+        let archive = MessageMutation::RestoreArchive {
+            inbox_mailbox: "INBOX".into(),
+        };
+        let trash = MessageMutation::RestoreFromTrash {
+            inbox_mailbox: "INBOX".into(),
+            trash_mailbox: "Trash".into(),
+            restore_inbox: true,
+            labels: vec!["Receipts".into()],
+        };
+        assert_eq!(archive.dimension(), MutationDimension::Inbox);
+        assert_eq!(trash.dimension(), MutationDimension::Inbox);
     }
 }
