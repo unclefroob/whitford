@@ -3,9 +3,9 @@ use crate::{
     composer::{ComposeDraft, DraftAttachment},
     config, drafts, gmail, message,
     model::{
-        AccountId, AccountIdentity, AccountRecord, CacheUsage, FolderCatalog, FolderDescriptor,
-        FolderId, FolderKind, MailProvider, MailboxSnapshot, MessageBody, MessageId,
-        MessageLocator, MessageMutation, ReconciledMessageState, SyncMetadata,
+        AccountId, AccountIdentity, AccountMessageId, AccountRecord, CacheUsage, FolderCatalog,
+        FolderDescriptor, FolderId, FolderKind, MailProvider, MailboxSnapshot, MessageBody,
+        MessageId, MessageLocator, MessageMutation, ReconciledMessageState, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -449,6 +449,18 @@ pub enum WorkerCommand {
     AddAccount {
         id: OperationId,
     },
+    /// Refresh one account using only its scoped credential and cache.
+    /// This deliberately does not replace the legacy singleton runtime.
+    ReconnectAccount {
+        id: OperationId,
+        account_id: AccountId,
+    },
+    /// Remove one account's registry row, scoped cache and scoped secret.
+    /// The operation never targets the legacy singleton credential.
+    RemoveAccount {
+        id: OperationId,
+        account_id: AccountId,
+    },
     Refresh {
         id: OperationId,
     },
@@ -502,6 +514,16 @@ pub enum WorkerCommand {
         message_id: MessageId,
         locator: MessageLocator,
     },
+    /// Account-aware reader request.  This intentionally carries the opaque
+    /// account selector together with the Gmail message ID; a message ID alone
+    /// is not a cross-account capability.
+    FetchAccountBody {
+        request_id: BodyRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        account_email: String,
+        locator: MessageLocator,
+    },
     DownloadAttachment {
         job_id: AttachmentJobId,
         generation: u64,
@@ -522,6 +544,13 @@ pub enum WorkerCommand {
     SendMessage {
         request_id: SendRequestId,
         generation: u64,
+        submission: Box<ComposeSubmission>,
+    },
+    SendAccountMessage {
+        request_id: SendRequestId,
+        generation: u64,
+        account_id: AccountId,
+        account_email: String,
         submission: Box<ComposeSubmission>,
     },
     LoadDrafts {
@@ -588,6 +617,15 @@ pub enum WorkerCommand {
         catalog: FolderCatalog,
         mutation: MessageMutation,
     },
+    MutateAccountMessage {
+        request_id: MutationRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        account_email: String,
+        locator: MessageLocator,
+        catalog: FolderCatalog,
+        mutation: MessageMutation,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -596,6 +634,16 @@ impl fmt::Debug for WorkerCommand {
             Self::Restore { id } => f.debug_tuple("Restore").field(id).finish(),
             Self::Connect { id } => f.debug_tuple("Connect").field(id).finish(),
             Self::AddAccount { id } => f.debug_tuple("AddAccount").field(id).finish(),
+            Self::ReconnectAccount { id, account_id } => f
+                .debug_struct("ReconnectAccount")
+                .field("id", id)
+                .field("account_id", account_id)
+                .finish(),
+            Self::RemoveAccount { id, account_id } => f
+                .debug_struct("RemoveAccount")
+                .field("id", id)
+                .field("account_id", account_id)
+                .finish(),
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
             Self::BackgroundSync { request_id, .. } => f
                 .debug_struct("BackgroundSync")
@@ -659,6 +707,17 @@ impl fmt::Debug for WorkerCommand {
                 .field("request_id", request_id)
                 .field("generation", generation)
                 .finish(),
+            Self::FetchAccountBody {
+                request_id,
+                generation,
+                message,
+                ..
+            } => f
+                .debug_struct("FetchAccountBody")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", &message.account_id)
+                .finish(),
             Self::DownloadAttachment {
                 job_id,
                 generation,
@@ -697,6 +756,18 @@ impl fmt::Debug for WorkerCommand {
                 .debug_struct("SendMessage")
                 .field("request_id", request_id)
                 .field("generation", generation)
+                .field("content", &"[REDACTED]")
+                .finish(),
+            Self::SendAccountMessage {
+                request_id,
+                generation,
+                account_id,
+                ..
+            } => f
+                .debug_struct("SendAccountMessage")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
                 .field("content", &"[REDACTED]")
                 .finish(),
             Self::LoadDrafts { operation_id, .. } => f
@@ -768,12 +839,53 @@ impl fmt::Debug for WorkerCommand {
                     },
                 )
                 .finish(),
+            Self::MutateAccountMessage {
+                request_id,
+                generation,
+                message,
+                mutation,
+                ..
+            } => f
+                .debug_struct("MutateAccountMessage")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", &message.account_id)
+                .field("kind", &mutation.dimension())
+                .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
 }
 
 pub enum WorkerEvent {
+    /// The durable multi-account registry and each account's locally cached
+    /// Inbox projection, read during startup without opening any account's
+    /// keyring entry or refreshing its token.  A missing or unreadable cache
+    /// is represented by `None`; the registry account is still retained.
+    AccountMailboxesRestored {
+        id: OperationId,
+        accounts: Vec<RestoredAccountMailbox>,
+    },
+    /// A scoped account refresh completed. The snapshot is written only in
+    /// that account's namespace before this event is emitted.
+    AccountSynced {
+        id: OperationId,
+        account_id: AccountId,
+        account: AccountIdentity,
+        snapshot: MailboxSnapshot,
+    },
+    /// All durable artifacts for this account were removed. Other registry
+    /// rows, cache namespaces and secrets are intentionally untouched.
+    AccountRemoved {
+        id: OperationId,
+        account_id: AccountId,
+    },
+    /// A scoped lifecycle operation failed without changing another account.
+    AccountOperationFailed {
+        id: OperationId,
+        account_id: AccountId,
+        failure: ServiceFailure,
+    },
     /// The durable account-registry identity for the legacy singleton session.
     ///
     /// This is deliberately a bridge, not a second OAuth path: the current
@@ -913,6 +1025,18 @@ pub enum WorkerEvent {
         message_id: MessageId,
         failure: BodyFailure,
     },
+    AccountBodyLoaded {
+        request_id: BodyRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        body: Arc<MessageBody>,
+    },
+    AccountBodyFailed {
+        request_id: BodyRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        failure: BodyFailure,
+    },
     AttachmentProgress {
         job_id: AttachmentJobId,
         generation: u64,
@@ -954,6 +1078,17 @@ pub enum WorkerEvent {
     MessageSendFailed {
         request_id: SendRequestId,
         generation: u64,
+        failure: SendFailure,
+    },
+    AccountMessageSent {
+        request_id: SendRequestId,
+        generation: u64,
+        account_id: AccountId,
+    },
+    AccountMessageSendFailed {
+        request_id: SendRequestId,
+        generation: u64,
+        account_id: AccountId,
         failure: SendFailure,
     },
     DraftsLoaded {
@@ -1021,10 +1156,67 @@ pub enum WorkerEvent {
         message_id: MessageId,
         uncertain: bool,
     },
+    AccountMutationConfirmed {
+        request_id: MutationRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        mutation: MessageMutation,
+    },
+    AccountMutationReconciled {
+        request_id: MutationRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        state: Option<ReconciledMessageState>,
+    },
+    AccountMutationFailed {
+        request_id: MutationRequestId,
+        generation: u64,
+        message: AccountMessageId,
+        uncertain: bool,
+    },
+}
+
+/// One account restored from the durable registry.  The identity always came
+/// from that registry; cache identity is only used as a consistency check.
+pub struct RestoredAccountMailbox {
+    pub account_id: AccountId,
+    pub account: AccountIdentity,
+    pub snapshot: Option<MailboxSnapshot>,
 }
 impl fmt::Debug for WorkerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AccountMailboxesRestored { id, accounts } => f
+                .debug_struct("AccountMailboxesRestored")
+                .field("id", id)
+                .field("count", &accounts.len())
+                .finish(),
+            Self::AccountSynced {
+                id,
+                account_id,
+                snapshot,
+                ..
+            } => f
+                .debug_struct("AccountSynced")
+                .field("id", id)
+                .field("account_id", account_id)
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
+            Self::AccountRemoved { id, account_id } => f
+                .debug_struct("AccountRemoved")
+                .field("id", id)
+                .field("account_id", account_id)
+                .finish(),
+            Self::AccountOperationFailed {
+                id,
+                account_id,
+                failure,
+            } => f
+                .debug_struct("AccountOperationFailed")
+                .field("id", id)
+                .field("account_id", account_id)
+                .field("failure", failure)
+                .finish(),
             Self::LegacyAccountRegistered { id, account_id, .. } => f
                 .debug_struct("LegacyAccountRegistered")
                 .field("id", id)
@@ -1193,6 +1385,29 @@ impl fmt::Debug for WorkerEvent {
                 .field("generation", generation)
                 .field("failure", failure)
                 .finish(),
+            Self::AccountBodyLoaded {
+                request_id,
+                generation,
+                message,
+                ..
+            } => f
+                .debug_struct("AccountBodyLoaded")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", &message.account_id)
+                .finish(),
+            Self::AccountBodyFailed {
+                request_id,
+                generation,
+                message,
+                failure,
+            } => f
+                .debug_struct("AccountBodyFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", &message.account_id)
+                .field("failure", failure)
+                .finish(),
             Self::AttachmentProgress {
                 job_id,
                 generation,
@@ -1273,6 +1488,28 @@ impl fmt::Debug for WorkerEvent {
                 .field("generation", generation)
                 .field("failure", failure)
                 .finish(),
+            Self::AccountMessageSent {
+                request_id,
+                generation,
+                account_id,
+            } => f
+                .debug_struct("AccountMessageSent")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
+                .finish(),
+            Self::AccountMessageSendFailed {
+                request_id,
+                generation,
+                account_id,
+                failure,
+            } => f
+                .debug_struct("AccountMessageSendFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
+                .field("failure", failure)
+                .finish(),
             Self::DraftsLoaded {
                 operation_id,
                 drafts,
@@ -1336,6 +1573,37 @@ impl fmt::Debug for WorkerEvent {
             } => f
                 .debug_struct("MutationFailed")
                 .field("request_id", request_id)
+                .field("uncertain", uncertain)
+                .finish(),
+            Self::AccountMutationConfirmed {
+                request_id,
+                message,
+                ..
+            } => f
+                .debug_struct("AccountMutationConfirmed")
+                .field("request_id", request_id)
+                .field("account_id", &message.account_id)
+                .finish(),
+            Self::AccountMutationReconciled {
+                request_id,
+                message,
+                state,
+                ..
+            } => f
+                .debug_struct("AccountMutationReconciled")
+                .field("request_id", request_id)
+                .field("account_id", &message.account_id)
+                .field("in_inbox", &state.is_some())
+                .finish(),
+            Self::AccountMutationFailed {
+                request_id,
+                message,
+                uncertain,
+                ..
+            } => f
+                .debug_struct("AccountMutationFailed")
+                .field("request_id", request_id)
+                .field("account_id", &message.account_id)
                 .field("uncertain", uncertain)
                 .finish(),
         }
@@ -1407,6 +1675,10 @@ async fn controller(
     // an `Active` lifecycle task because replacing/cleaning singleton auth
     // would make Google redirect to a listener that has just been aborted.
     let mut add_account_task: Option<(OperationId, JoinHandle<()>)> = None;
+    // Scoped account maintenance is independent from the legacy lifecycle
+    // slot. A reconnect for account B must not abort account A's foreground
+    // session, and one account can only have one such operation at a time.
+    let mut account_tasks = HashMap::<AccountId, (OperationId, JoinHandle<()>)>::new();
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
     let mut folder_task: Option<JoinHandle<()>> = None;
@@ -1483,6 +1755,10 @@ async fn controller(
                 let _ = task.await;
             }
             if let Some((_, task)) = add_account_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            for (_, (_, task)) in account_tasks.drain() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1796,6 +2072,68 @@ async fn controller(
             }
             continue;
         }
+        if let WorkerCommand::MutateAccountMessage {
+            request_id,
+            generation,
+            message,
+            account_email,
+            locator,
+            catalog,
+            mutation,
+        } = command
+        {
+            let tx = events.clone();
+            tokio::spawn(async move {
+                let outcome = match scoped_access_token(&message.account_id, &account_email).await {
+                    Ok(token) => {
+                        gmail::mutate_message(
+                            &account_email,
+                            token.as_str(),
+                            &message.message_id,
+                            &locator,
+                            &catalog,
+                            &mutation,
+                        )
+                        .await
+                    }
+                    Err(_) => gmail::MutationResult::DefiniteFailure(
+                        gmail::GmailError::AuthenticationFailed,
+                    ),
+                };
+                let event = match outcome {
+                    gmail::MutationResult::Confirmed => WorkerEvent::AccountMutationConfirmed {
+                        request_id,
+                        generation,
+                        message,
+                        mutation,
+                    },
+                    gmail::MutationResult::Reconciled(state) => {
+                        WorkerEvent::AccountMutationReconciled {
+                            request_id,
+                            generation,
+                            message,
+                            state,
+                        }
+                    }
+                    gmail::MutationResult::DefiniteFailure(_) => {
+                        WorkerEvent::AccountMutationFailed {
+                            request_id,
+                            generation,
+                            message,
+                            uncertain: false,
+                        }
+                    }
+                    gmail::MutationResult::Uncertain => WorkerEvent::AccountMutationFailed {
+                        request_id,
+                        generation,
+                        message,
+                        uncertain: true,
+                    },
+                };
+                let _ = tx.send(event);
+            });
+            continue;
+        }
         if matches!(
             command,
             WorkerCommand::LoadDrafts { .. }
@@ -1996,6 +2334,53 @@ async fn controller(
             }));
             continue;
         }
+        if let WorkerCommand::SendAccountMessage {
+            request_id,
+            generation,
+            account_id,
+            account_email,
+            submission,
+        } = command
+        {
+            let tx = events.clone();
+            tokio::spawn(async move {
+                let event_account_id = account_id.clone();
+                let result = guard_smtp_send(async move {
+                    let token = scoped_access_token(&account_id, &account_email)
+                        .await
+                        .map_err(|_| smtp::SmtpError::Authentication)?;
+                    let draft = submission.draft;
+                    // Do not trust a draft's historical display address to choose
+                    // credentials. The scoped account is the authority; this
+                    // check prevents an old draft being sent from another inbox.
+                    if !draft.account_email.eq_ignore_ascii_case(&account_email) {
+                        return Err(smtp::SmtpError::Authentication);
+                    }
+                    let submission =
+                        tokio::task::spawn_blocking(move || materialize_submission(draft))
+                            .await
+                            .map_err(|_| smtp::SmtpError::Build)??;
+                    let message = smtp::build_message(&submission)?;
+                    smtp::send_message(&account_email, token.as_str(), message).await
+                })
+                .await;
+                let event = match result {
+                    Ok(()) => WorkerEvent::AccountMessageSent {
+                        request_id,
+                        generation,
+                        account_id: event_account_id,
+                    },
+                    Err(error) => WorkerEvent::AccountMessageSendFailed {
+                        request_id,
+                        generation,
+                        account_id: event_account_id,
+                        failure: map_send_failure(error),
+                    },
+                };
+                let _ = tx.send(event);
+            });
+            continue;
+        }
         if let WorkerCommand::FetchBody {
             request_id,
             generation,
@@ -2054,6 +2439,50 @@ async fn controller(
                     );
                 }
             }));
+            continue;
+        }
+        if let WorkerCommand::FetchAccountBody {
+            request_id,
+            generation,
+            message,
+            account_email,
+            locator,
+        } = command
+        {
+            let tx = events.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    if message.message_id.gmail_value().is_none() || !locator.is_valid() {
+                        return Err(BodyFailure::Protocol);
+                    }
+                    let token = scoped_access_token(&message.account_id, &account_email).await?;
+                    let raw = gmail::fetch_body(
+                        &account_email,
+                        token.as_str(),
+                        &message.message_id,
+                        &locator,
+                    )
+                    .await
+                    .map_err(map_body_failure)?;
+                    Ok::<_, BodyFailure>(Arc::new(message::map_body(raw)))
+                }
+                .await;
+                let event = match result {
+                    Ok(body) => WorkerEvent::AccountBodyLoaded {
+                        request_id,
+                        generation,
+                        message,
+                        body,
+                    },
+                    Err(failure) => WorkerEvent::AccountBodyFailed {
+                        request_id,
+                        generation,
+                        message,
+                        failure,
+                    },
+                };
+                let _ = tx.send(event);
+            });
             continue;
         }
         if let WorkerCommand::ClearBodyCache {
@@ -2236,6 +2665,59 @@ async fn controller(
             add_account_task = Some((id, task));
             continue;
         }
+        if let WorkerCommand::ReconnectAccount { id, account_id } = command {
+            if let Some((active_id, task)) = account_tasks.remove(&account_id) {
+                if task.is_finished() {
+                    let _ = task.await;
+                } else {
+                    account_tasks.insert(account_id.clone(), (active_id, task));
+                    let _ = events.send(WorkerEvent::AccountOperationFailed {
+                        id,
+                        account_id,
+                        failure: failure(FailureKind::WorkerUnavailable, true, true),
+                    });
+                    continue;
+                }
+            }
+            let tx = events.clone();
+            let cache_io = cache_io.clone();
+            let task_account_id = account_id.clone();
+            let task = tokio::spawn(async move {
+                if let Err(failure) =
+                    reconnect_account(id, task_account_id.clone(), &tx, &cache_io).await
+                {
+                    let _ = tx.send(WorkerEvent::AccountOperationFailed {
+                        id,
+                        account_id: task_account_id,
+                        failure,
+                    });
+                }
+            });
+            account_tasks.insert(account_id, (id, task));
+            continue;
+        }
+        if let WorkerCommand::RemoveAccount { id, account_id } = command {
+            if let Some((_, task)) = account_tasks.remove(&account_id) {
+                task.abort();
+                let _ = task.await;
+            }
+            let tx = events.clone();
+            let cache_io = cache_io.clone();
+            let task_account_id = account_id.clone();
+            let task = tokio::spawn(async move {
+                if let Err(failure) =
+                    remove_account(id, task_account_id.clone(), &tx, &cache_io).await
+                {
+                    let _ = tx.send(WorkerEvent::AccountOperationFailed {
+                        id,
+                        account_id: task_account_id,
+                        failure,
+                    });
+                }
+            });
+            account_tasks.insert(account_id, (id, task));
+            continue;
+        }
         let disconnecting = matches!(command, WorkerCommand::Disconnect { .. });
         let cleanup_failed = if let Some(current) = active.take() {
             let Active { task, cleanup, .. } = current;
@@ -2342,6 +2824,9 @@ async fn controller(
                 })
             }
             WorkerCommand::AddAccount { .. } => unreachable!("handled above"),
+            WorkerCommand::ReconnectAccount { .. } | WorkerCommand::RemoveAccount { .. } => {
+                unreachable!("handled above")
+            }
             WorkerCommand::Restore { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
@@ -2386,10 +2871,12 @@ async fn controller(
             | WorkerCommand::SearchGmail { .. }
             | WorkerCommand::CancelSearch { .. }
             | WorkerCommand::FetchBody { .. }
+            | WorkerCommand::FetchAccountBody { .. }
             | WorkerCommand::DownloadAttachment { .. }
             | WorkerCommand::CancelAttachment { .. }
             | WorkerCommand::ClearBodyCache { .. }
             | WorkerCommand::SendMessage { .. }
+            | WorkerCommand::SendAccountMessage { .. }
             | WorkerCommand::LoadDrafts { .. }
             | WorkerCommand::SaveDraft { .. }
             | WorkerCommand::DeleteDraft { .. }
@@ -2399,6 +2886,7 @@ async fn controller(
             | WorkerCommand::SaveSignature { .. }
             | WorkerCommand::MutateMessage { .. }
             | WorkerCommand::MutateMessageInCatalog { .. }
+            | WorkerCommand::MutateAccountMessage { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
@@ -3135,6 +3623,8 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         WorkerCommand::Restore { id }
         | WorkerCommand::Connect { id }
         | WorkerCommand::AddAccount { id }
+        | WorkerCommand::ReconnectAccount { id, .. }
+        | WorkerCommand::RemoveAccount { id, .. }
         | WorkerCommand::Refresh { id }
         | WorkerCommand::Disconnect { id, .. }
         | WorkerCommand::Cancel { id } => Some(*id),
@@ -3145,10 +3635,12 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::SearchGmail { .. }
         | WorkerCommand::CancelSearch { .. }
         | WorkerCommand::FetchBody { .. }
+        | WorkerCommand::FetchAccountBody { .. }
         | WorkerCommand::DownloadAttachment { .. }
         | WorkerCommand::CancelAttachment { .. }
         | WorkerCommand::ClearBodyCache { .. }
         | WorkerCommand::SendMessage { .. }
+        | WorkerCommand::SendAccountMessage { .. }
         | WorkerCommand::LoadDrafts { .. }
         | WorkerCommand::SaveDraft { .. }
         | WorkerCommand::DeleteDraft { .. }
@@ -3158,6 +3650,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::SaveSignature { .. }
         | WorkerCommand::MutateMessage { .. }
         | WorkerCommand::MutateMessageInCatalog { .. }
+        | WorkerCommand::MutateAccountMessage { .. }
         | WorkerCommand::Shutdown => None,
     }
 }
@@ -3460,6 +3953,165 @@ async fn add_account(
     Ok(())
 }
 
+/// Refreshes exactly one durable account.  The registry supplies the identity
+/// and the opaque ID selects both the Secret Service item and cache namespace;
+/// no legacy credential or cache path is read or written here.
+async fn reconnect_account(
+    id: OperationId,
+    account_id: AccountId,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cache_io: &Arc<Mutex<()>>,
+) -> Result<(), ServiceFailure> {
+    let scoped_id = account_id.clone();
+    let record = cache_blocking(cache_io.clone(), move || {
+        cache::load_account_registry()?
+            .get(&scoped_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "account is not registered")
+            })
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?
+    .map_err(|_| failure(FailureKind::AuthorizationExpired, false, true))?;
+
+    emit_phase(tx, id, WorkerPhase::OpeningKeyring);
+    let refresh_token = timeout(KEYRING_TIMEOUT, secrets::load_for_account(&account_id))
+        .await
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+        .ok_or_else(|| failure(FailureKind::AuthorizationExpired, false, true))?;
+    emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
+    let config = config::load().map_err(|error| map_config(error, true))?;
+    let client = oauth::http_client().map_err(map_oauth)?;
+    emit_phase(tx, id, WorkerPhase::RefreshingToken);
+    let grant = oauth::refresh(&config, refresh_token.expose(), &client)
+        .await
+        .map_err(map_oauth)?;
+    emit_phase(tx, id, WorkerPhase::VerifyingIdentity);
+    let identity = oauth::fetch_identity(&grant.access_token, &client)
+        .await
+        .map_err(map_oauth)?;
+    if identity.provider != record.identity.provider
+        || !identity.email.eq_ignore_ascii_case(&record.identity.email)
+    {
+        return Err(failure(FailureKind::IdentityInvalid, false, true));
+    }
+    if let Some(replacement) = grant.refresh_token.as_ref() {
+        let replacement = RefreshToken::new(replacement.expose().to_owned())
+            .map_err(|_| failure(FailureKind::CredentialSaveFailed, true, true))?;
+        if !matches!(
+            timeout(
+                KEYRING_TIMEOUT,
+                secrets::replace_for_account(&account_id, &replacement)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            return Err(failure(FailureKind::CredentialSaveFailed, true, true));
+        }
+    }
+    let requested_limit = cache_blocking(cache_io.clone(), cache::load_limit)
+        .await
+        .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
+    emit_phase(tx, id, WorkerPhase::ConnectingImap);
+    let fetched = gmail::fetch_inbox(
+        &identity.email,
+        grant.access_token.expose(),
+        requested_limit,
+    )
+    .await
+    .map_err(map_gmail)?;
+    emit_phase(tx, id, WorkerPhase::FetchingInbox);
+    let cache_account_id = account_id.clone();
+    let cache_identity = identity.clone();
+    let snapshot = cache_blocking(cache_io.clone(), move || {
+        let (messages, fallback_count) = message::map_summaries(fetched.records);
+        cache::replace_and_save_for_account(
+            &cache_account_id,
+            &cache_identity,
+            MailboxSnapshot {
+                folder_catalog: fetched.folder_catalog,
+                metadata: SyncMetadata {
+                    completed_at: SystemTime::now(),
+                    requested_limit,
+                    loaded_count: messages.len(),
+                    fallback_count,
+                    skipped_count: fetched.skipped_count,
+                },
+                messages,
+            },
+            requested_limit,
+        )
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
+    let _ = tx.send(WorkerEvent::AccountSynced {
+        id,
+        account_id,
+        account: identity,
+        snapshot,
+    });
+    Ok(())
+}
+
+/// Delete durable account artifacts in an order that leaves the registry row
+/// intact when cleanup fails. Every filesystem/keyring call is scoped by the
+/// opaque ID, so a failed or successful removal cannot affect another account.
+async fn remove_account(
+    id: OperationId,
+    account_id: AccountId,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cache_io: &Arc<Mutex<()>>,
+) -> Result<(), ServiceFailure> {
+    // A registry row backed only by the old singleton secret is retained. Its
+    // removal belongs to the existing Disconnect flow; deleting it here would
+    // make it reappear on the next legacy restore.
+    match timeout(KEYRING_TIMEOUT, secrets::load_for_account(&account_id))
+        .await
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+    {
+        Some(_) => {}
+        None => return Err(failure(FailureKind::AuthorizationExpired, false, true)),
+    }
+    emit_phase(tx, id, WorkerPhase::Disconnecting);
+    let cache_account_id = account_id.clone();
+    cache_blocking(cache_io.clone(), move || {
+        cache::clear_account_cache(&cache_account_id)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
+    if !matches!(
+        timeout(KEYRING_TIMEOUT, secrets::delete_for_account(&account_id)).await,
+        Ok(Ok(()))
+    ) {
+        return Err(failure(FailureKind::DisconnectFailed, true, true));
+    }
+    let registry_account_id = account_id.clone();
+    cache_blocking(cache_io.clone(), move || {
+        let mut registry = cache::load_account_registry()?;
+        let before = registry.accounts.len();
+        registry
+            .accounts
+            .retain(|record| record.id != registry_account_id);
+        if registry.accounts.len() == before {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "account is not registered",
+            ));
+        }
+        cache::save_account_registry(&registry)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
+    let _ = tx.send(WorkerEvent::AccountRemoved { id, account_id });
+    Ok(())
+}
+
 fn callback_success_header() -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3516,6 +4168,13 @@ async fn restore_or_refresh(
     auth: &Arc<Mutex<Option<RuntimeAuth>>>,
     cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
+    // The account-aware projection is intentionally restored before touching
+    // the legacy keyring.  Secondary accounts have scoped credentials, and
+    // restoring their cached Inbox must not require a token refresh for each
+    // one (or let a missing legacy token hide their local mail).
+    if restore {
+        restore_account_mailboxes(id, tx, cache_io).await;
+    }
     emit_phase(tx, id, WorkerPhase::OpeningKeyring);
     let Some(token) = timeout(KEYRING_TIMEOUT, secrets::load())
         .await
@@ -3621,6 +4280,61 @@ async fn restore_or_refresh(
         token_obtained_at: Instant::now(),
     });
     sync(id, tx, account, grant.access_token.expose(), cache_io).await
+}
+
+async fn restore_account_mailboxes(
+    id: OperationId,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cache_io: &Arc<Mutex<()>>,
+) {
+    let restored = cache_blocking(cache_io.clone(), || {
+        let registry = cache::load_account_registry()?;
+        let limit = cache::load_limit();
+        Ok::<_, std::io::Error>(restore_account_mailbox_records(
+            registry.accounts,
+            limit,
+            cache::load_latest_for_account,
+        ))
+    })
+    .await;
+    if let Ok(Ok(accounts)) = restored {
+        let _ = tx.send(WorkerEvent::AccountMailboxesRestored { id, accounts });
+    }
+}
+
+/// Restore every durable registry row even when its scoped cache is absent,
+/// corrupted, or belongs to a different identity.  The latter cache is never
+/// projected across account boundaries, but the registry row remains visible
+/// so a transient cache problem cannot silently remove an account.
+fn restore_account_mailbox_records<F>(
+    records: Vec<AccountRecord>,
+    limit: usize,
+    mut load: F,
+) -> Vec<RestoredAccountMailbox>
+where
+    F: FnMut(&AccountId, usize) -> std::io::Result<Option<(AccountIdentity, MailboxSnapshot)>>,
+{
+    records
+        .into_iter()
+        .map(|record| {
+            let snapshot =
+                load(&record.id, limit)
+                    .ok()
+                    .flatten()
+                    .and_then(|(cached_identity, snapshot)| {
+                        (cached_identity.provider == record.identity.provider
+                            && cached_identity
+                                .email
+                                .eq_ignore_ascii_case(&record.identity.email))
+                        .then_some(snapshot)
+                    });
+            RestoredAccountMailbox {
+                account_id: record.id,
+                account: record.identity,
+                snapshot,
+            }
+        })
+        .collect()
 }
 
 /// Gives a pre-multi-account installation an opaque registry ID once its
@@ -4414,6 +5128,60 @@ fn map_body_failure(error: gmail::GmailError) -> BodyFailure {
     }
 }
 
+/// Obtains a short-lived Gmail access token for exactly one registry account.
+/// This intentionally never consults the singleton `RuntimeAuth`: doing so
+/// would make a late Unified Inbox operation capable of acting as whichever
+/// account happened to be selected most recently.
+async fn scoped_access_token(
+    account_id: &AccountId,
+    account_email: &str,
+) -> Result<Zeroizing<String>, BodyFailure> {
+    // Treat the durable registry as the authority for the display address.
+    // The account ID chooses the credential; rejecting a mismatch prevents a
+    // forged/stale command from pairing that credential with another inbox.
+    let account_id_for_registry = account_id.clone();
+    let registry = tokio::task::spawn_blocking(cache::load_account_registry)
+        .await
+        .map_err(|_| BodyFailure::Protocol)?
+        .map_err(|_| BodyFailure::Protocol)?;
+    if !registry
+        .get(&account_id_for_registry)
+        .is_some_and(|record| record.identity.email.eq_ignore_ascii_case(account_email))
+    {
+        return Err(BodyFailure::AuthorizationRequired);
+    }
+    let refresh = timeout(KEYRING_TIMEOUT, secrets::load_for_account(account_id))
+        .await
+        .map_err(|_| BodyFailure::AuthorizationRequired)?
+        .map_err(|_| BodyFailure::AuthorizationRequired)?
+        .ok_or(BodyFailure::AuthorizationRequired)?;
+    let config = config::load().map_err(|_| BodyFailure::Protocol)?;
+    let client = oauth::http_client().map_err(|_| BodyFailure::Offline)?;
+    let grant = oauth::refresh(&config, refresh.expose(), &client)
+        .await
+        .map_err(|error| match error {
+            oauth::OAuthError::Network
+            | oauth::OAuthError::ProviderUnavailable
+            | oauth::OAuthError::RateLimited => BodyFailure::Offline,
+            oauth::OAuthError::AuthorizationExpired | oauth::OAuthError::InvalidToken => {
+                BodyFailure::AuthorizationRequired
+            }
+            _ => BodyFailure::Protocol,
+        })?;
+    if let Some(replacement) = grant.refresh_token.as_ref() {
+        let replacement = RefreshToken::new(replacement.expose().to_owned())
+            .map_err(|_| BodyFailure::AuthorizationRequired)?;
+        timeout(
+            KEYRING_TIMEOUT,
+            secrets::replace_for_account(account_id, &replacement),
+        )
+        .await
+        .map_err(|_| BodyFailure::AuthorizationRequired)?
+        .map_err(|_| BodyFailure::AuthorizationRequired)?;
+    }
+    Ok(Zeroizing::new(grant.access_token.expose().to_owned()))
+}
+
 fn map_send_failure(error: smtp::SmtpError) -> SendFailure {
     match error {
         smtp::SmtpError::EmptyBody => SendFailure::Empty,
@@ -4562,6 +5330,49 @@ mod tests {
             duplicate_registered_account(&accounts, &gmail_identity("other@example.com")),
             None
         );
+    }
+
+    #[test]
+    fn startup_projection_keeps_every_registry_row_and_rejects_mismatched_cache() {
+        let first = account_id('a');
+        let second = account_id('b');
+        let records = vec![
+            AccountRecord::new(first.clone(), gmail_identity("personal@example.com")),
+            AccountRecord::new(second.clone(), gmail_identity("work@example.com")),
+        ];
+        let snapshot = MailboxSnapshot {
+            messages: Vec::new(),
+            folder_catalog: FolderCatalog::inbox_only(),
+            metadata: SyncMetadata {
+                completed_at: SystemTime::UNIX_EPOCH,
+                requested_limit: 50,
+                loaded_count: 0,
+                fallback_count: 0,
+                skipped_count: 0,
+            },
+        };
+        let restored = restore_account_mailbox_records(records, 50, |id, limit| {
+            assert_eq!(limit, 50);
+            if id == &first {
+                Ok(Some((
+                    gmail_identity("PERSONAL@example.com"),
+                    snapshot.clone(),
+                )))
+            } else {
+                // A scoped cache with the wrong identity is never projected
+                // into this registry row, while the row itself remains.
+                Ok(Some((
+                    gmail_identity("other@example.com"),
+                    snapshot.clone(),
+                )))
+            }
+        });
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].account_id, first);
+        assert!(restored[0].snapshot.is_some());
+        assert_eq!(restored[1].account_id, second);
+        assert!(restored[1].snapshot.is_none());
     }
 
     #[test]

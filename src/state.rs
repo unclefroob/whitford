@@ -10,9 +10,9 @@ use crate::{
     worker::{
         AttachmentDestination, AttachmentFailure, AttachmentJobId, BackgroundSyncRequestId,
         BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
-        FolderRequestId, MutationRequestId, OperationId, PreferencesRequestId, SearchRequestId,
-        SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent,
-        WorkerPhase,
+        FolderRequestId, MutationRequestId, OperationId, PreferencesRequestId,
+        RestoredAccountMailbox, SearchRequestId, SendFailure, SendRequestId, ServiceFailure,
+        SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
 use std::{
@@ -93,6 +93,10 @@ pub struct AppState {
     account_mailboxes: BTreeMap<AccountId, AccountMailbox>,
     selected_mailbox_view: MailboxView,
     selected_account_message: Option<AccountMessageId>,
+    // Account-scoped reconnect/removal requests use the same monotonically
+    // increasing operation IDs, but never occupy the singleton lifecycle
+    // slot. This lets one account recover without interrupting the rest.
+    account_operations: BTreeMap<AccountId, OperationId>,
 }
 
 /// The account-scoped navigation identity. `UnifiedInbox` has no provider
@@ -288,6 +292,21 @@ pub enum ReaderState {
         id: MessageId,
         failure: BodyFailure,
     },
+    /// The account ID remains part of every Unified Inbox reader state. A
+    /// Gmail message ID is only unique inside that account.
+    AccountLoading {
+        id: AccountMessageId,
+        request_id: BodyRequestId,
+        generation: u64,
+    },
+    AccountLoaded {
+        id: AccountMessageId,
+        body: Arc<MessageBody>,
+    },
+    AccountFailed {
+        id: AccountMessageId,
+        failure: BodyFailure,
+    },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComposeSession {
@@ -399,6 +418,12 @@ pub enum Action {
     /// Starts additive Gmail OAuth. This is separate from `Connect`, which
     /// retains its established singleton session semantics.
     AddAccount,
+    ReconnectAccount {
+        account_id: AccountId,
+    },
+    RemoveAccount {
+        account_id: AccountId,
+    },
     RemoveAccountMailbox {
         account_id: AccountId,
     },
@@ -483,6 +508,7 @@ pub enum Action {
     },
     Worker(WorkerEvent),
 }
+#[allow(clippy::large_enum_variant)] // Worker commands own private staged-file paths.
 #[derive(Debug)]
 pub enum Effect {
     SendWorker(WorkerCommand),
@@ -690,7 +716,11 @@ fn compare_account_messages_newest_first(
 /// legacy singleton lifecycle reducer sees them.
 fn worker_operation_id(event: &WorkerEvent) -> Option<OperationId> {
     match event {
-        WorkerEvent::LegacyAccountRegistered { id, .. }
+        WorkerEvent::AccountMailboxesRestored { id, .. }
+        | WorkerEvent::AccountSynced { id, .. }
+        | WorkerEvent::AccountRemoved { id, .. }
+        | WorkerEvent::AccountOperationFailed { id, .. }
+        | WorkerEvent::LegacyAccountRegistered { id, .. }
         | WorkerEvent::Phase { id, .. }
         | WorkerEvent::AuthorizationRequired { id, .. }
         | WorkerEvent::IdentityVerified { id, .. }
@@ -835,6 +865,7 @@ impl AppState {
             account_mailboxes: BTreeMap::new(),
             selected_mailbox_view: MailboxView::UnifiedInbox,
             selected_account_message: None,
+            account_operations: BTreeMap::new(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -854,6 +885,8 @@ impl AppState {
                 identity,
             } => self.register_legacy_account(account_id, identity),
             Action::AddAccount => self.start_add_account(),
+            Action::ReconnectAccount { account_id } => self.reconnect_account(account_id),
+            Action::RemoveAccount { account_id } => self.remove_account(account_id),
             Action::RemoveAccountMailbox { account_id } => self.remove_account_mailbox(&account_id),
             Action::SelectMailboxView(view) => self.select_mailbox_view(view),
             Action::SelectAccountMessage(id) => self.select_account_message(id),
@@ -1167,6 +1200,73 @@ impl AppState {
             ..Default::default()
         }
     }
+    fn reconnect_account(&mut self, account_id: AccountId) -> Update {
+        if self.account_operations.contains_key(&account_id) {
+            return Update {
+                feedback: Some("This Gmail account is already being updated"),
+                ..Default::default()
+            };
+        }
+        if !self.account_mailboxes.contains_key(&account_id) {
+            return Update {
+                feedback: Some("That Gmail account is unavailable"),
+                ..Default::default()
+            };
+        }
+        let Some(id) = self.allocate_account_operation() else {
+            return Update {
+                feedback: Some("Mail worker is unavailable"),
+                ..Default::default()
+            };
+        };
+        if let Some(account) = self.account_mailboxes.get_mut(&account_id) {
+            account.session = SessionState::Syncing {
+                kind: SyncKind::Refresh,
+                phase: WorkerPhase::OpeningKeyring,
+            };
+        }
+        self.account_operations.insert(account_id.clone(), id);
+        self.bump_list();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::ReconnectAccount {
+                id,
+                account_id,
+            })],
+            ..Default::default()
+        }
+    }
+    fn remove_account(&mut self, account_id: AccountId) -> Update {
+        if self.account_operations.contains_key(&account_id) {
+            return Update {
+                feedback: Some("This Gmail account is already being updated"),
+                ..Default::default()
+            };
+        }
+        if !self.account_mailboxes.contains_key(&account_id) {
+            return Update {
+                feedback: Some("That Gmail account is unavailable"),
+                ..Default::default()
+            };
+        }
+        let Some(id) = self.allocate_account_operation() else {
+            return Update {
+                feedback: Some("Mail worker is unavailable"),
+                ..Default::default()
+            };
+        };
+        if let Some(account) = self.account_mailboxes.get_mut(&account_id) {
+            account.session = SessionState::Disconnecting;
+        }
+        self.account_operations.insert(account_id.clone(), id);
+        self.bump_list();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::RemoveAccount {
+                id,
+                account_id,
+            })],
+            ..Default::default()
+        }
+    }
     fn cancel(&mut self) -> Update {
         if let Some(id) = self.adding_account_operation.take() {
             return Update {
@@ -1246,6 +1346,11 @@ impl AppState {
         self.active_operation = Some(id);
         Some(id)
     }
+    fn allocate_account_operation(&mut self) -> Option<OperationId> {
+        let current = self.next_operation;
+        self.next_operation = self.next_operation.checked_add(1)?;
+        Some(OperationId(current))
+    }
     fn worker_event(&mut self, event: WorkerEvent) -> Update {
         if self
             .adding_account_operation
@@ -1253,7 +1358,18 @@ impl AppState {
         {
             return self.add_account_worker_event(event);
         }
+        if worker_operation_id(&event)
+            .is_some_and(|id| self.account_operations.values().any(|value| *value == id))
+        {
+            return self.account_projection_worker_event(event);
+        }
         match event {
+            WorkerEvent::AccountMailboxesRestored { id, accounts } => {
+                if self.active_operation != Some(id) {
+                    return Update::default();
+                }
+                self.restore_account_mailboxes(accounts)
+            }
             WorkerEvent::AttachmentProgress {
                 job_id,
                 generation,
@@ -1398,6 +1514,43 @@ impl AppState {
                 }
                 Update::default()
             }
+            WorkerEvent::AccountBodyLoaded {
+                request_id,
+                generation,
+                message,
+                body,
+            } => {
+                let matches = matches!(
+                    &self.reader,
+                    ReaderState::AccountLoading { id, request_id: current, generation: current_generation }
+                        if id == &message && *current == request_id && *current_generation == generation
+                );
+                if matches && generation == self.cache_generation {
+                    self.reader = ReaderState::AccountLoaded { id: message, body };
+                    self.bump_reader();
+                }
+                Update::default()
+            }
+            WorkerEvent::AccountBodyFailed {
+                request_id,
+                generation,
+                message,
+                failure,
+            } => {
+                let matches = matches!(
+                    &self.reader,
+                    ReaderState::AccountLoading { id, request_id: current, generation: current_generation }
+                        if id == &message && *current == request_id && *current_generation == generation
+                );
+                if matches && generation == self.cache_generation {
+                    self.reader = ReaderState::AccountFailed {
+                        id: message,
+                        failure,
+                    };
+                    self.bump_reader();
+                }
+                Update::default()
+            }
             WorkerEvent::CacheCleared {
                 operation_id,
                 generation,
@@ -1492,6 +1645,17 @@ impl AppState {
                     ..Default::default()
                 }
             }
+            WorkerEvent::AccountMessageSent {
+                request_id,
+                generation,
+                account_id,
+            } => self.finish_account_send(request_id, generation, &account_id, None),
+            WorkerEvent::AccountMessageSendFailed {
+                request_id,
+                generation,
+                account_id,
+                failure,
+            } => self.finish_account_send(request_id, generation, &account_id, Some(failure)),
             WorkerEvent::DraftsLoaded {
                 operation_id,
                 generation,
@@ -1735,6 +1899,31 @@ impl AppState {
                 message_id,
                 uncertain,
             } => self.finish_mutation(request_id, generation, &message_id, false, None, uncertain),
+            WorkerEvent::AccountMutationConfirmed {
+                message, mutation, ..
+            } => {
+                // The mutation was intentionally applied only after Gmail
+                // confirmed it, so a duplicate Gmail ID in another account
+                // can never be changed by this acknowledgement.
+                self.apply_account_mutation(&message, &mutation);
+                self.bump_list();
+                self.bump_reader();
+                Update::default()
+            }
+            WorkerEvent::AccountMutationReconciled { message, state, .. } => {
+                self.apply_account_reconciled(&message, state.as_ref());
+                self.bump_list();
+                self.bump_reader();
+                Update::default()
+            }
+            WorkerEvent::AccountMutationFailed { uncertain, .. } => Update {
+                feedback: Some(if uncertain {
+                    "Gmail received the change, but its final state could not be verified"
+                } else {
+                    "Gmail rejected the change"
+                }),
+                ..Default::default()
+            },
             WorkerEvent::PreferencesSaved { request_id } => {
                 if self.pending_preferences_request == Some(request_id) {
                     self.pending_preferences_request = None;
@@ -1924,6 +2113,96 @@ impl AppState {
         }
     }
 
+    fn account_projection_worker_event(&mut self, event: WorkerEvent) -> Update {
+        match event {
+            WorkerEvent::Phase { id, phase } => {
+                let account_id =
+                    self.account_operations
+                        .iter()
+                        .find_map(|(account_id, operation)| {
+                            (*operation == id).then(|| account_id.clone())
+                        });
+                if let Some(account_id) = account_id
+                    && let Some(account) = self.account_mailboxes.get_mut(&account_id)
+                {
+                    account.session = SessionState::Syncing {
+                        kind: SyncKind::Refresh,
+                        phase,
+                    };
+                    self.bump_list();
+                }
+                Update::default()
+            }
+            WorkerEvent::AccountSynced {
+                id,
+                account_id,
+                account,
+                snapshot,
+            } => {
+                if self.account_operations.get(&account_id) != Some(&id) {
+                    return Update::default();
+                }
+                self.account_operations.remove(&account_id);
+                let _ = self.upsert_account_mailbox(
+                    account_id,
+                    account,
+                    SessionState::Ready,
+                    Some(snapshot),
+                );
+                Update {
+                    feedback: Some("Gmail account reconnected"),
+                    ..Default::default()
+                }
+            }
+            WorkerEvent::AccountRemoved { id, account_id } => {
+                if self.account_operations.get(&account_id) != Some(&id) {
+                    return Update::default();
+                }
+                self.account_operations.remove(&account_id);
+                self.remove_account_mailbox(&account_id);
+                Update {
+                    feedback: Some("Gmail account removed"),
+                    ..Default::default()
+                }
+            }
+            WorkerEvent::AccountOperationFailed {
+                id,
+                account_id,
+                failure,
+            } => {
+                if self.account_operations.get(&account_id) != Some(&id) {
+                    return Update::default();
+                }
+                self.account_operations.remove(&account_id);
+                if let Some(account) = self.account_mailboxes.get_mut(&account_id) {
+                    account.session = if matches!(
+                        failure.kind,
+                        FailureKind::AuthorizationExpired
+                            | FailureKind::IdentityInvalid
+                            | FailureKind::ImapAuthenticationFailed
+                    ) {
+                        SessionState::AuthRequired {
+                            cleanup_failed: failure.cleanup_failed,
+                        }
+                    } else if failure.preserve_mail && account.inbox.is_some() {
+                        SessionState::Offline { failure }
+                    } else {
+                        SessionState::ServiceError { failure }
+                    };
+                    self.bump_list();
+                }
+                Update {
+                    feedback: Some("Could not update the Gmail account"),
+                    ..Default::default()
+                }
+            }
+            // A scoped command cannot legitimately emit singleton lifecycle
+            // data. Dropping it keeps a stale/injected event from replacing
+            // the active legacy account.
+            _ => Update::default(),
+        }
+    }
+
     fn add_account_worker_event(&mut self, event: WorkerEvent) -> Update {
         let Some(id) = worker_operation_id(&event) else {
             return Update::default();
@@ -1993,57 +2272,19 @@ impl AppState {
     }
 
     fn account_worker_event(&mut self, event: WorkerEvent) -> Update {
-        let id = match &event {
-            WorkerEvent::LegacyAccountRegistered { id, .. }
-            | WorkerEvent::Phase { id, .. }
-            | WorkerEvent::AuthorizationRequired { id, .. }
-            | WorkerEvent::IdentityVerified { id, .. }
-            | WorkerEvent::DuplicateAccountIdentity { id, .. }
-            | WorkerEvent::AccountAdded { id, .. }
-            | WorkerEvent::AccountPersisted { id, .. }
-            | WorkerEvent::CacheLoaded { id, .. }
-            | WorkerEvent::NoStoredAccount { id }
-            | WorkerEvent::SyncComplete { id, .. }
-            | WorkerEvent::Disconnected { id }
-            | WorkerEvent::Cancelled { id }
-            | WorkerEvent::Failed { id, .. } => *id,
-            WorkerEvent::BodyLoaded { .. }
-            | WorkerEvent::BodyFailed { .. }
-            | WorkerEvent::AttachmentProgress { .. }
-            | WorkerEvent::AttachmentCompleted { .. }
-            | WorkerEvent::AttachmentFailed { .. }
-            | WorkerEvent::AttachmentCancelled { .. }
-            | WorkerEvent::FolderCacheLoaded { .. }
-            | WorkerEvent::FolderLoaded { .. }
-            | WorkerEvent::FolderFailed { .. }
-            | WorkerEvent::SearchLoaded { .. }
-            | WorkerEvent::SearchFailed { .. }
-            | WorkerEvent::SearchCancelled { .. }
-            | WorkerEvent::CacheCleared { .. }
-            | WorkerEvent::CacheClearFailed { .. }
-            | WorkerEvent::CacheUsageChanged { .. }
-            | WorkerEvent::MessageSent { .. }
-            | WorkerEvent::MessageSendFailed { .. }
-            | WorkerEvent::DraftsLoaded { .. }
-            | WorkerEvent::DraftSaved { .. }
-            | WorkerEvent::DraftDeleted { .. }
-            | WorkerEvent::AttachmentStaged { .. }
-            | WorkerEvent::StagedRemoved { .. }
-            | WorkerEvent::SignatureLoaded { .. }
-            | WorkerEvent::SignatureSaved { .. }
-            | WorkerEvent::DraftOperationFailed { .. }
-            | WorkerEvent::MutationConfirmed { .. }
-            | WorkerEvent::MutationReconciled { .. }
-            | WorkerEvent::MutationFailed { .. }
-            | WorkerEvent::PreferencesSaved { .. }
-            | WorkerEvent::PreferencesSaveFailed { .. }
-            | WorkerEvent::BackgroundSyncComplete { .. }
-            | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
+        let Some(id) = worker_operation_id(&event) else {
+            return Update::default();
         };
         if self.active_operation != Some(id) {
             return Update::default();
         }
         match event {
+            // `worker_event` consumes this before lifecycle routing so the
+            // restored projections cannot disturb singleton state.
+            WorkerEvent::AccountMailboxesRestored { .. } => unreachable!(),
+            WorkerEvent::AccountSynced { .. }
+            | WorkerEvent::AccountRemoved { .. }
+            | WorkerEvent::AccountOperationFailed { .. } => Update::default(),
             WorkerEvent::LegacyAccountRegistered {
                 account_id,
                 account,
@@ -2326,6 +2567,7 @@ impl AppState {
             | WorkerEvent::PreferencesSaveFailed { .. }
             | WorkerEvent::BackgroundSyncComplete { .. }
             | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
+            _ => Update::default(),
         }
     }
     fn upsert_account_mailbox(
@@ -2366,6 +2608,22 @@ impl AppState {
         );
         self.reconcile_account_selection();
         self.bump_list();
+        Update::default()
+    }
+
+    fn restore_account_mailboxes(&mut self, accounts: Vec<RestoredAccountMailbox>) -> Update {
+        // Each row came from the durable registry. Keep rows whose snapshots
+        // are unavailable too: losing a cache must never look like removing
+        // an account. These are local projections only, so `Ready` means
+        // "ready to view cached mail", not that a live token was refreshed.
+        for restored in accounts {
+            let _ = self.upsert_account_mailbox(
+                restored.account_id,
+                restored.account,
+                SessionState::Ready,
+                restored.snapshot,
+            );
+        }
         Update::default()
     }
 
@@ -2510,7 +2768,41 @@ impl AppState {
         }
         self.selected_account_message = Some(id);
         self.bump_list();
-        Update::default()
+        self.open_selected_account()
+    }
+
+    fn selected_account_summary(&self) -> Option<AccountMessageSummary> {
+        let id = self.selected_account_message.as_ref()?;
+        self.account_visible_messages()
+            .into_iter()
+            .find(|message| &message.id == id)
+    }
+
+    fn open_selected_account(&mut self) -> Update {
+        let Some(message) = self.selected_account_summary() else {
+            return Update::default();
+        };
+        if matches!(&self.reader, ReaderState::AccountLoaded { id, .. } if id == &message.id) {
+            return Update::default();
+        }
+        let request_id = BodyRequestId(self.next_body_request);
+        self.next_body_request = self.next_body_request.wrapping_add(1).max(1);
+        self.reader = ReaderState::AccountLoading {
+            id: message.id.clone(),
+            request_id,
+            generation: self.cache_generation,
+        };
+        self.bump_reader();
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::FetchAccountBody {
+                request_id,
+                generation: self.cache_generation,
+                message: message.id,
+                account_email: message.account.email,
+                locator: message.message.locator,
+            })],
+            ..Default::default()
+        }
     }
 
     fn reconcile_account_selection(&mut self) {
@@ -2696,18 +2988,34 @@ impl AppState {
                 }
             }),
             label_options: self
-                .mailbox
+                .selected_account_message
                 .as_ref()
+                .and_then(|id| self.account_mailboxes.get(&id.account_id))
+                .and_then(|account| account.inbox.as_ref())
+                .map(|mailbox| {
+                    (
+                        &mailbox.folder_catalog,
+                        self.selected_account_summary()
+                            .map(|message| message.message),
+                    )
+                })
+                .or_else(|| {
+                    self.mailbox
+                        .as_ref()
+                        .map(|mailbox| (&mailbox.folder_catalog, self.selected_message().cloned()))
+                })
                 .map(|mailbox| {
                     mailbox
-                        .folder_catalog
+                        .0
                         .folders
                         .iter()
                         .filter_map(|folder| match &folder.id {
                             FolderId::Label(mailbox_name) => Some((
                                 mailbox_name.clone(),
                                 folder.display_name.clone(),
-                                self.selected_message()
+                                mailbox
+                                    .1
+                                    .as_ref()
                                     .is_some_and(|message| message.labels.contains(mailbox_name)),
                             )),
                             _ => None,
@@ -3211,6 +3519,7 @@ impl AppState {
     }
     fn select_message(&mut self, id: MessageId) -> Update {
         if self.visible_message_ids().contains(&id) {
+            self.selected_account_message = None;
             self.selected_message_id = Some(id);
             self.bump_list();
             self.open_selected()
@@ -3225,6 +3534,9 @@ impl AppState {
         &mut self,
         build: impl FnOnce(&MessageSummary, &crate::model::FolderCatalog) -> MessageMutation,
     ) -> Update {
+        if self.selected_account_message.is_some() {
+            return self.mutate_account_selected(build);
+        }
         if !matches!(self.session, SessionState::Ready) {
             return Update {
                 feedback: Some("Connect Gmail before changing messages"),
@@ -3353,6 +3665,147 @@ impl AppState {
                 mutation,
             })],
             ..Default::default()
+        }
+    }
+
+    fn mutate_account_selected(
+        &mut self,
+        build: impl FnOnce(&MessageSummary, &crate::model::FolderCatalog) -> MessageMutation,
+    ) -> Update {
+        let Some(selected) = self.selected_account_summary() else {
+            return Update {
+                feedback: Some("Message is unavailable"),
+                ..Default::default()
+            };
+        };
+        let Some(account) = self.account_mailboxes.get(&selected.id.account_id) else {
+            return Update {
+                feedback: Some("That Gmail account is unavailable"),
+                ..Default::default()
+            };
+        };
+        let Some(catalog) = account
+            .inbox
+            .as_ref()
+            .map(|inbox| inbox.folder_catalog.clone())
+        else {
+            return Update {
+                feedback: Some("That Gmail mailbox is unavailable"),
+                ..Default::default()
+            };
+        };
+        let mutation = build(&selected.message, &catalog);
+        if matches!(mutation, MessageMutation::Archive)
+            && (!selected.message.in_inbox || selected.message.in_trash)
+        {
+            return Update {
+                feedback: Some("This message is not in Inbox"),
+                ..Default::default()
+            };
+        }
+        if matches!(mutation, MessageMutation::MoveToTrash { .. }) && selected.message.in_trash {
+            return Update {
+                feedback: Some("This message is already in Trash"),
+                ..Default::default()
+            };
+        }
+        if matches!(&mutation, MessageMutation::MoveToTrash { mailbox } if mailbox.is_empty()) {
+            return Update {
+                feedback: Some("Gmail did not expose a Trash mailbox"),
+                ..Default::default()
+            };
+        }
+        if let MessageMutation::SetLabel { mailbox, .. } = &mutation
+            && !matches!(catalog.find(&FolderId::Label(mailbox.clone())), Some(folder) if folder.mailbox == *mailbox)
+        {
+            return Update {
+                feedback: Some("That Gmail label is unavailable"),
+                ..Default::default()
+            };
+        }
+        let request_id = MutationRequestId(self.next_mutation_request);
+        self.next_mutation_request = self.next_mutation_request.wrapping_add(1).max(1);
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::MutateAccountMessage {
+                request_id,
+                generation: self.cache_generation,
+                message: selected.id,
+                account_email: selected.account.email,
+                locator: selected.message.locator,
+                catalog,
+                mutation,
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn apply_account_mutation(&mut self, id: &AccountMessageId, mutation: &MessageMutation) {
+        let Some(account) = self.account_mailboxes.get_mut(&id.account_id) else {
+            return;
+        };
+        let apply = |message: &mut MessageSummary| {
+            if message.id == id.message_id {
+                mutation.apply(message);
+                match mutation {
+                    MessageMutation::Archive => message.in_inbox = false,
+                    MessageMutation::MoveToTrash { .. } => {
+                        message.in_inbox = false;
+                        message.in_trash = true;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        if let Some(inbox) = account.inbox.as_mut() {
+            inbox.messages.iter_mut().for_each(&apply);
+            inbox.messages.retain(message_is_in_inbox);
+            inbox.metadata.loaded_count = inbox.messages.len();
+        }
+        for snapshot in account.folders.values_mut() {
+            snapshot.messages.iter_mut().for_each(&apply);
+            snapshot.messages.retain(Self::belongs_in_projection);
+            snapshot.metadata.loaded_count = snapshot.messages.len();
+        }
+    }
+
+    fn apply_account_reconciled(
+        &mut self,
+        id: &AccountMessageId,
+        state: Option<&ReconciledMessageState>,
+    ) {
+        let Some(account) = self.account_mailboxes.get_mut(&id.account_id) else {
+            return;
+        };
+        let reconcile = |message: &mut MessageSummary| {
+            if message.id == id.message_id
+                && let Some(state) = state
+            {
+                message.unread = state.unread;
+                message.starred = state.starred;
+                message.in_inbox = state.in_inbox;
+                message.in_trash = state.in_trash;
+                message.labels = state.labels.clone();
+            }
+        };
+        if let Some(inbox) = account.inbox.as_mut() {
+            inbox.messages.iter_mut().for_each(&reconcile);
+            if state.is_none() {
+                inbox.messages.retain(|message| message.id != id.message_id);
+            } else {
+                inbox.messages.retain(message_is_in_inbox);
+            }
+            inbox.metadata.loaded_count = inbox.messages.len();
+        }
+        for snapshot in account.folders.values_mut() {
+            snapshot.messages.iter_mut().for_each(&reconcile);
+            if state.is_none() {
+                snapshot
+                    .messages
+                    .retain(|message| message.id != id.message_id);
+            } else {
+                snapshot.messages.retain(Self::belongs_in_projection);
+            }
+            snapshot.metadata.loaded_count = snapshot.messages.len();
         }
     }
 
@@ -3532,6 +3985,9 @@ impl AppState {
     }
 
     fn can_change_selected_message(&self) -> bool {
+        if self.selected_account_message.is_some() {
+            return self.selected_account_summary().is_some();
+        }
         matches!(self.session, SessionState::Ready) && self.selected_message().is_some()
     }
 
@@ -3642,11 +4098,21 @@ impl AppState {
     }
 
     fn can_archive_selected(&self) -> bool {
+        if self.selected_account_message.is_some() {
+            return self
+                .selected_account_summary()
+                .is_some_and(|message| message.message.in_inbox && !message.message.in_trash);
+        }
         self.selected_message()
             .is_some_and(|message| self.can_archive_message(message))
     }
 
     fn can_trash_selected(&self) -> bool {
+        if self.selected_account_message.is_some() {
+            return self
+                .selected_account_summary()
+                .is_some_and(|message| !message.message.in_trash);
+        }
         self.selected_message()
             .is_some_and(|message| self.can_trash_message(message))
     }
@@ -3937,6 +4403,9 @@ impl AppState {
             ReaderState::Loading { id, .. }
             | ReaderState::Loaded { id, .. }
             | ReaderState::Failed { id, .. } => Some(id),
+            ReaderState::AccountLoading { .. }
+            | ReaderState::AccountLoaded { .. }
+            | ReaderState::AccountFailed { .. } => None,
         };
         if reader_id.is_some_and(|id| !visible.contains(id)) {
             self.reader = ReaderState::Closed;
@@ -3998,7 +4467,9 @@ impl AppState {
         }
     }
     fn retry_body(&mut self) -> Update {
-        if matches!(self.reader, ReaderState::Failed { .. }) {
+        if matches!(self.reader, ReaderState::AccountFailed { .. }) {
+            self.open_selected_account()
+        } else if matches!(self.reader, ReaderState::Failed { .. }) {
             self.open_selected()
         } else {
             Update::default()
@@ -4009,6 +4480,16 @@ impl AppState {
         requested: crate::model::Attachment,
         destination: AttachmentDestination,
     ) -> Update {
+        if self.selected_account_message.is_some() {
+            // The legacy attachment command is keyed by a bare MessageId.
+            // Do not let an account-reader attachment fall through to that
+            // singleton lane until its transport receives the same scoped
+            // contract as body loading.
+            return Update {
+                feedback: Some("Attachment downloads are not available for this account yet"),
+                ..Default::default()
+            };
+        }
         if self.attachment_jobs.len() >= crate::worker::MAX_CONTENT_JOBS {
             return Update {
                 feedback: Some("Wait for an attachment download to finish"),
@@ -4112,6 +4593,17 @@ impl AppState {
                         body.html
                             .clone()
                             .unwrap_or_else(|| format!("<div>{}</div>", escape_html(&body.text))),
+                        None,
+                    )),
+                    ReaderState::AccountLoaded { id, body } => Some((
+                        id.message_id.clone(),
+                        body.reply_context.clone(),
+                        body.html
+                            .clone()
+                            .unwrap_or_else(|| format!("<div>{}</div>", escape_html(&body.text))),
+                        self.account_mailboxes
+                            .get(&id.account_id)
+                            .map(|account| account.identity.email.clone()),
                     )),
                     _ => {
                         return Update {
@@ -4122,7 +4614,7 @@ impl AppState {
                 }
             }
         };
-        let source_id = source.as_ref().map(|(id, _, _)| id.clone());
+        let source_id = source.as_ref().map(|(id, _, _, _)| id.clone());
         if expected_id != source_id && expected_id.is_some() {
             return Update {
                 feedback: Some("Reopen the message to continue composing"),
@@ -4153,7 +4645,7 @@ impl AppState {
                 .find(|draft| {
                     source
                         .as_ref()
-                        .is_some_and(|(id, _, _)| compose_matches(&draft.kind, start, id))
+                        .is_some_and(|(id, _, _, _)| compose_matches(&draft.kind, start, id))
                 })
                 .cloned()
         {
@@ -4168,11 +4660,16 @@ impl AppState {
         let source_subject = if let Some(id) = source_id.as_ref() {
             // The selected row may be an ephemeral Gmail server-search result, not a member
             // of the currently loaded folder. Resolve through the same accessor as selection.
-            let Some(subject) = self
-                .selected_message()
-                .filter(|message| &message.id == id)
-                .map(|message| message.subject.clone())
-            else {
+            let subject = self
+                .selected_account_summary()
+                .filter(|message| &message.id.message_id == id)
+                .map(|message| message.message.subject)
+                .or_else(|| {
+                    self.selected_message()
+                        .filter(|message| &message.id == id)
+                        .map(|message| message.subject.clone())
+                });
+            let Some(subject) = subject else {
                 return Update {
                     feedback: Some("The source message is no longer in this mailbox"),
                     ..Default::default()
@@ -4182,7 +4679,11 @@ impl AppState {
         } else {
             None
         };
-        let Some(account_email) = self.account.as_ref().map(|a| a.email.clone()) else {
+        let account_email = source
+            .as_ref()
+            .and_then(|(_, _, _, account)| account.clone())
+            .or_else(|| self.account.as_ref().map(|a| a.email.clone()));
+        let Some(account_email) = account_email else {
             return Update {
                 feedback: Some("Connect Gmail before composing"),
                 ..Default::default()
@@ -4209,7 +4710,7 @@ impl AppState {
         };
         let built = match (start, source.as_ref()) {
             (ComposeStart::New, _) => composer::new_message(draft_id, &account_email, signature),
-            (ComposeStart::Reply, Some((id, context, original_html))) => composer::new_reply(
+            (ComposeStart::Reply, Some((id, context, original_html, _))) => composer::new_reply(
                 draft_id,
                 &account_email,
                 id.clone(),
@@ -4218,7 +4719,7 @@ impl AppState {
                 original_html,
                 signature,
             ),
-            (ComposeStart::ReplyAll, Some((id, context, original_html))) => {
+            (ComposeStart::ReplyAll, Some((id, context, original_html, _))) => {
                 composer::new_reply_all(
                     draft_id,
                     &account_email,
@@ -4229,15 +4730,17 @@ impl AppState {
                     signature,
                 )
             }
-            (ComposeStart::Forward, Some((id, context, original_html))) => composer::new_forward(
-                draft_id,
-                &account_email,
-                id.clone(),
-                source_subject.as_deref().unwrap_or(""),
-                context,
-                original_html,
-                signature,
-            ),
+            (ComposeStart::Forward, Some((id, context, original_html, _))) => {
+                composer::new_forward(
+                    draft_id,
+                    &account_email,
+                    id.clone(),
+                    source_subject.as_deref().unwrap_or(""),
+                    context,
+                    original_html,
+                    signature,
+                )
+            }
             _ => return Update::default(),
         };
         let Ok(compose) = built else {
@@ -4254,11 +4757,11 @@ impl AppState {
             .join(", ");
         self.composer = ComposerState::Editing {
             draft: ComposeSession {
-                source_message_id: source.as_ref().map(|(id, _, _)| id.clone()),
+                source_message_id: source.as_ref().map(|(id, _, _, _)| id.clone()),
                 recipient,
                 subject: compose.subject.clone(),
                 body: String::new(),
-                context: source.map(|(_, context, _)| context),
+                context: source.map(|(_, context, _, _)| context),
                 compose: compose.clone(),
             },
         };
@@ -4729,17 +5232,84 @@ impl AppState {
         let submission = crate::worker::ComposeSubmission {
             draft: draft.compose.clone(),
         };
+        let draft_account_email = draft.compose.account_email.clone();
         self.composer = ComposerState::Sending {
             draft,
             request_id,
             generation,
         };
-        Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::SendMessage {
+        let scoped_account = self
+            .account_mailboxes
+            .iter()
+            .find_map(|(account_id, account)| {
+                account
+                    .identity
+                    .email
+                    .eq_ignore_ascii_case(&draft_account_email)
+                    .then(|| (account_id.clone(), account.identity.email.clone()))
+            });
+        let command = match scoped_account {
+            Some((account_id, account_email)) => WorkerCommand::SendAccountMessage {
+                request_id,
+                generation,
+                account_id,
+                account_email,
+                submission: Box::new(submission),
+            },
+            None => WorkerCommand::SendMessage {
                 request_id,
                 generation,
                 submission: Box::new(submission),
-            })],
+            },
+        };
+        Update {
+            effects: vec![Effect::SendWorker(command)],
+            ..Default::default()
+        }
+    }
+
+    fn finish_account_send(
+        &mut self,
+        request_id: SendRequestId,
+        generation: u64,
+        account_id: &AccountId,
+        failure: Option<SendFailure>,
+    ) -> Update {
+        let draft = match &self.composer {
+            ComposerState::Sending {
+                draft,
+                request_id: current,
+                generation: current_generation,
+            } if *current == request_id
+                && *current_generation == generation
+                && generation == self.send_generation =>
+            {
+                draft.clone()
+            }
+            _ => return Update::default(),
+        };
+        let belongs_to_account = self
+            .account_mailboxes
+            .get(account_id)
+            .is_some_and(|account| {
+                account
+                    .identity
+                    .email
+                    .eq_ignore_ascii_case(&draft.compose.account_email)
+            });
+        if !belongs_to_account {
+            return Update::default();
+        }
+        if let Some(failure) = failure {
+            self.composer = ComposerState::Failed { draft, failure };
+            return Update {
+                feedback: Some(send_failure_feedback(failure)),
+                ..Default::default()
+            };
+        }
+        self.composer = ComposerState::Closed;
+        Update {
+            feedback: Some("Message sent"),
             ..Default::default()
         }
     }

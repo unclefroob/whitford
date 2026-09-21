@@ -117,10 +117,11 @@ fn appearance_presentation(
 /// Reply actions are based on the loaded message body, not its list provenance. This
 /// keeps a Gmail server-search result equivalent to a message opened from a folder.
 fn reply_action_availability(snapshot: &ViewSnapshot) -> (bool, bool, bool) {
-    let can_compose = matches!(snapshot.session, SessionState::Ready)
-        && matches!(snapshot.composer, ComposerState::Closed);
+    let can_compose = matches!(snapshot.composer, ComposerState::Closed)
+        && (matches!(snapshot.session, SessionState::Ready)
+            || matches!(snapshot.reader, ReaderState::AccountLoaded { .. }));
     let Some(body) = (match &snapshot.reader {
-        ReaderState::Loaded { body, .. } => Some(body),
+        ReaderState::Loaded { body, .. } | ReaderState::AccountLoaded { body, .. } => Some(body),
         _ => None,
     }) else {
         return (false, false, false);
@@ -642,6 +643,71 @@ fn render_accounts(ui: &Ui, snapshot: &ViewSnapshot) {
                 .tooltip_text(account_session_label(&account.session))
                 .build(),
         );
+        let reconnect = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Reconnect this Gmail account")
+            .valign(gtk::Align::Center)
+            .build();
+        reconnect.set_sensitive(!matches!(
+            &account.session,
+            SessionState::Syncing { .. }
+                | SessionState::Authorizing { .. }
+                | SessionState::Disconnecting
+        ));
+        reconnect.update_property(&[gtk::accessible::Property::Label("Reconnect Gmail account")]);
+        let reconnect_id = account.id.clone();
+        let weak = ui.downgrade();
+        reconnect.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dispatch(Action::ReconnectAccount {
+                    account_id: reconnect_id.clone(),
+                });
+            }
+        });
+        row.add_suffix(&reconnect);
+
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this Gmail account")
+            .valign(gtk::Align::Center)
+            .build();
+        remove.add_css_class("destructive-action");
+        remove.set_sensitive(!matches!(
+            &account.session,
+            SessionState::Syncing { .. }
+                | SessionState::Authorizing { .. }
+                | SessionState::Disconnecting
+        ));
+        remove.update_property(&[gtk::accessible::Property::Label("Remove Gmail account")]);
+        let remove_id = account.id.clone();
+        let email = account.identity.email.clone();
+        let weak = ui.downgrade();
+        remove.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let dialog = adw::AlertDialog::builder()
+                .heading("Remove Gmail account?")
+                .body(format!(
+                    "This removes {email} from Whitford along with its local mail cache and saved authorization. Other connected accounts are unchanged."
+                ))
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Remove");
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            let weak = ui.downgrade();
+            let account_id = remove_id.clone();
+            dialog.choose(
+                Some(&ui.window),
+                None::<&gtk::gio::Cancellable>,
+                move |response| {
+                    if response == "remove" && let Some(ui) = weak.upgrade() {
+                        ui.dispatch(Action::RemoveAccount { account_id });
+                    }
+                },
+            );
+        });
+        row.add_suffix(&remove);
         ui.accounts_rows.append(&row);
     }
 }
@@ -762,11 +828,21 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         ui.reader.append(&status_panel(ViewStatus::Ready));
         return;
     }
-    if snapshot.selected_message.is_none() {
+    let account_message = snapshot.selected_account_message.as_ref().and_then(|id| {
+        snapshot
+            .account_visible_messages
+            .iter()
+            .find(|message| &message.id == id)
+    });
+    if snapshot.selected_message.is_none() && account_message.is_none() {
         ui.reader.append(&main_status_panel(snapshot));
         return;
     }
-    let Some(message) = &snapshot.selected_message else {
+    let Some(message) = snapshot
+        .selected_message
+        .as_ref()
+        .or_else(|| account_message.map(|account_message| &account_message.message))
+    else {
         ui.reader.append(&status_panel(snapshot.status));
         return;
     };
@@ -802,6 +878,11 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
 
     let loaded_body = match &snapshot.reader {
         ReaderState::Loaded { id, body } if id == &message.id => Some(body.as_ref()),
+        ReaderState::AccountLoaded { id, body }
+            if account_message.is_some_and(|selected| id == &selected.id) =>
+        {
+            Some(body.as_ref())
+        }
         _ => None,
     };
     if loaded_body.is_some_and(|body| body.used_fallback) {
@@ -871,6 +952,20 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             ui.reader.append(&loading);
             return;
         }
+        ReaderState::AccountLoading { id, .. }
+            if account_message.is_some_and(|selected| id == &selected.id) =>
+        {
+            let loading = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .halign(gtk::Align::Center)
+                .margin_top(36)
+                .build();
+            loading.append(&gtk::Spinner::builder().spinning(true).build());
+            loading.append(&gtk::Label::new(Some("Loading message…")));
+            ui.reader.append(&loading);
+            return;
+        }
         ReaderState::Failed { id, failure } if id == &message.id => {
             let (title, detail, action) = match failure {
                 BodyFailure::Offline => (
@@ -907,7 +1002,68 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
             ui.reader.append(&notice_banner(title, detail, action));
             return;
         }
+        ReaderState::AccountFailed { id, failure }
+            if account_message.is_some_and(|selected| id == &selected.id) =>
+        {
+            let (title, detail, action) = match failure {
+                BodyFailure::Offline => (
+                    "Not available offline",
+                    "This message has not been downloaded yet.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+                BodyFailure::AuthorizationRequired => (
+                    "Authorization required",
+                    "Reconnect this Gmail account, then try again.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+                BodyFailure::TimedOut => (
+                    "Message loading timed out",
+                    "Try again when your connection is stable.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+                BodyFailure::MailboxChanged => (
+                    "Mailbox changed",
+                    "Refresh this Gmail account and reopen the message.",
+                    None,
+                ),
+                BodyFailure::Missing => (
+                    "Message unavailable",
+                    "This message is no longer available in this Gmail account.",
+                    None,
+                ),
+                BodyFailure::Protocol => (
+                    "Could not load message",
+                    "Whitford could not read this message safely.",
+                    Some(("Retry", "win.retry-body", "Retry loading this message")),
+                ),
+            };
+            ui.reader.append(&notice_banner(title, detail, action));
+            return;
+        }
         ReaderState::Loaded { id, body } if id == &message.id => {
+            if let Some(html) = &body.html {
+                ui.reader.append(&super::email_view::message_body(html));
+            } else {
+                ui.reader.append(
+                    &gtk::Label::builder()
+                        .label(&body.text)
+                        .xalign(0.0)
+                        .yalign(0.0)
+                        .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                        .selectable(true)
+                        .css_classes(["whitford-body"])
+                        .build(),
+                );
+            }
+            for attachment in &body.attachments {
+                ui.reader
+                    .append(&received_attachment_card(ui, snapshot, attachment));
+            }
+        }
+        ReaderState::AccountLoaded { id, body }
+            if account_message.is_some_and(|selected| id == &selected.id) =>
+        {
             if let Some(html) = &body.html {
                 ui.reader.append(&super::email_view::message_body(html));
             } else {

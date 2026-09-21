@@ -104,6 +104,133 @@ fn unified_inbox_is_newest_first_and_keeps_equal_gmail_ids_account_scoped() {
 }
 
 #[test]
+fn unified_reader_load_is_account_scoped_and_ignores_a_same_id_other_account() {
+    let first = multi_account_id(41);
+    let second = multi_account_id(42);
+    let mut state = AppState::new();
+    for (id, email) in [
+        (&first, "personal@example.com"),
+        (&second, "work@example.com"),
+    ] {
+        let mut messages = fixture_messages();
+        messages[0].id = MessageId::gmail(77);
+        state.dispatch(Action::UpsertAccountMailbox {
+            account_id: id.clone(),
+            identity: multi_account(email),
+            session: SessionState::Ready,
+            mailbox: Some(inbox_snapshot(messages)),
+        });
+    }
+    let selected = crate::model::AccountMessageId {
+        account_id: first.clone(),
+        message_id: MessageId::gmail(77),
+    };
+    let update = state.dispatch(Action::SelectAccountMessage(selected.clone()));
+    let (request_id, generation) = match update.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::FetchAccountBody {
+                request_id,
+                generation,
+                message,
+                account_email,
+                ..
+            }),
+        ] if message == &selected && account_email == "personal@example.com" => {
+            (*request_id, *generation)
+        }
+        other => panic!("expected scoped body request, got {other:?}"),
+    };
+    let wrong = crate::model::AccountMessageId {
+        account_id: second,
+        message_id: MessageId::gmail(77),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountBodyLoaded {
+        request_id,
+        generation,
+        message: wrong,
+        body: reply_body(),
+    }));
+    assert!(
+        matches!(state.snapshot().reader, ReaderState::AccountLoading { id, .. } if id == selected)
+    );
+    state.dispatch(Action::Worker(WorkerEvent::AccountBodyLoaded {
+        request_id,
+        generation,
+        message: selected.clone(),
+        body: reply_body(),
+    }));
+    assert!(
+        matches!(state.snapshot().reader, ReaderState::AccountLoaded { id, .. } if id == selected)
+    );
+}
+
+#[test]
+fn unified_mutation_keeps_the_account_id_when_gmail_ids_collide() {
+    let first = multi_account_id(43);
+    let second = multi_account_id(44);
+    let mut state = AppState::new();
+    for (id, email) in [
+        (&first, "personal@example.com"),
+        (&second, "work@example.com"),
+    ] {
+        let mut messages = fixture_messages();
+        messages[0].id = MessageId::gmail(88);
+        state.dispatch(Action::UpsertAccountMailbox {
+            account_id: id.clone(),
+            identity: multi_account(email),
+            session: SessionState::Ready,
+            mailbox: Some(inbox_snapshot(messages)),
+        });
+    }
+    let selected = crate::model::AccountMessageId {
+        account_id: first.clone(),
+        message_id: MessageId::gmail(88),
+    };
+    state.dispatch(Action::SelectAccountMessage(selected.clone()));
+    let update = state.dispatch(Action::ToggleStar);
+    let (request_id, generation) = match update.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::MutateAccountMessage {
+                request_id,
+                generation,
+                message,
+                account_email,
+                mutation: MessageMutation::SetStarred(true),
+                ..
+            }),
+        ] if message == &selected && account_email == "personal@example.com" => {
+            (*request_id, *generation)
+        }
+        other => panic!("expected scoped mutation, got {other:?}"),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountMutationConfirmed {
+        request_id,
+        generation,
+        message: selected.clone(),
+        mutation: MessageMutation::SetStarred(true),
+    }));
+    let snapshot = state.snapshot();
+    assert!(
+        snapshot
+            .account_visible_messages
+            .iter()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .message
+            .starred
+    );
+    assert!(
+        !snapshot
+            .account_visible_messages
+            .iter()
+            .find(|row| row.id.account_id == second && row.id.message_id == MessageId::gmail(88))
+            .unwrap()
+            .message
+            .starred
+    );
+}
+
+#[test]
 fn account_view_selection_and_removal_are_scoped_without_disturbing_other_accounts() {
     let first = multi_account_id(11);
     let second = multi_account_id(12);
@@ -166,6 +293,64 @@ fn account_view_selection_and_removal_are_scoped_without_disturbing_other_accoun
             .iter()
             .all(|message| message.id.account_id == second)
     );
+}
+
+#[test]
+fn account_reconnect_and_durable_removal_are_scoped_to_the_selected_account() {
+    let first = multi_account_id(13);
+    let second = multi_account_id(14);
+    let mut state = AppState::new();
+    for (id, email) in [
+        (first.clone(), "personal@example.com"),
+        (second.clone(), "work@example.com"),
+    ] {
+        state.dispatch(Action::UpsertAccountMailbox {
+            account_id: id,
+            identity: multi_account(email),
+            session: SessionState::Ready,
+            mailbox: Some(inbox_snapshot(fixture_messages())),
+        });
+    }
+
+    let update = state.dispatch(Action::ReconnectAccount {
+        account_id: first.clone(),
+    });
+    let reconnect_id = match update.effects.as_slice() {
+        [Effect::SendWorker(WorkerCommand::ReconnectAccount { id, account_id })]
+            if account_id == &first =>
+        {
+            *id
+        }
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountSynced {
+        id: reconnect_id,
+        account_id: first.clone(),
+        account: multi_account("personal@example.com"),
+        snapshot: inbox_snapshot(Vec::new()),
+    }));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.accounts.len(), 2);
+    assert!(matches!(snapshot.accounts[0].session, SessionState::Ready));
+
+    let update = state.dispatch(Action::RemoveAccount {
+        account_id: first.clone(),
+    });
+    let remove_id = match update.effects.as_slice() {
+        [Effect::SendWorker(WorkerCommand::RemoveAccount { id, account_id })]
+            if account_id == &first =>
+        {
+            *id
+        }
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountRemoved {
+        id: remove_id,
+        account_id: first,
+    }));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.accounts.len(), 1);
+    assert_eq!(snapshot.accounts[0].id, second);
 }
 
 #[test]
@@ -727,6 +912,43 @@ fn startup_is_disconnected_then_restore_is_an_effect() {
         update.effects.as_slice(),
         [Effect::SendWorker(WorkerCommand::Restore { .. })]
     ));
+}
+
+#[test]
+fn startup_restores_every_registered_account_without_waiting_for_live_auth() {
+    let first = multi_account_id(31);
+    let second = multi_account_id(32);
+    let mut state = AppState::new();
+    let startup = state.dispatch(Action::Startup);
+    let id = match startup.effects.as_slice() {
+        [Effect::SendWorker(WorkerCommand::Restore { id })] => *id,
+        other => panic!("unexpected startup effects: {other:?}"),
+    };
+
+    state.dispatch(Action::Worker(WorkerEvent::AccountMailboxesRestored {
+        id,
+        accounts: vec![
+            crate::worker::RestoredAccountMailbox {
+                account_id: first.clone(),
+                account: multi_account("personal@example.com"),
+                snapshot: Some(inbox_snapshot(fixture_messages())),
+            },
+            crate::worker::RestoredAccountMailbox {
+                account_id: second.clone(),
+                account: multi_account("work@example.com"),
+                snapshot: None,
+            },
+        ],
+    }));
+    // The legacy restore may still have no token. That must only disconnect
+    // its singleton UI, not discard the restored multi-account projection.
+    state.dispatch(Action::Worker(WorkerEvent::NoStoredAccount { id }));
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.accounts.len(), 2);
+    assert_eq!(snapshot.accounts[0].id, first);
+    assert_eq!(snapshot.accounts[1].id, second);
+    assert!(!snapshot.account_visible_messages.is_empty());
 }
 
 fn mutation_effect(update: Update) -> (MutationRequestId, u64, MessageId, MessageMutation) {
