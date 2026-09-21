@@ -1,7 +1,7 @@
 ---
-status: post-implementation
+status: shipped-for-review
 branch: feature/settings-sidebar-theme
-next_step: review-and-ship
+next_step: merge-pr
 scope: cross-stack
 ---
 
@@ -23,3 +23,7 @@ scope: cross-stack
 - `cargo build --release`
 - `git diff --check`
 
+### Completed
+
+PR: https://github.com/unclefroob/whitford/pull/2
+Status: ready for review; local release binary installed at `/home/ryan/.local/bin/whitford`.
