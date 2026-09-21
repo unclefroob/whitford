@@ -50,6 +50,9 @@ pub struct BackgroundSyncRequestId(pub u64);
 pub struct BodyRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheOperationId(pub u64);
+/// Correlates an acknowledged full-preferences persistence request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreferencesRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SendRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -226,6 +229,13 @@ pub enum WorkerCommand {
     SetCacheLimit {
         limit: usize,
     },
+    /// Persist the entire preferences snapshot on the worker's serialized
+    /// cache lane. Never use a field-specific write here: independent UI
+    /// controls can otherwise clobber each other's latest value.
+    SavePreferences {
+        request_id: PreferencesRequestId,
+        preferences: cache::Preferences,
+    },
     FetchFolder {
         request_id: FolderRequestId,
         generation: u64,
@@ -358,6 +368,15 @@ impl fmt::Debug for WorkerCommand {
             Self::SetCacheLimit { limit } => f
                 .debug_struct("SetCacheLimit")
                 .field("limit", limit)
+                .finish(),
+            Self::SavePreferences {
+                request_id,
+                preferences,
+            } => f
+                .debug_struct("SavePreferences")
+                .field("request_id", request_id)
+                .field("retained_messages", &preferences.retained_messages)
+                .field("appearance", &preferences.appearance)
                 .finish(),
             Self::FetchFolder {
                 request_id,
@@ -513,6 +532,16 @@ impl fmt::Debug for WorkerCommand {
 }
 
 pub enum WorkerEvent {
+    /// The matching full snapshot was durably written and any requested cache
+    /// retention pruning completed.
+    PreferencesSaved {
+        request_id: PreferencesRequestId,
+    },
+    /// The worker attempted the matching save but could not complete it. The
+    /// reducer keeps the active in-memory choice and marks it unsaved.
+    PreferencesSaveFailed {
+        request_id: PreferencesRequestId,
+    },
     Phase {
         id: OperationId,
         phase: WorkerPhase,
@@ -727,6 +756,14 @@ pub enum WorkerEvent {
 impl fmt::Debug for WorkerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PreferencesSaved { request_id } => f
+                .debug_struct("PreferencesSaved")
+                .field("request_id", request_id)
+                .finish(),
+            Self::PreferencesSaveFailed { request_id } => f
+                .debug_struct("PreferencesSaveFailed")
+                .field("request_id", request_id)
+                .finish(),
             Self::Phase { id, phase } => f
                 .debug_struct("Phase")
                 .field("id", id)
@@ -1161,6 +1198,31 @@ async fn controller(
             })
             .await;
             if let Ok(Ok(usage)) = result {
+                let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
+            }
+            continue;
+        }
+        if let WorkerCommand::SavePreferences {
+            request_id,
+            preferences,
+        } = &command
+        {
+            let request_id = *request_id;
+            let preferences = preferences.clone();
+            let result = cache_blocking(cache_io.clone(), move || {
+                cache::save_preferences_and_prune(preferences)
+            })
+            .await;
+            let event = match result {
+                Ok(Ok(())) => WorkerEvent::PreferencesSaved { request_id },
+                Ok(Err(_)) | Err(_) => WorkerEvent::PreferencesSaveFailed { request_id },
+            };
+            let saved = matches!(event, WorkerEvent::PreferencesSaved { .. });
+            let _ = events.send(event);
+            // Retention changes can prune cached bodies. Refresh the value shown
+            // in Settings after a successful full-preferences save, just as the
+            // older cache-limit command did.
+            if saved && let Ok(Ok(usage)) = cache_blocking(cache_io.clone(), cache::usage).await {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
             continue;
@@ -1981,6 +2043,7 @@ async fn controller(
             WorkerCommand::BackgroundSync { .. } => unreachable!(),
             WorkerCommand::Cancel { .. }
             | WorkerCommand::SetCacheLimit { .. }
+            | WorkerCommand::SavePreferences { .. }
             | WorkerCommand::FetchFolder { .. }
             | WorkerCommand::SearchGmail { .. }
             | WorkerCommand::CancelSearch { .. }
@@ -2738,6 +2801,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::Cancel { id } => Some(*id),
         WorkerCommand::BackgroundSync { .. }
         | WorkerCommand::SetCacheLimit { .. }
+        | WorkerCommand::SavePreferences { .. }
         | WorkerCommand::FetchFolder { .. }
         | WorkerCommand::SearchGmail { .. }
         | WorkerCommand::CancelSearch { .. }
@@ -4021,6 +4085,33 @@ mod tests {
         assert_eq!(offline.kind, FailureKind::Network);
         assert!(offline.retryable);
         assert!(offline.preserve_mail);
+    }
+
+    #[test]
+    fn preferences_save_failure_is_acknowledged_with_its_request_id() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(controller(command_rx, event_tx));
+            command_tx
+                .send(WorkerCommand::SavePreferences {
+                    request_id: PreferencesRequestId(28),
+                    preferences: cache::Preferences::new(51, cache::AppearancePreference::Dark),
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(WorkerEvent::PreferencesSaveFailed {
+                    request_id: PreferencesRequestId(28),
+                })
+            ));
+            command_tx.send(WorkerCommand::Shutdown).unwrap();
+            task.await.unwrap();
+        });
     }
 
     #[test]

@@ -23,6 +23,7 @@ use std::{
 };
 
 pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
+    render_appearance(ui, snapshot);
     if ui.search.text().as_str() != snapshot.search_query {
         ui.search.set_text(&snapshot.search_query);
     }
@@ -34,6 +35,7 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     render_filters(ui, snapshot.message_filter);
     render_sync(ui, snapshot);
     render_cache_usage(ui, snapshot);
+    render_account(ui, snapshot);
     render_banners(ui, snapshot);
     set_action_enabled(ui, "connect", snapshot.can_connect);
     set_action_enabled(ui, "refresh", snapshot.can_refresh);
@@ -91,6 +93,24 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
         render_label_menu(ui, snapshot);
         render_reader(ui, snapshot);
         ui.last_reader_revision.set(snapshot.reader_revision);
+    }
+}
+
+fn render_appearance(ui: &Ui, snapshot: &ViewSnapshot) {
+    let (selected, scheme) = appearance_presentation(snapshot.appearance);
+    if ui.appearance.selected() != selected {
+        ui.appearance.set_selected(selected);
+    }
+    adw::StyleManager::default().set_color_scheme(scheme);
+}
+
+fn appearance_presentation(
+    appearance: crate::cache::AppearancePreference,
+) -> (u32, adw::ColorScheme) {
+    match appearance {
+        crate::cache::AppearancePreference::System => (0, adw::ColorScheme::Default),
+        crate::cache::AppearancePreference::Light => (1, adw::ColorScheme::ForceLight),
+        crate::cache::AppearancePreference::Dark => (2, adw::ColorScheme::ForceDark),
     }
 }
 
@@ -418,66 +438,94 @@ fn format_bytes(bytes: u64) -> String {
 
 fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
     clear_list(&ui.folders);
-    for folder in &snapshot.folders {
-        let row = gtk::Button::builder()
-            .has_frame(false)
-            .css_classes(["whitford-folder-row"])
-            .build();
-        if folder.id == snapshot.selected_folder_id {
-            row.add_css_class("selected");
-        }
-        let selected = folder.id == snapshot.selected_folder_id;
-        let content = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(10)
-            .margin_bottom(10)
-            .build();
-        content.append(&gtk::Image::from_icon_name(folder.icon));
-        content.append(
+    for folder in &snapshot.sidebar_folders.primary {
+        append_folder_row(ui, snapshot, folder);
+    }
+    if !snapshot.sidebar_folders.labels.is_empty() {
+        ui.folders.append(
             &gtk::Label::builder()
-                .label(&folder.name)
+                .label("Labels")
                 .xalign(0.0)
-                .hexpand(true)
+                .margin_start(22)
+                .margin_top(18)
+                .margin_bottom(4)
+                .css_classes(["heading", "dim-label"])
                 .build(),
         );
-        let count = snapshot
-            .folder_counts
-            .iter()
-            .find(|(id, _)| id == &folder.id)
-            .map_or(0, |(_, count)| *count);
-        if count > 0 {
-            content.append(
-                &gtk::Label::builder()
-                    .label(count.to_string())
-                    .css_classes(["whitford-count"])
-                    .build(),
-            );
-        }
-        row.set_child(Some(&content));
-        let count_kind = "unread";
-        let selected_text = if selected { ", selected" } else { "" };
-        row.update_property(&[gtk::accessible::Property::Label(&format!(
-            "{}, {count} {count_kind}{selected_text}",
-            folder.name
-        ))]);
-        row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
-        let id = folder.id.clone();
-        row.connect_clicked({
-            let weak_ui = ui.downgrade();
-            move |_| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    ui.dispatch(Action::SelectFolder(id.clone()));
-                    if ui.outer.is_collapsed() {
-                        ui.outer.set_show_sidebar(false);
-                    }
+    }
+    for folder in &snapshot.sidebar_folders.labels {
+        append_folder_row(ui, snapshot, folder);
+    }
+}
+
+fn append_folder_row(ui: &Ui, snapshot: &ViewSnapshot, folder: &crate::model::Folder) {
+    let row = gtk::Button::builder()
+        .has_frame(false)
+        .css_classes(["whitford-folder-row"])
+        .build();
+    if folder.id == snapshot.selected_folder_id {
+        row.add_css_class("selected");
+    }
+    let selected = folder.id == snapshot.selected_folder_id;
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(10)
+        .margin_bottom(10)
+        .build();
+    content.append(&gtk::Image::from_icon_name(folder.icon));
+    content.append(
+        &gtk::Label::builder()
+            .label(&folder.name)
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    let count = snapshot
+        .folder_counts
+        .iter()
+        .find(|(id, _)| id == &folder.id)
+        .map_or(0, |(_, count)| *count);
+    if count > 0 {
+        content.append(
+            &gtk::Label::builder()
+                .label(count.to_string())
+                .css_classes(["whitford-count"])
+                .build(),
+        );
+    }
+    row.set_child(Some(&content));
+    let count_kind = "unread";
+    let selected_text = if selected { ", selected" } else { "" };
+    row.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{}, {count} {count_kind}{selected_text}",
+        folder.name
+    ))]);
+    row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
+    let id = folder.id.clone();
+    row.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::SelectFolder(id.clone()));
+                if ui.outer.is_collapsed() {
+                    ui.outer.set_show_sidebar(false);
                 }
             }
-        });
-        ui.folders.append(&row);
-    }
+        }
+    });
+    ui.folders.append(&row);
+}
+
+fn render_account(ui: &Ui, snapshot: &ViewSnapshot) {
+    ui.account_email.set_text(
+        snapshot
+            .account
+            .as_ref()
+            .map_or("Not connected", |account| account.email.as_str()),
+    );
 }
 
 fn render_messages(ui: &Ui, snapshot: &ViewSnapshot) {
@@ -1160,7 +1208,7 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
         }
     };
     ui.sync_title.set_text(&title);
-    ui.sync_detail.set_text(&detail);
+    ui.sync_detail.set_subtitle(&detail);
     // Keep the changing state explicit to assistive technologies as well as to
     // sighted users: the subtitle alone must not make a retrying or paused poll
     // sound like a successfully current Inbox.
@@ -1173,6 +1221,16 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
     } else {
         ui.sync_title.remove_css_class("whitford-online");
     }
+
+    // Keep Settings focused on actions that can be used in the current session.
+    // In the normal connected state this is deliberately only Refresh and
+    // Disconnect; recovery and authorization controls do not add clutter.
+    ui.sync_refresh.set_visible(snapshot.can_refresh);
+    ui.sync_retry.set_visible(snapshot.can_retry);
+    ui.sync_reopen.set_visible(snapshot.can_reopen);
+    ui.sync_cancel.set_visible(snapshot.can_cancel);
+    ui.account_connect.set_visible(snapshot.can_connect);
+    ui.account_disconnect.set_visible(snapshot.can_disconnect);
 }
 
 fn ready_sync_presentation(
@@ -1379,7 +1437,23 @@ fn clear_box(container: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SyncMetadata;
+    use crate::{cache::AppearancePreference, model::SyncMetadata};
+
+    #[test]
+    fn appearance_preferences_map_to_libadwaita_schemes() {
+        assert_eq!(
+            appearance_presentation(AppearancePreference::System),
+            (0, adw::ColorScheme::Default)
+        );
+        assert_eq!(
+            appearance_presentation(AppearancePreference::Light),
+            (1, adw::ColorScheme::ForceLight)
+        );
+        assert_eq!(
+            appearance_presentation(AppearancePreference::Dark),
+            (2, adw::ColorScheme::ForceDark)
+        );
+    }
 
     #[test]
     fn background_sync_status_never_claims_the_inbox_is_current() {

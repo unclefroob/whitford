@@ -26,7 +26,10 @@ fn main() -> gtk::glib::ExitCode {
     let application = adw::Application::builder().application_id(APP_ID).build();
 
     application.connect_startup(|_| {
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        // `Default` follows the desktop scheme and continues to follow a live
+        // system change. A persisted override, when one exists, is applied by
+        // the UI as soon as its state snapshot is available.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
         let provider = gtk::CssProvider::new();
         provider.load_from_string(include_str!("style.css"));
         if let Some(display) = gdk::Display::default() {
