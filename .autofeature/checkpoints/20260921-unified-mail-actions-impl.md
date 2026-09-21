@@ -25,4 +25,9 @@ scope: cross-stack
 
 ### Remaining
 
-1. Commit, push, and open PR against `master`.
+None.
+
+### Completed
+
+PR: https://github.com/unclefroob/whitford/pull/1
+Status: SHIPPED
