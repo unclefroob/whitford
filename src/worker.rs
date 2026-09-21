@@ -1402,6 +1402,11 @@ async fn controller(
     let search_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let content_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTENT_JOBS));
+    // An additional-account OAuth callback must stay alive while normal
+    // singleton commands (including background polling) continue. It is not
+    // an `Active` lifecycle task because replacing/cleaning singleton auth
+    // would make Google redirect to a listener that has just been aborted.
+    let mut add_account_task: Option<(OperationId, JoinHandle<()>)> = None;
     let mut body_task: Option<JoinHandle<()>> = None;
     let mut send_task: Option<JoinHandle<()>> = None;
     let mut folder_task: Option<JoinHandle<()>> = None;
@@ -1474,6 +1479,10 @@ async fn controller(
                 let _ = task.await;
             }
             if let Some((_, task)) = background_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = add_account_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -2184,6 +2193,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            if let Some((_, task)) = add_account_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
             for (_, task) in attachment_tasks.drain() {
                 task.abort();
                 let _ = task.await;
@@ -2191,6 +2204,37 @@ async fn controller(
             auth.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
+        }
+        if let WorkerCommand::Cancel { id } = command
+            && add_account_task
+                .as_ref()
+                .is_some_and(|(active_id, _)| *active_id == id)
+        {
+            let (_, task) = add_account_task.take().expect("checked above");
+            task.abort();
+            let _ = task.await;
+            let _ = events.send(WorkerEvent::Cancelled { id });
+            continue;
+        }
+        if let WorkerCommand::AddAccount { id } = command {
+            if let Some((active_id, task)) = add_account_task.take() {
+                if task.is_finished() {
+                    let _ = task.await;
+                } else {
+                    add_account_task = Some((active_id, task));
+                    fail(&events, id, FailureKind::WorkerUnavailable, true, true);
+                    continue;
+                }
+            }
+            let tx = events.clone();
+            let cache_io = cache_io.clone();
+            let task = tokio::spawn(async move {
+                if let Err(failure) = add_account(id, &tx, &cache_io).await {
+                    let _ = tx.send(WorkerEvent::Failed { id, failure });
+                }
+            });
+            add_account_task = Some((id, task));
+            continue;
         }
         let disconnecting = matches!(command, WorkerCommand::Disconnect { .. });
         let cleanup_failed = if let Some(current) = active.take() {
@@ -2297,18 +2341,7 @@ async fn controller(
                     }
                 })
             }
-            WorkerCommand::AddAccount { id } => {
-                let tx = events.clone();
-                let cache_io = cache_io.clone();
-                tokio::spawn(async move {
-                    // This task deliberately receives no `RuntimeAuth`.
-                    // Adding an account must never replace the account that
-                    // backs legacy compose, folder, and polling commands.
-                    if let Err(failure) = add_account(id, &tx, &cache_io).await {
-                        let _ = tx.send(WorkerEvent::Failed { id, failure });
-                    }
-                })
-            }
+            WorkerCommand::AddAccount { .. } => unreachable!("handled above"),
             WorkerCommand::Restore { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
