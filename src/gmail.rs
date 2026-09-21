@@ -9,6 +9,7 @@ use async_imap::{
     types::NameAttribute,
 };
 use futures_util::TryStreamExt;
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use tokio::{
     net::TcpStream,
@@ -29,6 +30,9 @@ const MAX_ATTACHMENTS: usize = 20;
 pub const ATTACHMENT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ATTACHMENT_ENCODED_BYTES: u64 = 150 * 1024 * 1024;
+const GMAIL_SEND_AS_ENDPOINT: &str =
+    "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs";
+const MAX_SEND_AS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_SEARCH_QUERY_BYTES: usize = 2 * 1024;
 pub const MAX_SEARCH_RESULTS: usize = 500;
 pub const SEARCH_SUMMARY_BATCH: usize = 100;
@@ -119,6 +123,122 @@ pub enum GmailError {
     MessageMissing,
     Protocol,
     TimedOut,
+    RateLimited,
+}
+
+#[derive(Deserialize)]
+struct SendAsListResponse {
+    #[serde(default, rename = "sendAs")]
+    send_as: Vec<SendAsResponse>,
+}
+
+#[derive(Deserialize)]
+struct SendAsResponse {
+    #[serde(rename = "sendAsEmail")]
+    email: Option<String>,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(rename = "isDefault", default)]
+    is_default: bool,
+    #[serde(rename = "verificationStatus")]
+    verification_status: Option<String>,
+}
+
+/// Lists only addresses Gmail has accepted for the authenticated account.
+/// The endpoint is deliberately `users/me`: callers cannot choose another
+/// mailbox or manufacture a From address by supplying an email parameter.
+pub async fn fetch_verified_send_as(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Vec<crate::model::GmailSendAsIdentity>, GmailError> {
+    if access_token.trim().is_empty() {
+        return Err(GmailError::AuthenticationFailed);
+    }
+    timeout(
+        Duration::from_secs(20),
+        fetch_verified_send_as_inner(client, access_token),
+    )
+    .await
+    .map_err(|_| GmailError::TimedOut)?
+}
+
+async fn fetch_verified_send_as_inner(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Vec<crate::model::GmailSendAsIdentity>, GmailError> {
+    let response = client
+        .get(GMAIL_SEND_AS_ENDPOINT)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(map_settings_transport_error)?;
+    if !response.status().is_success() {
+        return Err(map_settings_status(response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SEND_AS_RESPONSE_BYTES as u64)
+    {
+        return Err(GmailError::Protocol);
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(map_settings_transport_error)?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_SEND_AS_RESPONSE_BYTES {
+            return Err(GmailError::Protocol);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_verified_send_as_response(&body)
+}
+
+fn parse_verified_send_as_response(
+    body: &[u8],
+) -> Result<Vec<crate::model::GmailSendAsIdentity>, GmailError> {
+    let response: SendAsListResponse =
+        serde_json::from_slice(body).map_err(|_| GmailError::Protocol)?;
+    Ok(crate::model::GmailSendAsIdentity::bounded(
+        response
+            .send_as
+            .into_iter()
+            .filter(|identity| {
+                identity
+                    .verification_status
+                    .as_deref()
+                    .is_some_and(|status| status.eq_ignore_ascii_case("accepted"))
+            })
+            .filter_map(|identity| {
+                Some(crate::model::GmailSendAsIdentity {
+                    email: identity.email?,
+                    display_name: identity.display_name,
+                    is_default: identity.is_default,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn map_settings_transport_error(error: reqwest::Error) -> GmailError {
+    if error.is_timeout() {
+        GmailError::TimedOut
+    } else {
+        GmailError::Offline
+    }
+}
+
+fn map_settings_status(status: reqwest::StatusCode) -> GmailError {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            GmailError::AuthenticationFailed
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => GmailError::RateLimited,
+        status if status.is_server_error() => GmailError::Offline,
+        _ => GmailError::Protocol,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2188,6 +2308,42 @@ mod tests {
         decoded.extend(quoted.push(b"0world=\r", false).unwrap());
         decoded.extend(quoted.push(b"\nnext", true).unwrap());
         assert_eq!(decoded, b"hello worldnext");
+    }
+
+    #[test]
+    fn send_as_response_keeps_only_gmail_accepted_identities() {
+        let aliases = parse_verified_send_as_response(
+            br#"{
+                "sendAs": [
+                    {"sendAsEmail":"primary@example.com","displayName":"Primary","isDefault":true,"verificationStatus":"accepted"},
+                    {"sendAsEmail":"pending@example.com","verificationStatus":"pending"},
+                    {"sendAsEmail":"alias@example.com","verificationStatus":"ACCEPTED"},
+                    {"sendAsEmail":"missing-status@example.com"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0].email, "primary@example.com");
+        assert!(aliases[0].is_default);
+        assert_eq!(aliases[1].email, "alias@example.com");
+        assert!(!aliases[1].is_default);
+    }
+
+    #[test]
+    fn send_as_response_and_status_errors_are_typed() {
+        assert_eq!(
+            parse_verified_send_as_response(b"not json"),
+            Err(GmailError::Protocol)
+        );
+        assert_eq!(
+            map_settings_status(reqwest::StatusCode::UNAUTHORIZED),
+            GmailError::AuthenticationFailed
+        );
+        assert_eq!(
+            map_settings_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            GmailError::RateLimited
+        );
     }
 
     #[test]

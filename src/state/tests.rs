@@ -376,6 +376,93 @@ fn account_projection_rejects_a_duplicate_gmail_identity() {
 }
 
 #[test]
+fn compose_from_only_accepts_connected_primary_identities() {
+    let first = multi_account_id(91);
+    let second = multi_account_id(92);
+    let mut state = AppState::new();
+    for (id, email) in [
+        (&first, "personal@example.com"),
+        (&second, "work@example.com"),
+    ] {
+        state.dispatch(Action::UpsertAccountMailbox {
+            account_id: id.clone(),
+            identity: multi_account(email),
+            session: SessionState::Ready,
+            mailbox: None,
+        });
+    }
+    state.draft_catalog_state = DraftCatalogState::Ready;
+    state.composer = ComposerState::Editing {
+        draft: compatibility_draft(
+            crate::composer::new_message("draft-from".into(), "personal@example.com", "").unwrap(),
+        ),
+    };
+
+    state.dispatch(Action::SelectComposeFrom(second.clone()));
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { draft } if draft.compose.account_email == "work@example.com"
+    ));
+
+    state.dispatch(Action::SelectComposeFrom(multi_account_id(93)));
+    assert!(matches!(
+        state.snapshot().composer,
+        ComposerState::Editing { draft } if draft.compose.account_email == "work@example.com"
+    ));
+}
+
+#[test]
+fn verified_send_as_rows_are_request_bound_and_not_picker_identities() {
+    let account_id = multi_account_id(94);
+    let mut state = AppState::new();
+    let update = state.dispatch(Action::UpsertAccountMailbox {
+        account_id: account_id.clone(),
+        identity: multi_account("person@example.com"),
+        session: SessionState::Ready,
+        mailbox: None,
+    });
+    let (request_id, generation) = match update.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::FetchAccountSendAs {
+                request_id,
+                generation,
+                account_id: received,
+                account_email,
+            }),
+        ] if received == &account_id && account_email == "person@example.com" => {
+            (*request_id, *generation)
+        }
+        other => panic!("expected send-as fetch, got {other:?}"),
+    };
+    state.dispatch(Action::Worker(WorkerEvent::AccountSendAsLoaded {
+        request_id,
+        generation,
+        account_id: account_id.clone(),
+        aliases: vec![
+            crate::model::GmailSendAsIdentity {
+                email: "alias@example.com".into(),
+                display_name: Some("Alias".into()),
+                is_default: false,
+            },
+            crate::model::GmailSendAsIdentity {
+                email: "ALIAS@example.com".into(),
+                display_name: Some("Duplicate".into()),
+                is_default: true,
+            },
+        ],
+    }));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.verified_send_as.len(), 1);
+    assert_eq!(snapshot.verified_send_as[0].aliases.len(), 1);
+    assert_eq!(
+        snapshot.verified_send_as[0].aliases[0].email,
+        "alias@example.com"
+    );
+    assert_eq!(snapshot.compose_identities.len(), 1);
+    assert_eq!(snapshot.compose_identities[0].email, "person@example.com");
+}
+
+#[test]
 fn background_tick_is_separate_from_foreground_and_duplicate_events_notify_once() {
     let mut state = AppState::new();
     ready(&mut state);
@@ -2644,11 +2731,8 @@ fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
             _ => None,
         })
         .expect("close save");
-    assert!(matches!(
-        state.snapshot().composer,
-        ComposerState::Editing { .. }
-    ));
-    assert!(state.snapshot().composer_close_pending);
+    assert!(matches!(state.snapshot().composer, ComposerState::Closed));
+    assert!(!state.snapshot().composer_close_pending);
     let saved = state.dispatch(Action::Worker(WorkerEvent::DraftSaved {
         operation_id,
         generation: state.draft_generation,
@@ -2656,7 +2740,7 @@ fn hiding_saves_and_resume_restores_local_draft_then_discard_deletes_it() {
         draft_id,
         revision,
     }));
-    assert_eq!(saved.feedback, Some("Draft saved on this device"));
+    assert_eq!(saved.feedback, None);
     assert!(matches!(state.snapshot().composer, ComposerState::Closed));
 
     state.dispatch(Action::ResumeDraft);

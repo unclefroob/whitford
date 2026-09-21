@@ -5,6 +5,10 @@ pub const MAX_FOLDER_MAILBOX_BYTES: usize = 1_024;
 pub const MAX_FOLDER_CATALOG_ENTRIES: usize = 256;
 pub const MAX_MESSAGE_LABELS: usize = 256;
 pub const MAX_ACCOUNTS: usize = 32;
+/// Gmail currently limits send-as addresses to far fewer entries than this.
+/// Keep the client-side cap explicit so a malformed provider response cannot
+/// turn an identity selector into an unbounded allocation.
+pub const MAX_GMAIL_SEND_AS_IDENTITIES: usize = 100;
 
 /// An opaque, durable identifier for an account.  It is deliberately unrelated
 /// to the email address: account IDs are used in filenames, cache keys and
@@ -212,6 +216,69 @@ impl AccountIdentity {
         !self.email.trim().is_empty()
             && self.email.len() <= 320
             && !self.email.chars().any(char::is_control)
+    }
+}
+
+/// A Gmail address which Google's Settings API has confirmed can be used as a
+/// `From` identity for the authenticated account.  It is intentionally a
+/// separate type from `AccountIdentity`: an account owns credentials, whereas
+/// a send-as identity is only an authorized presentation address.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GmailSendAsIdentity {
+    pub email: String,
+    pub display_name: Option<String>,
+    pub is_default: bool,
+}
+
+impl GmailSendAsIdentity {
+    pub fn is_valid(&self) -> bool {
+        !self.email.trim().is_empty()
+            && self.email.len() <= 320
+            && !self.email.chars().any(char::is_control)
+            && self.display_name.as_ref().is_none_or(|name| {
+                !name.trim().is_empty()
+                    && name.len() <= 1_024
+                    && !name.chars().any(char::is_control)
+            })
+    }
+
+    /// Sanitizes a provider response into a deterministic, bounded selector
+    /// list.  The Gmail API permits one default address; if a malformed
+    /// response claims more, retain the first deterministic address only.
+    pub fn bounded(mut identities: Vec<Self>) -> Vec<Self> {
+        identities.retain(Self::is_valid);
+        for identity in &mut identities {
+            identity.email = identity.email.trim().to_owned();
+            identity.display_name = identity
+                .display_name
+                .take()
+                .map(|name| name.trim().to_owned());
+        }
+        // Group equal addresses before de-duplicating. Prefer a default row
+        // if a malformed response repeats an address with conflicting flags.
+        identities.sort_by(|left, right| {
+            left.email
+                .to_ascii_lowercase()
+                .cmp(&right.email.to_ascii_lowercase())
+                .then_with(|| right.is_default.cmp(&left.is_default))
+        });
+        identities.dedup_by(|left, right| left.email.eq_ignore_ascii_case(&right.email));
+        identities.sort_by(|left, right| {
+            right.is_default.cmp(&left.is_default).then_with(|| {
+                left.email
+                    .to_ascii_lowercase()
+                    .cmp(&right.email.to_ascii_lowercase())
+            })
+        });
+        let mut default_seen = false;
+        for identity in &mut identities {
+            if identity.is_default && default_seen {
+                identity.is_default = false;
+            }
+            default_seen |= identity.is_default;
+        }
+        identities.truncate(MAX_GMAIL_SEND_AS_IDENTITIES);
+        identities
     }
 }
 
@@ -733,5 +800,46 @@ mod tests {
             AccountRegistryError::DuplicateIdentity
         );
         assert!(registry.get(&id).is_some());
+    }
+
+    #[test]
+    fn send_as_identities_are_bounded_deduplicated_and_have_one_default() {
+        let identities = GmailSendAsIdentity::bounded(vec![
+            GmailSendAsIdentity {
+                email: " beta@example.com ".into(),
+                display_name: Some(" Beta ".into()),
+                is_default: true,
+            },
+            GmailSendAsIdentity {
+                email: "ALPHA@example.com".into(),
+                display_name: None,
+                is_default: true,
+            },
+            GmailSendAsIdentity {
+                email: "alpha@example.com".into(),
+                display_name: Some("duplicate".into()),
+                is_default: false,
+            },
+            GmailSendAsIdentity {
+                email: "\ninvalid@example.com".into(),
+                display_name: None,
+                is_default: false,
+            },
+        ]);
+        assert_eq!(
+            identities,
+            vec![
+                GmailSendAsIdentity {
+                    email: "ALPHA@example.com".into(),
+                    display_name: None,
+                    is_default: true,
+                },
+                GmailSendAsIdentity {
+                    email: "beta@example.com".into(),
+                    display_name: Some("Beta".into()),
+                    is_default: false,
+                },
+            ]
+        );
     }
 }

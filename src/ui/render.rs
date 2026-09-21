@@ -162,6 +162,8 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
     let (draft, sending, failure) = match &snapshot.composer {
         ComposerState::Closed => {
             ui.composer_window.set_visible(false);
+            ui.composer_inline_host.set_visible(false);
+            ui.composer_popped_out.set(false);
             *ui.composer_message_id.borrow_mut() = None;
             ui.composer_inline_ids.borrow_mut().clear();
             ui.composer_attachment_fingerprint.set(u64::MAX);
@@ -172,6 +174,15 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
         ComposerState::Failed { draft, failure } => (draft, false, Some(*failure)),
     };
     if ui.composer_message_id.borrow().as_deref() != Some(&draft.compose.id) {
+        let reply_in_reader = matches!(
+            draft.compose.kind,
+            crate::composer::ComposeKind::Reply { .. }
+                | crate::composer::ComposeKind::ReplyAll { .. }
+        );
+        // A newly opened reply starts inline; new messages and forwards are
+        // independent windows.  Once the user pops a reply out, rendering
+        // never pulls it back into the mailbox.
+        ui.composer_popped_out.set(!reply_in_reader);
         *ui.composer_message_id.borrow_mut() = Some(draft.compose.id.clone());
         ui.composer_to
             .set_text(&format_recipients(&draft.compose.to));
@@ -189,8 +200,11 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
             .iter()
             .map(|v| v.content_id.clone())
             .collect();
-        ui.composer_window.present();
-        ui.composer_editor.view.grab_focus();
+        if reply_in_reader {
+            ui.show_composer_inline();
+        } else {
+            ui.pop_out_composer();
+        }
     }
     let current_inline = draft
         .compose
@@ -215,6 +229,24 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
     let staging = snapshot.pending_attachment_staging > 0;
     let closing = snapshot.composer_close_pending;
     let locked = sending || closing;
+    ui.composer_from
+        .set_label(&format!("From: {}", draft.compose.account_email));
+    ui.composer_from_menu.remove_all();
+    for identity in &snapshot.compose_identities {
+        let label = if identity
+            .email
+            .eq_ignore_ascii_case(&draft.compose.account_email)
+        {
+            format!("✓ {}", identity.email)
+        } else {
+            identity.email.clone()
+        };
+        let item = gtk::gio::MenuItem::new(Some(&label), Some("win.select-compose-from"));
+        item.set_attribute_value("target", Some(&identity.account_id.as_str().to_variant()));
+        ui.composer_from_menu.append_item(&item);
+    }
+    ui.composer_from
+        .set_sensitive(!locked && snapshot.compose_identities.len() > 1);
     for entry in [
         &ui.composer_to,
         &ui.composer_cc,
@@ -232,6 +264,8 @@ fn render_composer(ui: &Ui, snapshot: &ViewSnapshot) {
     ui.composer_attach.set_sensitive(!locked);
     ui.composer_inline.set_sensitive(!locked);
     ui.composer_signature.set_sensitive(!locked);
+    ui.composer_expand
+        .set_visible(!ui.composer_popped_out.get());
     let mut hasher = DefaultHasher::new();
     draft.compose.attachments.hash(&mut hasher);
     draft.compose.inline_images.hash(&mut hasher);

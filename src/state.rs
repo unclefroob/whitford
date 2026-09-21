@@ -3,16 +3,16 @@ use crate::{
     composer::{self, ComposeDraft, Recipient},
     model::{
         AccountFolderId, AccountId, AccountIdentity, AccountMessageId, CacheUsage, Folder,
-        FolderId, FolderKind, MAX_ACCOUNTS, MailboxSnapshot, MessageBody, MessageId,
-        MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState,
+        FolderId, FolderKind, GmailSendAsIdentity, MAX_ACCOUNTS, MailboxSnapshot, MessageBody,
+        MessageId, MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState,
     },
     smtp,
     worker::{
         AttachmentDestination, AttachmentFailure, AttachmentJobId, BackgroundSyncRequestId,
         BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
         FolderRequestId, MutationRequestId, OperationId, PreferencesRequestId,
-        RestoredAccountMailbox, SearchRequestId, SendFailure, SendRequestId, ServiceFailure,
-        SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+        RestoredAccountMailbox, SearchRequestId, SendAsRequestId, SendFailure, SendRequestId,
+        ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
 use std::{
@@ -97,6 +97,14 @@ pub struct AppState {
     // increasing operation IDs, but never occupy the singleton lifecycle
     // slot. This lets one account recover without interrupting the rest.
     account_operations: BTreeMap<AccountId, OperationId>,
+    // Send-as rows are provider-verified data. They are kept separately from
+    // the primary-account picker: SMTP routing currently supports only an
+    // account's primary identity, while this makes verified aliases available
+    // to the next send transport without ever accepting free-form From text.
+    verified_send_as: BTreeMap<AccountId, Vec<GmailSendAsIdentity>>,
+    next_send_as_request: u64,
+    send_as_generation: u64,
+    pending_send_as: BTreeMap<AccountId, SendAsRequestId>,
 }
 
 /// The account-scoped navigation identity. `UnifiedInbox` has no provider
@@ -127,6 +135,23 @@ pub struct AccountViewSummary {
     pub identity: AccountIdentity,
     pub session: SessionState,
     pub unread_count: usize,
+}
+
+/// A selectable From identity. These entries are derived exclusively from
+/// connected account records; UI parameters are treated only as opaque IDs and
+/// are checked again by the state reducer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposeIdentity {
+    pub account_id: AccountId,
+    pub email: String,
+}
+
+/// Provider-verified aliases retained for future send-as transport support.
+/// They are deliberately not selectable by the primary-account picker yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedSendAsIdentities {
+    pub account_id: AccountId,
+    pub aliases: Vec<GmailSendAsIdentity>,
 }
 
 /// A message in a state projection. The account-scoped ID is required even
@@ -415,6 +440,9 @@ pub enum Action {
         account_id: AccountId,
         identity: AccountIdentity,
     },
+    /// Changes the current draft's sender to another connected account's
+    /// primary identity. The address itself never crosses the UI boundary.
+    SelectComposeFrom(AccountId),
     /// Starts additive Gmail OAuth. This is separate from `Connect`, which
     /// retains its established singleton session semantics.
     AddAccount,
@@ -589,6 +617,11 @@ pub struct ViewSnapshot {
     /// Account registry used by account-aware UI. It is ordered by opaque
     /// account ID, giving settings/sidebar consumers a stable result.
     pub accounts: Vec<AccountViewSummary>,
+    /// Primary identities eligible for the compose From picker.
+    pub compose_identities: Vec<ComposeIdentity>,
+    /// Verified Gmail send-as aliases received from the worker. They remain
+    /// non-selectable until the send transport can route them safely.
+    pub verified_send_as: Vec<VerifiedSendAsIdentities>,
     /// The selected account-aware navigation destination. The legacy
     /// `selected_folder_id` remains available for singleton renderers.
     pub mailbox_view: MailboxView,
@@ -686,6 +719,27 @@ fn message_is_in_folder(message: &MessageSummary, folder_id: &FolderId) -> bool 
         FolderId::Inbox => message_is_in_inbox(message),
         _ => message.folder_id == *folder_id,
     }
+}
+
+fn normalize_verified_send_as(
+    aliases: Vec<crate::model::GmailSendAsIdentity>,
+) -> Vec<crate::model::GmailSendAsIdentity> {
+    let mut seen = HashSet::new();
+    let mut aliases = aliases
+        .into_iter()
+        .filter(|alias| alias.is_valid())
+        .filter(|alias| seen.insert(alias.email.trim().to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    // A deterministic order makes this safe to expose in later picker UI and
+    // keeps a provider's default identity first without trusting its ordering.
+    aliases.sort_by(|left, right| {
+        right.is_default.cmp(&left.is_default).then_with(|| {
+            left.email
+                .to_ascii_lowercase()
+                .cmp(&right.email.to_ascii_lowercase())
+        })
+    });
+    aliases
 }
 
 /// Newest first, with a total ordering for equal or missing provider dates.
@@ -866,6 +920,10 @@ impl AppState {
             selected_mailbox_view: MailboxView::UnifiedInbox,
             selected_account_message: None,
             account_operations: BTreeMap::new(),
+            verified_send_as: BTreeMap::new(),
+            next_send_as_request: 1,
+            send_as_generation: 1,
+            pending_send_as: BTreeMap::new(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -884,6 +942,7 @@ impl AppState {
                 account_id,
                 identity,
             } => self.register_legacy_account(account_id, identity),
+            Action::SelectComposeFrom(account_id) => self.select_compose_from(account_id),
             Action::AddAccount => self.start_add_account(),
             Action::ReconnectAccount { account_id } => self.reconnect_account(account_id),
             Action::RemoveAccount { account_id } => self.remove_account(account_id),
@@ -1364,6 +1423,36 @@ impl AppState {
             return self.account_projection_worker_event(event);
         }
         match event {
+            WorkerEvent::AccountSendAsLoaded {
+                request_id,
+                generation,
+                account_id,
+                aliases,
+            } => {
+                if generation != self.send_as_generation
+                    || self.pending_send_as.get(&account_id) != Some(&request_id)
+                    || !self.account_mailboxes.contains_key(&account_id)
+                {
+                    return Update::default();
+                }
+                self.pending_send_as.remove(&account_id);
+                self.verified_send_as
+                    .insert(account_id, normalize_verified_send_as(aliases));
+                Update::default()
+            }
+            WorkerEvent::AccountSendAsFailed {
+                request_id,
+                generation,
+                account_id,
+                failure: _,
+            } => {
+                if generation == self.send_as_generation
+                    && self.pending_send_as.get(&account_id) == Some(&request_id)
+                {
+                    self.pending_send_as.remove(&account_id);
+                }
+                Update::default()
+            }
             WorkerEvent::AccountMailboxesRestored { id, accounts } => {
                 if self.active_operation != Some(id) {
                     return Update::default();
@@ -2143,16 +2232,14 @@ impl AppState {
                     return Update::default();
                 }
                 self.account_operations.remove(&account_id);
-                let _ = self.upsert_account_mailbox(
+                let mut update = self.upsert_account_mailbox(
                     account_id,
                     account,
                     SessionState::Ready,
                     Some(snapshot),
                 );
-                Update {
-                    feedback: Some("Gmail account reconnected"),
-                    ..Default::default()
-                }
+                update.feedback = Some("Gmail account reconnected");
+                update
             }
             WorkerEvent::AccountRemoved { id, account_id } => {
                 if self.account_operations.get(&account_id) != Some(&id) {
@@ -2233,16 +2320,15 @@ impl AppState {
                 ..
             } => {
                 self.adding_account_operation = None;
-                let _ = self.upsert_account_mailbox(
+                let mut update = self.upsert_account_mailbox(
                     account_id,
                     account,
                     SessionState::Ready,
                     Some(snapshot),
                 );
-                Update {
-                    feedback: Some("Gmail account added"),
-                    effects: vec![Effect::ClearAuthorization { id }],
-                }
+                update.feedback = Some("Gmail account added");
+                update.effects.push(Effect::ClearAuthorization { id });
+                update
             }
             WorkerEvent::Failed { .. } => {
                 self.adding_account_operation = None;
@@ -2597,8 +2683,9 @@ impl AppState {
             .get(&account_id)
             .map(|account| account.folders.clone())
             .unwrap_or_default();
+        let ready = matches!(session, SessionState::Ready);
         self.account_mailboxes.insert(
-            account_id,
+            account_id.clone(),
             AccountMailbox {
                 identity,
                 session,
@@ -2608,7 +2695,13 @@ impl AppState {
         );
         self.reconcile_account_selection();
         self.bump_list();
-        Update::default()
+        let mut update = Update::default();
+        if ready {
+            update
+                .effects
+                .extend(self.fetch_verified_send_as(&account_id));
+        }
+        update
     }
 
     fn restore_account_mailboxes(&mut self, accounts: Vec<RestoredAccountMailbox>) -> Update {
@@ -2722,9 +2815,75 @@ impl AppState {
         if self.account_mailboxes.remove(account_id).is_none() {
             return Update::default();
         }
+        self.verified_send_as.remove(account_id);
+        self.pending_send_as.remove(account_id);
         self.reconcile_account_selection();
         self.bump_list();
         Update::default()
+    }
+
+    fn fetch_verified_send_as(&mut self, account_id: &AccountId) -> Vec<Effect> {
+        if self.pending_send_as.contains_key(account_id) {
+            return Vec::new();
+        }
+        let Some(account) = self.account_mailboxes.get(account_id) else {
+            return Vec::new();
+        };
+        if !matches!(account.session, SessionState::Ready) {
+            return Vec::new();
+        }
+        let request_id = SendAsRequestId(self.next_send_as_request);
+        self.next_send_as_request = self.next_send_as_request.wrapping_add(1).max(1);
+        self.pending_send_as.insert(account_id.clone(), request_id);
+        vec![Effect::SendWorker(WorkerCommand::FetchAccountSendAs {
+            request_id,
+            generation: self.send_as_generation,
+            account_id: account_id.clone(),
+            account_email: account.identity.email.clone(),
+        })]
+    }
+
+    fn select_compose_from(&mut self, account_id: AccountId) -> Update {
+        let Some(account) = self.account_mailboxes.get(&account_id) else {
+            return Update {
+                feedback: Some("That Gmail identity is unavailable"),
+                ..Default::default()
+            };
+        };
+        if !matches!(account.session, SessionState::Ready) {
+            return Update {
+                feedback: Some("Reconnect that Gmail account before using it as From"),
+                ..Default::default()
+            };
+        }
+        let account_email = account.identity.email.clone();
+        let draft = match &mut self.composer {
+            ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
+            ComposerState::Closed | ComposerState::Sending { .. } => return Update::default(),
+        };
+        if draft
+            .compose
+            .account_email
+            .eq_ignore_ascii_case(&account_email)
+        {
+            return Update::default();
+        }
+        // Staged files are partitioned by account email. Do not make a draft
+        // point at another account before those files can be moved atomically.
+        if !draft.compose.attachments.is_empty()
+            || !draft.compose.inline_images.is_empty()
+            || !self.pending_attachment_staging.is_empty()
+        {
+            return Update {
+                feedback: Some("Remove attachments before changing From"),
+                ..Default::default()
+            };
+        }
+        draft.compose.account_email = account_email;
+        draft.compose.dirty_revision = draft.compose.dirty_revision.wrapping_add(1);
+        let compose = draft.compose.clone();
+        self.upsert_saved_draft(compose.clone());
+        self.queue_draft_save(compose, None)
     }
 
     fn select_mailbox_view(&mut self, view: MailboxView) -> Update {
@@ -2847,6 +3006,28 @@ impl AppState {
                             .count()
                     })
                     .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn compose_identities(&self) -> Vec<ComposeIdentity> {
+        self.account_mailboxes
+            .iter()
+            .filter(|(_, account)| matches!(account.session, SessionState::Ready))
+            .map(|(account_id, account)| ComposeIdentity {
+                account_id: account_id.clone(),
+                email: account.identity.email.clone(),
+            })
+            .collect()
+    }
+
+    fn verified_send_as_identities(&self) -> Vec<VerifiedSendAsIdentities> {
+        self.verified_send_as
+            .iter()
+            .filter(|(account_id, _)| self.account_mailboxes.contains_key(*account_id))
+            .map(|(account_id, aliases)| VerifiedSendAsIdentities {
+                account_id: account_id.clone(),
+                aliases: aliases.clone(),
             })
             .collect()
     }
@@ -3038,6 +3219,8 @@ impl AppState {
                 BackgroundSyncStatus::Idle
             },
             accounts: self.account_view_summaries(),
+            compose_identities: self.compose_identities(),
+            verified_send_as: self.verified_send_as_identities(),
             mailbox_view: self.selected_mailbox_view.clone(),
             account_visible_messages,
             selected_account_message: self.selected_account_message.clone(),
@@ -4856,7 +5039,12 @@ impl AppState {
             return Update::default();
         };
         self.upsert_saved_draft(compose.clone());
-        self.queue_draft_save(compose, Some(false))
+        // Closing a draft is a navigation action, not a storage transaction.
+        // Queue the durable write, but release the editor immediately so an
+        // unavailable or slow worker can never trap the user in a reply.
+        let update = self.queue_draft_save(compose, None);
+        self.composer = ComposerState::Closed;
+        update
     }
     fn hide_composer_and_close_app(&mut self) -> Update {
         if !self.pending_attachment_staging.is_empty() {
@@ -5168,12 +5356,18 @@ impl AppState {
             ComposerState::Editing { draft } | ComposerState::Failed { draft, .. } => draft,
             ComposerState::Closed | ComposerState::Sending { .. } => return Update::default(),
         };
-        let Some(account_email) = self.account.as_ref().map(|account| account.email.clone()) else {
+        if self.account.is_none() {
             return Update {
                 feedback: Some("Connect Gmail before sending"),
                 ..Default::default()
             };
-        };
+        }
+        if !self.compose_sender_is_connected(&draft.compose.account_email) {
+            return Update {
+                feedback: Some("Choose a connected Gmail identity before sending"),
+                ..Default::default()
+            };
+        }
         if draft.body.trim().is_empty()
             && draft.compose.attachments.is_empty()
             && draft.compose.inline_images.is_empty()
@@ -5195,7 +5389,7 @@ impl AppState {
             };
         }
         if let Err(error) = smtp::build_message(&smtp::MailSubmission {
-            account_email: account_email.clone(),
+            account_email: draft.compose.account_email.clone(),
             to: draft.compose.to.clone(),
             cc: draft.compose.cc.clone(),
             bcc: draft.compose.bcc.clone(),
@@ -5266,6 +5460,15 @@ impl AppState {
             effects: vec![Effect::SendWorker(command)],
             ..Default::default()
         }
+    }
+
+    fn compose_sender_is_connected(&self, email: &str) -> bool {
+        self.account_mailboxes.values().any(|account| {
+            matches!(account.session, SessionState::Ready)
+                && account.identity.email.eq_ignore_ascii_case(email)
+        }) || (self.account.as_ref().is_some_and(|account| {
+            matches!(self.session, SessionState::Ready) && account.email.eq_ignore_ascii_case(email)
+        }))
     }
 
     fn finish_account_send(

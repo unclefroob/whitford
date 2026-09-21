@@ -74,7 +74,15 @@ pub(super) fn build(
     let settings = build_settings_page();
     let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &message_status, &search, &list_menu);
-    let (reader_page, reader, reader_banner, label_menu) = build_reader_page(&reader_menu);
+    // A reply starts beside the conversation.  It can be promoted to a normal
+    // desktop window without creating a second draft.
+    let inline_composer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .visible(false)
+        .css_classes(["whitford-inline-composer"])
+        .build();
+    let (reader_page, reader, reader_banner, label_menu) =
+        build_reader_page(&reader_menu, &inline_composer);
 
     let inner = adw::NavigationSplitView::builder()
         .sidebar(&message_page)
@@ -114,7 +122,7 @@ pub(super) fn build(
         .content(&toast_overlay)
         .css_classes(["whitford-window"])
         .build();
-    let composer = build_composer(&window);
+    let composer = build_composer();
     window.set_size_request(600, 560);
     add_breakpoints(
         &window,
@@ -159,6 +167,11 @@ pub(super) fn build(
         sync_reopen: settings.sync_reopen,
         sync_cancel: settings.sync_cancel,
         composer_window: composer.window,
+        composer_content: composer.content,
+        composer_inline_host: inline_composer,
+        composer_popped_out: Rc::new(Cell::new(false)),
+        composer_from: composer.from,
+        composer_from_menu: composer.from_menu,
         composer_to: composer.to,
         composer_cc: composer.cc,
         composer_bcc: composer.bcc,
@@ -194,6 +207,9 @@ pub(super) fn build(
 
 struct ComposerWidgets {
     window: adw::Window,
+    content: gtk::ScrolledWindow,
+    from: gtk::MenuButton,
+    from_menu: gtk::gio::Menu,
     to: gtk::Entry,
     cc: gtk::Entry,
     bcc: gtk::Entry,
@@ -215,7 +231,14 @@ struct ComposerWidgets {
     error: gtk::Label,
 }
 
-fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
+fn build_composer() -> ComposerWidgets {
+    let from_menu = gtk::gio::Menu::new();
+    let from = gtk::MenuButton::builder()
+        .label("From")
+        .menu_model(&from_menu)
+        .tooltip_text("Choose the connected Gmail account to send from")
+        .build();
+    from.update_property(&[gtk::accessible::Property::Label("From identity")]);
     let to = recipient_entry("To", "Recipients, separated by commas");
     let cc = recipient_entry("Cc", "Carbon copy recipients");
     let bcc = recipient_entry("Bcc", "Blind carbon copy recipients");
@@ -321,7 +344,8 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
         .label("Send")
         .css_classes(["suggested-action"])
         .build();
-    let hide = gtk::Button::with_label("Save & Close");
+    let hide = gtk::Button::with_label("Close");
+    hide.set_tooltip_text(Some("Close this draft. It is saved automatically."));
     let discard = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
         .tooltip_text("Discard draft")
@@ -329,7 +353,7 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
     discard.update_property(&[gtk::accessible::Property::Label("Discard draft")]);
     let expand = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
-        .tooltip_text("Expand composer")
+        .tooltip_text("Pop out composer")
         .build();
     expand.update_property(&[gtk::accessible::Property::Label("Expand composer")]);
     let refresh = gtk::Button::with_label("Refresh Gmail");
@@ -373,6 +397,7 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
             .css_classes(["title-1"])
             .build(),
     );
+    content.append(&from);
     let recipients = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -408,14 +433,16 @@ fn build_composer(window: &adw::ApplicationWindow) -> ComposerWidgets {
         .build();
     let composer = adw::Window::builder()
         .title("Compose — Whitford")
-        .default_width(560)
-        .default_height(520)
+        .default_width(720)
+        .default_height(640)
         .modal(false)
-        .transient_for(window)
         .content(&content_scroll)
         .build();
     ComposerWidgets {
         window: composer,
+        content: content_scroll,
+        from,
+        from_menu,
         to,
         cc,
         bcc,
@@ -505,12 +532,10 @@ pub(super) fn connect_signals(ui: &Ui) {
         }
     });
     ui.composer_expand.connect_clicked({
-        let window = ui.composer_window.clone();
+        let weak_ui = ui.downgrade();
         move |_| {
-            if window.width() < 800 {
-                window.set_default_size(900, 760)
-            } else {
-                window.set_default_size(620, 600)
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.pop_out_composer();
             }
         }
     });
@@ -1143,6 +1168,7 @@ fn build_message_page(
 
 fn build_reader_page(
     menu: &gtk::Button,
+    inline_composer: &gtk::Box,
 ) -> (adw::NavigationPage, gtk::Box, gtk::Box, gtk::gio::Menu) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -1196,6 +1222,7 @@ fn build_reader_page(
             .child(&reader)
             .build(),
     );
+    content.append(inline_composer);
     toolbar.set_content(Some(&content));
     (
         adw::NavigationPage::with_tag(&toolbar, "Message", "reader"),

@@ -33,6 +33,21 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "reply-all", |ui| ui.dispatch(Action::BeginReplyAll));
     add(ui, "forward", |ui| ui.dispatch(Action::BeginForward));
     add(ui, "resume-draft", |ui| ui.dispatch(Action::ResumeDraft));
+    let from_identity =
+        gio::SimpleAction::new("select-compose-from", Some(&String::static_variant_type()));
+    let weak_ui = ui.downgrade();
+    from_identity.connect_activate(move |_, parameter| {
+        let Some(account_id) = parameter
+            .and_then(|value| value.str())
+            .and_then(|value| crate::model::AccountId::new(value.to_owned()).ok())
+        else {
+            return;
+        };
+        if let Some(ui) = weak_ui.upgrade() {
+            ui.dispatch(Action::SelectComposeFrom(account_id));
+        }
+    });
+    ui.window.add_action(&from_identity);
     add(ui, "send-message", Ui::send_message);
     add(ui, "cancel-compose", Ui::request_close_composer);
     add(ui, "focus-search", |ui| {

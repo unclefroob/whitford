@@ -4,8 +4,9 @@ use crate::{
     config, drafts, gmail, message,
     model::{
         AccountId, AccountIdentity, AccountMessageId, AccountRecord, CacheUsage, FolderCatalog,
-        FolderDescriptor, FolderId, FolderKind, MailProvider, MailboxSnapshot, MessageBody,
-        MessageId, MessageLocator, MessageMutation, ReconciledMessageState, SyncMetadata,
+        FolderDescriptor, FolderId, FolderKind, GmailSendAsIdentity, MailProvider, MailboxSnapshot,
+        MessageBody, MessageId, MessageLocator, MessageMutation, ReconciledMessageState,
+        SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -55,6 +56,10 @@ pub struct CacheOperationId(pub u64);
 pub struct PreferencesRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SendRequestId(pub u64);
+/// Correlates a verified Gmail send-as identity lookup.  It is distinct from
+/// sending: resolving eligible identities must never submit a message.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SendAsRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DraftOperationId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -394,6 +399,14 @@ pub enum SendFailure {
     DeliveryUncertain,
     Protocol,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendAsFailure {
+    Offline,
+    TimedOut,
+    AuthorizationRequired,
+    RateLimited,
+    Protocol,
+}
 /// A generic composer submission. It intentionally carries only private staged
 /// file references; attachment bytes are loaded on the blocking worker lane.
 pub struct ComposeSubmission {
@@ -552,6 +565,15 @@ pub enum WorkerCommand {
         account_id: AccountId,
         account_email: String,
         submission: Box<ComposeSubmission>,
+    },
+    /// Loads Gmail-approved From identities for exactly this account. The
+    /// opaque account ID chooses the refresh token; `account_email` is only a
+    /// registry consistency check and is never sent to Google's API.
+    FetchAccountSendAs {
+        request_id: SendAsRequestId,
+        generation: u64,
+        account_id: AccountId,
+        account_email: String,
     },
     LoadDrafts {
         operation_id: DraftOperationId,
@@ -769,6 +791,17 @@ impl fmt::Debug for WorkerCommand {
                 .field("generation", generation)
                 .field("account_id", account_id)
                 .field("content", &"[REDACTED]")
+                .finish(),
+            Self::FetchAccountSendAs {
+                request_id,
+                generation,
+                account_id,
+                ..
+            } => f
+                .debug_struct("FetchAccountSendAs")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
                 .finish(),
             Self::LoadDrafts { operation_id, .. } => f
                 .debug_struct("LoadDrafts")
@@ -1090,6 +1123,18 @@ pub enum WorkerEvent {
         generation: u64,
         account_id: AccountId,
         failure: SendFailure,
+    },
+    AccountSendAsLoaded {
+        request_id: SendAsRequestId,
+        generation: u64,
+        account_id: AccountId,
+        aliases: Vec<GmailSendAsIdentity>,
+    },
+    AccountSendAsFailed {
+        request_id: SendAsRequestId,
+        generation: u64,
+        account_id: AccountId,
+        failure: SendAsFailure,
     },
     DraftsLoaded {
         operation_id: DraftOperationId,
@@ -1505,6 +1550,30 @@ impl fmt::Debug for WorkerEvent {
                 failure,
             } => f
                 .debug_struct("AccountMessageSendFailed")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
+                .field("failure", failure)
+                .finish(),
+            Self::AccountSendAsLoaded {
+                request_id,
+                generation,
+                account_id,
+                aliases,
+            } => f
+                .debug_struct("AccountSendAsLoaded")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field("account_id", account_id)
+                .field("count", &aliases.len())
+                .finish(),
+            Self::AccountSendAsFailed {
+                request_id,
+                generation,
+                account_id,
+                failure,
+            } => f
+                .debug_struct("AccountSendAsFailed")
                 .field("request_id", request_id)
                 .field("generation", generation)
                 .field("account_id", account_id)
@@ -2381,6 +2450,44 @@ async fn controller(
             });
             continue;
         }
+        if let WorkerCommand::FetchAccountSendAs {
+            request_id,
+            generation,
+            account_id,
+            account_email,
+        } = command
+        {
+            let tx = events.clone();
+            tokio::spawn(async move {
+                let event_account_id = account_id.clone();
+                let result = async {
+                    let token = scoped_access_token(&account_id, &account_email)
+                        .await
+                        .map_err(map_send_as_body_failure)?;
+                    let client = oauth::http_client().map_err(|_| SendAsFailure::Offline)?;
+                    gmail::fetch_verified_send_as(&client, token.as_str())
+                        .await
+                        .map_err(map_send_as_gmail)
+                }
+                .await;
+                let event = match result {
+                    Ok(aliases) => WorkerEvent::AccountSendAsLoaded {
+                        request_id,
+                        generation,
+                        account_id: event_account_id,
+                        aliases,
+                    },
+                    Err(failure) => WorkerEvent::AccountSendAsFailed {
+                        request_id,
+                        generation,
+                        account_id: event_account_id,
+                        failure,
+                    },
+                };
+                let _ = tx.send(event);
+            });
+            continue;
+        }
         if let WorkerCommand::FetchBody {
             request_id,
             generation,
@@ -2872,6 +2979,7 @@ async fn controller(
             | WorkerCommand::CancelSearch { .. }
             | WorkerCommand::FetchBody { .. }
             | WorkerCommand::FetchAccountBody { .. }
+            | WorkerCommand::FetchAccountSendAs { .. }
             | WorkerCommand::DownloadAttachment { .. }
             | WorkerCommand::CancelAttachment { .. }
             | WorkerCommand::ClearBodyCache { .. }
@@ -3636,6 +3744,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::CancelSearch { .. }
         | WorkerCommand::FetchBody { .. }
         | WorkerCommand::FetchAccountBody { .. }
+        | WorkerCommand::FetchAccountSendAs { .. }
         | WorkerCommand::DownloadAttachment { .. }
         | WorkerCommand::CancelAttachment { .. }
         | WorkerCommand::ClearBodyCache { .. }
@@ -5124,7 +5233,33 @@ fn map_body_failure(error: gmail::GmailError) -> BodyFailure {
         gmail::GmailError::AuthenticationFailed => BodyFailure::AuthorizationRequired,
         gmail::GmailError::MailboxChanged => BodyFailure::MailboxChanged,
         gmail::GmailError::MessageMissing => BodyFailure::Missing,
-        gmail::GmailError::InboxUnavailable | gmail::GmailError::Protocol => BodyFailure::Protocol,
+        gmail::GmailError::InboxUnavailable
+        | gmail::GmailError::Protocol
+        | gmail::GmailError::RateLimited => BodyFailure::Protocol,
+    }
+}
+
+fn map_send_as_body_failure(error: BodyFailure) -> SendAsFailure {
+    match error {
+        BodyFailure::Offline => SendAsFailure::Offline,
+        BodyFailure::TimedOut => SendAsFailure::TimedOut,
+        BodyFailure::AuthorizationRequired => SendAsFailure::AuthorizationRequired,
+        BodyFailure::MailboxChanged | BodyFailure::Missing | BodyFailure::Protocol => {
+            SendAsFailure::Protocol
+        }
+    }
+}
+
+fn map_send_as_gmail(error: gmail::GmailError) -> SendAsFailure {
+    match error {
+        gmail::GmailError::Offline | gmail::GmailError::TlsFailed => SendAsFailure::Offline,
+        gmail::GmailError::TimedOut => SendAsFailure::TimedOut,
+        gmail::GmailError::AuthenticationFailed => SendAsFailure::AuthorizationRequired,
+        gmail::GmailError::RateLimited => SendAsFailure::RateLimited,
+        gmail::GmailError::InboxUnavailable
+        | gmail::GmailError::MailboxChanged
+        | gmail::GmailError::MessageMissing
+        | gmail::GmailError::Protocol => SendAsFailure::Protocol,
     }
 }
 
@@ -5281,6 +5416,7 @@ fn map_gmail(error: gmail::GmailError) -> ServiceFailure {
         }
         gmail::GmailError::Protocol => FailureKind::ImapProtocol,
         gmail::GmailError::TimedOut => FailureKind::SyncTimedOut,
+        gmail::GmailError::RateLimited => FailureKind::RateLimited,
     };
     failure(kind, true, true)
 }
@@ -6157,5 +6293,33 @@ mod tests {
         assert!(debug.contains("trash"));
         assert!(!debug.contains("private@example.com"));
         assert!(!debug.contains("[Gmail]/Trash"));
+    }
+
+    #[test]
+    fn send_as_lookup_is_account_scoped_redacted_and_maps_failures() {
+        let account_id = account_id('d');
+        let command = WorkerCommand::FetchAccountSendAs {
+            request_id: SendAsRequestId(7),
+            generation: 3,
+            account_id: account_id.clone(),
+            account_email: "private@example.com".into(),
+        };
+        let debug = format!("{command:?}");
+        assert_eq!(command_id(&command), None);
+        assert!(debug.contains("FetchAccountSendAs"));
+        assert!(debug.contains(account_id.as_str()));
+        assert!(!debug.contains("private@example.com"));
+        assert_eq!(
+            map_send_as_gmail(gmail::GmailError::AuthenticationFailed),
+            SendAsFailure::AuthorizationRequired
+        );
+        assert_eq!(
+            map_send_as_gmail(gmail::GmailError::RateLimited),
+            SendAsFailure::RateLimited
+        );
+        assert_eq!(
+            map_send_as_body_failure(BodyFailure::TimedOut),
+            SendAsFailure::TimedOut
+        );
     }
 }

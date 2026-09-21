@@ -75,6 +75,12 @@ pub struct Ui {
     pub(crate) sync_reopen: adw::ActionRow,
     pub(crate) sync_cancel: adw::ActionRow,
     pub(crate) composer_window: adw::Window,
+    pub(crate) composer_content: gtk::ScrolledWindow,
+    pub(crate) composer_inline_host: gtk::Box,
+    /// The current draft has been explicitly promoted out of the reader.
+    pub(crate) composer_popped_out: Rc<Cell<bool>>,
+    pub(crate) composer_from: gtk::MenuButton,
+    pub(crate) composer_from_menu: gtk::gio::Menu,
     pub(crate) composer_to: gtk::Entry,
     pub(crate) composer_cc: gtk::Entry,
     pub(crate) composer_bcc: gtk::Entry,
@@ -136,6 +142,11 @@ pub(crate) struct WeakUi {
     sync_reopen: gtk::glib::WeakRef<adw::ActionRow>,
     sync_cancel: gtk::glib::WeakRef<adw::ActionRow>,
     composer_window: gtk::glib::WeakRef<adw::Window>,
+    composer_content: gtk::glib::WeakRef<gtk::ScrolledWindow>,
+    composer_inline_host: gtk::glib::WeakRef<gtk::Box>,
+    composer_popped_out: Weak<Cell<bool>>,
+    composer_from: gtk::glib::WeakRef<gtk::MenuButton>,
+    composer_from_menu: gtk::gio::Menu,
     composer_to: gtk::glib::WeakRef<gtk::Entry>,
     composer_cc: gtk::glib::WeakRef<gtk::Entry>,
     composer_bcc: gtk::glib::WeakRef<gtk::Entry>,
@@ -225,6 +236,11 @@ impl Ui {
             sync_reopen: self.sync_reopen.downgrade(),
             sync_cancel: self.sync_cancel.downgrade(),
             composer_window: self.composer_window.downgrade(),
+            composer_content: self.composer_content.downgrade(),
+            composer_inline_host: self.composer_inline_host.downgrade(),
+            composer_popped_out: Rc::downgrade(&self.composer_popped_out),
+            composer_from: self.composer_from.downgrade(),
+            composer_from_menu: self.composer_from_menu.clone(),
             composer_to: self.composer_to.downgrade(),
             composer_cc: self.composer_cc.downgrade(),
             composer_bcc: self.composer_bcc.downgrade(),
@@ -340,6 +356,27 @@ impl Ui {
                 });
             }
         }
+    }
+
+    /// Promote the current reply to a normal, compositor-managed window.  This
+    /// is deliberately not a dialog: Hyprland can tile, float, minimise, and
+    /// focus it independently from the mailbox.
+    pub(crate) fn pop_out_composer(&self) {
+        self.composer_popped_out.set(true);
+        self.composer_content.unparent();
+        self.composer_inline_host.set_visible(false);
+        self.composer_window
+            .set_content(Some(&self.composer_content));
+        self.composer_window.present();
+        self.composer_editor.view.grab_focus();
+    }
+
+    pub(crate) fn show_composer_inline(&self) {
+        self.composer_content.unparent();
+        self.composer_window.set_visible(false);
+        self.composer_inline_host.append(&self.composer_content);
+        self.composer_inline_host.set_visible(true);
+        self.composer_editor.view.grab_focus();
     }
 
     pub(crate) fn save_composer_then_close_app(&self) {
@@ -624,6 +661,11 @@ impl WeakUi {
             sync_reopen: self.sync_reopen.upgrade()?,
             sync_cancel: self.sync_cancel.upgrade()?,
             composer_window: self.composer_window.upgrade()?,
+            composer_content: self.composer_content.upgrade()?,
+            composer_inline_host: self.composer_inline_host.upgrade()?,
+            composer_popped_out: self.composer_popped_out.upgrade()?,
+            composer_from: self.composer_from.upgrade()?,
+            composer_from_menu: self.composer_from_menu.clone(),
             composer_to: self.composer_to.upgrade()?,
             composer_cc: self.composer_cc.upgrade()?,
             composer_bcc: self.composer_bcc.upgrade()?,
