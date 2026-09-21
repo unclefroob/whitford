@@ -1,3 +1,4 @@
+use crate::model::AccountId;
 use secret_service::{EncryptionType, SecretService};
 use std::{collections::HashMap, fmt};
 use zeroize::Zeroizing;
@@ -34,6 +35,10 @@ pub enum SecretError {
     ReadFailed,
     SaveFailed,
     DeleteFailed,
+    /// A legacy singleton token and an account-scoped token disagree. Never
+    /// overwrite either credential; the caller can ask the person to
+    /// reconnect instead.
+    MigrationConflict,
 }
 
 fn attributes() -> HashMap<&'static str, &'static str> {
@@ -44,6 +49,27 @@ fn attributes() -> HashMap<&'static str, &'static str> {
         ("kind", "oauth-refresh-token"),
         ("schema-version", "1"),
     ])
+}
+
+fn account_attributes(account_id: &AccountId) -> HashMap<&str, &str> {
+    let mut attributes = HashMap::from([
+        ("xdg:schema", "dev.whitford.OAuthRefreshToken"),
+        ("application", "dev.whitford.Whitford"),
+        ("provider", "gmail"),
+        ("kind", "oauth-refresh-token"),
+        ("schema-version", "2"),
+    ]);
+    attributes.insert("account-id", account_id.as_str());
+    attributes
+}
+
+/// The result of safely moving the original singleton keyring item into an
+/// account namespace. A failed delete is deliberately reported as an error:
+/// retrying is idempotent and leaves the legacy item intact until it succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyTokenMigration {
+    NoLegacyToken,
+    Migrated,
 }
 
 pub async fn load() -> Result<Option<RefreshToken>, SecretError> {
@@ -57,6 +83,34 @@ pub async fn load() -> Result<Option<RefreshToken>, SecretError> {
     unlock_collection(&collection).await?;
     let items = collection
         .search_items(attributes())
+        .await
+        .map_err(|_| SecretError::ReadFailed)?;
+    unlock_items(&items).await?;
+    match items.len() {
+        0 => Ok(None),
+        1 => {
+            let bytes = items[0]
+                .get_secret()
+                .await
+                .map_err(|_| SecretError::ReadFailed)?;
+            classify_secret_values(vec![bytes])
+        }
+        _ => Err(SecretError::Ambiguous),
+    }
+}
+
+/// Loads exactly one refresh token belonging to `account_id`.
+pub async fn load_for_account(account_id: &AccountId) -> Result<Option<RefreshToken>, SecretError> {
+    let service = SecretService::connect(EncryptionType::Dh)
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    let collection = service
+        .get_default_collection()
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    unlock_collection(&collection).await?;
+    let items = collection
+        .search_items(account_attributes(account_id))
         .await
         .map_err(|_| SecretError::ReadFailed)?;
     unlock_items(&items).await?;
@@ -95,6 +149,33 @@ pub async fn replace(token: &RefreshToken) -> Result<(), SecretError> {
     Ok(())
 }
 
+/// Replaces only this account's token. The account ID is an opaque selector,
+/// so one Gmail identity can never overwrite another account's item.
+pub async fn replace_for_account(
+    account_id: &AccountId,
+    token: &RefreshToken,
+) -> Result<(), SecretError> {
+    let service = SecretService::connect(EncryptionType::Dh)
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    let collection = service
+        .get_default_collection()
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    unlock_collection(&collection).await?;
+    collection
+        .create_item(
+            LABEL,
+            account_attributes(account_id),
+            token.expose().as_bytes(),
+            true,
+            CONTENT_TYPE,
+        )
+        .await
+        .map_err(|_| SecretError::SaveFailed)?;
+    Ok(())
+}
+
 pub async fn delete() -> Result<(), SecretError> {
     let service = SecretService::connect(EncryptionType::Dh)
         .await
@@ -115,6 +196,51 @@ pub async fn delete() -> Result<(), SecretError> {
         item.delete().await.map_err(|_| SecretError::DeleteFailed)?;
     }
     Ok(())
+}
+
+/// Deletes the scoped item(s) for one account and never touches legacy or
+/// other-account credentials.
+pub async fn delete_for_account(account_id: &AccountId) -> Result<(), SecretError> {
+    let service = SecretService::connect(EncryptionType::Dh)
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    let collection = service
+        .get_default_collection()
+        .await
+        .map_err(|_| SecretError::Unavailable)?;
+    unlock_collection(&collection).await?;
+    let items = collection
+        .search_items(account_attributes(account_id))
+        .await
+        .map_err(|_| SecretError::DeleteFailed)?;
+    unlock_items(&items)
+        .await
+        .map_err(|_| SecretError::DeleteFailed)?;
+    for item in items {
+        item.delete().await.map_err(|_| SecretError::DeleteFailed)?;
+    }
+    Ok(())
+}
+
+/// One-time, recoverable migration for installations with the old singleton
+/// record. The scoped write happens before the legacy delete. If a process
+/// stops between them, retrying compares the two values and only completes
+/// deletion when they are identical.
+pub async fn migrate_legacy_to_account(
+    account_id: &AccountId,
+) -> Result<LegacyTokenMigration, SecretError> {
+    let Some(legacy) = load().await? else {
+        return Ok(LegacyTokenMigration::NoLegacyToken);
+    };
+    match load_for_account(account_id).await? {
+        Some(scoped) if scoped.expose() != legacy.expose() => {
+            return Err(SecretError::MigrationConflict);
+        }
+        Some(_) => {}
+        None => replace_for_account(account_id, &legacy).await?,
+    }
+    delete().await?;
+    Ok(LegacyTokenMigration::Migrated)
 }
 
 async fn unlock_collection(collection: &secret_service::Collection<'_>) -> Result<(), SecretError> {
@@ -196,6 +322,15 @@ mod tests {
         let attrs = attributes();
         assert_eq!(attrs.len(), 5);
         assert_eq!(attrs["provider"], "gmail");
+    }
+    #[test]
+    fn account_attributes_are_namespaced_by_opaque_id() {
+        let account = AccountId::new("acct-0123456789abcdef0123456789abcdef").unwrap();
+        let attrs = account_attributes(&account);
+        assert_eq!(attrs.len(), 6);
+        assert_eq!(attrs["schema-version"], "2");
+        assert_eq!(attrs["account-id"], account.as_str());
+        assert!(!attrs.contains_key("email"));
     }
     #[test]
     fn secret_contract_classifies_zero_one_multiple_and_boundaries() {

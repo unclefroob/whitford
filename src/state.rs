@@ -2,8 +2,9 @@ use crate::{
     cache::{self, AppearancePreference, Preferences},
     composer::{self, ComposeDraft, Recipient},
     model::{
-        AccountIdentity, CacheUsage, Folder, FolderId, FolderKind, MailboxSnapshot, MessageBody,
-        MessageId, MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState,
+        AccountFolderId, AccountId, AccountIdentity, AccountMessageId, CacheUsage, Folder,
+        FolderId, FolderKind, MAX_ACCOUNTS, MailboxSnapshot, MessageBody, MessageId,
+        MessageMutation, MessageSummary, MutationDimension, ReconciledMessageState,
     },
     smtp,
     worker::{
@@ -15,7 +16,7 @@ use crate::{
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -28,6 +29,10 @@ const MAX_EMITTED_BACKGROUND_IDS: usize = cache::MAX_SUMMARIES_PER_FOLDER;
 pub struct AppState {
     session: SessionState,
     active_operation: Option<OperationId>,
+    // Add-account OAuth is deliberately independent of the singleton
+    // lifecycle operation. Its events can update only the account-aware
+    // projection and must never replace `account`, `mailbox`, or `session`.
+    adding_account_operation: Option<OperationId>,
     next_operation: u64,
     account: Option<AccountIdentity>,
     mailbox: Option<MailboxSnapshot>,
@@ -80,6 +85,54 @@ pub struct AppState {
     next_attachment_job: u64,
     attachment_jobs: HashMap<AttachmentJobId, AttachmentDownload>,
     background_sync: BackgroundSyncState,
+    // This is deliberately a projection-only registry for the incremental
+    // multi-account rollout. The existing singleton fields above still drive
+    // worker commands until they become account keyed. Keeping this separate
+    // prevents a partially migrated worker event from changing another
+    // account's visible data.
+    account_mailboxes: BTreeMap<AccountId, AccountMailbox>,
+    selected_mailbox_view: MailboxView,
+    selected_account_message: Option<AccountMessageId>,
+}
+
+/// The account-scoped navigation identity. `UnifiedInbox` has no provider
+/// folder counterpart; every other destination is explicitly namespaced by an
+/// opaque account ID.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum MailboxView {
+    #[default]
+    UnifiedInbox,
+    AccountFolder(AccountFolderId),
+}
+
+/// A mailbox snapshot belonging to one account. It is intentionally separate
+/// from the singleton `AppState::mailbox` while worker/cache protocols are
+/// migrated incrementally.
+#[derive(Clone, Debug)]
+struct AccountMailbox {
+    identity: AccountIdentity,
+    session: SessionState,
+    inbox: Option<MailboxSnapshot>,
+    folders: HashMap<FolderId, MailboxSnapshot>,
+}
+
+/// A compact account row for sidebar/settings consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountViewSummary {
+    pub id: AccountId,
+    pub identity: AccountIdentity,
+    pub session: SessionState,
+    pub unread_count: usize,
+}
+
+/// A message in a state projection. The account-scoped ID is required even
+/// where Gmail's message ID looks globally unique: Gmail only guarantees it
+/// within an account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountMessageSummary {
+    pub id: AccountMessageId,
+    pub account: AccountIdentity,
+    pub message: MessageSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +373,37 @@ pub enum ServerSearchView {
 #[derive(Debug)]
 pub enum Action {
     Startup,
+    /// Inserts or replaces one account's independently loaded mailbox
+    /// projection. This is a state boundary, not a worker protocol: worker
+    /// migration can begin feeding it without changing existing commands.
+    UpsertAccountMailbox {
+        account_id: AccountId,
+        identity: AccountIdentity,
+        session: SessionState,
+        mailbox: Option<MailboxSnapshot>,
+    },
+    /// Stores a loaded non-unified folder without replacing the account's
+    /// Inbox projection. This lets a foreground folder view coexist with the
+    /// deterministic Unified Inbox.
+    UpsertAccountFolder {
+        folder: AccountFolderId,
+        snapshot: MailboxSnapshot,
+    },
+    /// Bridges the verified legacy singleton account into the account-aware
+    /// projection. It does not change the singleton account, worker runtime,
+    /// or credential ownership.
+    RegisterLegacyAccount {
+        account_id: AccountId,
+        identity: AccountIdentity,
+    },
+    /// Starts additive Gmail OAuth. This is separate from `Connect`, which
+    /// retains its established singleton session semantics.
+    AddAccount,
+    RemoveAccountMailbox {
+        account_id: AccountId,
+    },
+    SelectMailboxView(MailboxView),
+    SelectAccountMessage(AccountMessageId),
     Connect,
     Refresh,
     CancelAuthorization,
@@ -476,6 +560,16 @@ pub struct ViewSnapshot {
     pub label_options: Vec<(String, String, bool)>,
     pub attachment_downloads: Vec<AttachmentDownload>,
     pub background_sync_status: BackgroundSyncStatus,
+    /// Account registry used by account-aware UI. It is ordered by opaque
+    /// account ID, giving settings/sidebar consumers a stable result.
+    pub accounts: Vec<AccountViewSummary>,
+    /// The selected account-aware navigation destination. The legacy
+    /// `selected_folder_id` remains available for singleton renderers.
+    pub mailbox_view: MailboxView,
+    /// Messages for `mailbox_view`. In Unified Inbox this is the deterministic
+    /// newest-first merge across all account Inbox projections.
+    pub account_visible_messages: Vec<AccountMessageSummary>,
+    pub selected_account_message: Option<AccountMessageId>,
 }
 
 /// A UI-ready projection of the provider folder catalog.
@@ -555,6 +649,64 @@ fn sidebar_folders(catalog: Option<&crate::model::FolderCatalog>) -> SidebarFold
     SidebarFolders { primary, labels }
 }
 
+fn message_is_in_inbox(message: &MessageSummary) -> bool {
+    // Older cached Inbox snapshots did not retain the system-label bit. Their
+    // folder identity is sufficient for this compatibility projection.
+    message.in_inbox || message.folder_id == FolderId::Inbox
+}
+
+fn message_is_in_folder(message: &MessageSummary, folder_id: &FolderId) -> bool {
+    match folder_id {
+        FolderId::Inbox => message_is_in_inbox(message),
+        _ => message.folder_id == *folder_id,
+    }
+}
+
+/// Newest first, with a total ordering for equal or missing provider dates.
+/// The opaque account ID comes before the Gmail message ID so two accounts
+/// containing the same Gmail ID remain distinct and consistently ordered.
+fn compare_account_messages_newest_first(
+    left: &AccountMessageSummary,
+    right: &AccountMessageSummary,
+) -> std::cmp::Ordering {
+    right
+        .message
+        .received_at_unix
+        .cmp(&left.message.received_at_unix)
+        .then_with(|| left.id.account_id.cmp(&right.id.account_id))
+        .then_with(|| left.id.message_id.0.cmp(&right.id.message_id.0))
+        .then_with(|| {
+            left.message
+                .locator
+                .uid_validity
+                .cmp(&right.message.locator.uid_validity)
+        })
+        .then_with(|| left.message.locator.uid.cmp(&right.message.locator.uid))
+        .then_with(|| left.message.subject.cmp(&right.message.subject))
+}
+
+/// Only lifecycle events carry an operation ID. Keeping this extraction at
+/// the reducer boundary lets additive OAuth consume its own events before the
+/// legacy singleton lifecycle reducer sees them.
+fn worker_operation_id(event: &WorkerEvent) -> Option<OperationId> {
+    match event {
+        WorkerEvent::LegacyAccountRegistered { id, .. }
+        | WorkerEvent::Phase { id, .. }
+        | WorkerEvent::AuthorizationRequired { id, .. }
+        | WorkerEvent::IdentityVerified { id, .. }
+        | WorkerEvent::DuplicateAccountIdentity { id, .. }
+        | WorkerEvent::AccountAdded { id, .. }
+        | WorkerEvent::AccountPersisted { id, .. }
+        | WorkerEvent::CacheLoaded { id, .. }
+        | WorkerEvent::NoStoredAccount { id }
+        | WorkerEvent::SyncComplete { id, .. }
+        | WorkerEvent::Disconnected { id }
+        | WorkerEvent::Cancelled { id }
+        | WorkerEvent::Failed { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UndoMessageOperationView {
     pub id: u64,
@@ -628,6 +780,7 @@ impl AppState {
         Self {
             session: SessionState::Disconnected,
             active_operation: None,
+            adding_account_operation: None,
             next_operation: 1,
             account: None,
             mailbox: None,
@@ -679,11 +832,31 @@ impl AppState {
             next_attachment_job: 1,
             attachment_jobs: HashMap::new(),
             background_sync: BackgroundSyncState::default(),
+            account_mailboxes: BTreeMap::new(),
+            selected_mailbox_view: MailboxView::UnifiedInbox,
+            selected_account_message: None,
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
         match action {
             Action::Startup => self.start(SyncKind::Restore),
+            Action::UpsertAccountMailbox {
+                account_id,
+                identity,
+                session,
+                mailbox,
+            } => self.upsert_account_mailbox(account_id, identity, session, mailbox),
+            Action::UpsertAccountFolder { folder, snapshot } => {
+                self.upsert_account_folder(folder, snapshot)
+            }
+            Action::RegisterLegacyAccount {
+                account_id,
+                identity,
+            } => self.register_legacy_account(account_id, identity),
+            Action::AddAccount => self.start_add_account(),
+            Action::RemoveAccountMailbox { account_id } => self.remove_account_mailbox(&account_id),
+            Action::SelectMailboxView(view) => self.select_mailbox_view(view),
+            Action::SelectAccountMessage(id) => self.select_account_message(id),
             Action::Connect => self.start(SyncKind::Connect),
             Action::Refresh => {
                 if self.account.is_some() {
@@ -696,13 +869,13 @@ impl AppState {
                 }
             }
             Action::CancelAuthorization => self.cancel(),
-            Action::ReopenAuthorization => {
-                self.active_operation
-                    .map_or_else(Update::default, |id| Update {
-                        effects: vec![Effect::LaunchAuthorization { id }],
-                        ..Default::default()
-                    })
-            }
+            Action::ReopenAuthorization => self
+                .active_operation
+                .or(self.adding_account_operation)
+                .map_or_else(Update::default, |id| Update {
+                    effects: vec![Effect::LaunchAuthorization { id }],
+                    ..Default::default()
+                }),
             Action::RequestDisconnect => self.request_disconnect(),
             Action::ConfirmDisconnect => {
                 if matches!(self.composer, ComposerState::Sending { .. }) {
@@ -726,7 +899,16 @@ impl AppState {
                 },
             },
             Action::BrowserLaunchFailed(id) => {
-                if self.active_operation == Some(id) {
+                if self.adding_account_operation == Some(id) {
+                    self.adding_account_operation = None;
+                    Update {
+                        feedback: Some("Could not open your browser"),
+                        effects: vec![
+                            Effect::SendWorker(WorkerCommand::Cancel { id }),
+                            Effect::ClearAuthorization { id },
+                        ],
+                    }
+                } else if self.active_operation == Some(id) {
                     self.session = SessionState::ServiceError {
                         failure: ServiceFailure {
                             kind: FailureKind::BrowserLaunchFailed,
@@ -754,6 +936,7 @@ impl AppState {
             Action::WorkerUnavailable => {
                 let cancel_background = self.stop_background_sync();
                 self.active_operation = None;
+                self.adding_account_operation = None;
                 self.recovery = None;
                 let _ = self.invalidate_server_search();
                 self.pending_mutations.clear();
@@ -908,6 +1091,12 @@ impl AppState {
         }
     }
     fn start(&mut self, kind: SyncKind) -> Update {
+        if self.adding_account_operation.is_some() {
+            return Update {
+                feedback: Some("Wait for the additional Gmail account to finish connecting"),
+                ..Default::default()
+            };
+        }
         if matches!(self.composer, ComposerState::Sending { .. }) {
             return Update {
                 feedback: Some("Wait for the message to finish sending before reconnecting"),
@@ -953,7 +1142,41 @@ impl AppState {
             ..Default::default()
         }
     }
+    fn start_add_account(&mut self) -> Update {
+        // The worker has one OAuth listener slot. Rejecting this locally
+        // avoids superseding a Connect/Restore operation and, importantly,
+        // leaves the singleton mailbox untouched.
+        if self.active_operation.is_some() || self.adding_account_operation.is_some() {
+            return Update {
+                feedback: Some("Wait for the current Gmail connection to finish"),
+                ..Default::default()
+            };
+        }
+        let current = self.next_operation;
+        let Some(next) = current.checked_add(1) else {
+            return Update {
+                feedback: Some("Mail worker is unavailable"),
+                ..Default::default()
+            };
+        };
+        self.next_operation = next;
+        let id = OperationId(current);
+        self.adding_account_operation = Some(id);
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::AddAccount { id })],
+            ..Default::default()
+        }
+    }
     fn cancel(&mut self) -> Update {
+        if let Some(id) = self.adding_account_operation.take() {
+            return Update {
+                effects: vec![
+                    Effect::SendWorker(WorkerCommand::Cancel { id }),
+                    Effect::ClearAuthorization { id },
+                ],
+                ..Default::default()
+            };
+        }
         let old = self.active_operation;
         let Some(id) = self.allocate() else {
             return Update::default();
@@ -968,6 +1191,12 @@ impl AppState {
         }
     }
     fn disconnect(&mut self) -> Update {
+        if self.adding_account_operation.is_some() {
+            return Update {
+                feedback: Some("Wait for the additional Gmail account to finish connecting"),
+                ..Default::default()
+            };
+        }
         let account_email = match self.account.as_ref() {
             Some(account) => account.email.clone(),
             None if self.recovery == Some(RecoveryAction::Disconnect) => String::new(),
@@ -1018,6 +1247,12 @@ impl AppState {
         Some(id)
     }
     fn worker_event(&mut self, event: WorkerEvent) -> Update {
+        if self
+            .adding_account_operation
+            .is_some_and(|id| worker_operation_id(&event) == Some(id))
+        {
+            return self.add_account_worker_event(event);
+        }
         match event {
             WorkerEvent::AttachmentProgress {
                 job_id,
@@ -1095,13 +1330,13 @@ impl AppState {
                 generation,
                 folder_id,
                 snapshot,
-            } => self.folder_loaded(request_id, generation, folder_id, snapshot, true),
+            } => self.folder_loaded_and_project(request_id, generation, folder_id, snapshot, true),
             WorkerEvent::FolderLoaded {
                 request_id,
                 generation,
                 folder_id,
                 snapshot,
-            } => self.folder_loaded(request_id, generation, folder_id, snapshot, false),
+            } => self.folder_loaded_and_project(request_id, generation, folder_id, snapshot, false),
             WorkerEvent::FolderFailed {
                 request_id,
                 generation,
@@ -1653,6 +1888,7 @@ impl AppState {
                     self.mailbox = Some(snapshot);
                     self.normalize();
                     self.bump_list();
+                    self.mirror_singleton_inbox_projection();
                 }
                 let mut effects = Vec::new();
                 if count > 0 {
@@ -1688,11 +1924,82 @@ impl AppState {
         }
     }
 
+    fn add_account_worker_event(&mut self, event: WorkerEvent) -> Update {
+        let Some(id) = worker_operation_id(&event) else {
+            return Update::default();
+        };
+        if self.adding_account_operation != Some(id) {
+            return Update::default();
+        }
+        match event {
+            WorkerEvent::Phase { .. } | WorkerEvent::IdentityVerified { .. } => Update::default(),
+            WorkerEvent::AuthorizationRequired { .. } => Update {
+                // The singleton session stays Ready (or whatever it already
+                // was); this deadline is only for the browser authorization
+                // owned by the additional account.
+                effects: vec![Effect::LaunchAuthorization { id }],
+                ..Default::default()
+            },
+            WorkerEvent::DuplicateAccountIdentity { .. } => {
+                self.adding_account_operation = None;
+                Update {
+                    feedback: Some("That Gmail account is already connected"),
+                    effects: vec![Effect::ClearAuthorization { id }],
+                }
+            }
+            WorkerEvent::AccountAdded {
+                account_id,
+                account,
+                snapshot,
+                ..
+            } => {
+                self.adding_account_operation = None;
+                let _ = self.upsert_account_mailbox(
+                    account_id,
+                    account,
+                    SessionState::Ready,
+                    Some(snapshot),
+                );
+                Update {
+                    feedback: Some("Gmail account added"),
+                    effects: vec![Effect::ClearAuthorization { id }],
+                }
+            }
+            WorkerEvent::Failed { .. } => {
+                self.adding_account_operation = None;
+                Update {
+                    feedback: Some("Could not add the Gmail account"),
+                    effects: vec![Effect::ClearAuthorization { id }],
+                }
+            }
+            WorkerEvent::Cancelled { .. } => {
+                self.adding_account_operation = None;
+                Update {
+                    effects: vec![Effect::ClearAuthorization { id }],
+                    ..Default::default()
+                }
+            }
+            // The additive command emits none of the singleton state events.
+            // Ignore any stale/injected lifecycle event rather than allowing
+            // it to mutate the active legacy account.
+            WorkerEvent::LegacyAccountRegistered { .. }
+            | WorkerEvent::AccountPersisted { .. }
+            | WorkerEvent::CacheLoaded { .. }
+            | WorkerEvent::NoStoredAccount { .. }
+            | WorkerEvent::SyncComplete { .. }
+            | WorkerEvent::Disconnected { .. } => Update::default(),
+            _ => Update::default(),
+        }
+    }
+
     fn account_worker_event(&mut self, event: WorkerEvent) -> Update {
         let id = match &event {
-            WorkerEvent::Phase { id, .. }
+            WorkerEvent::LegacyAccountRegistered { id, .. }
+            | WorkerEvent::Phase { id, .. }
             | WorkerEvent::AuthorizationRequired { id, .. }
             | WorkerEvent::IdentityVerified { id, .. }
+            | WorkerEvent::DuplicateAccountIdentity { id, .. }
+            | WorkerEvent::AccountAdded { id, .. }
             | WorkerEvent::AccountPersisted { id, .. }
             | WorkerEvent::CacheLoaded { id, .. }
             | WorkerEvent::NoStoredAccount { id }
@@ -1737,6 +2044,14 @@ impl AppState {
             return Update::default();
         }
         match event {
+            WorkerEvent::LegacyAccountRegistered {
+                account_id,
+                account,
+                ..
+            } => self.register_legacy_account(account_id, account),
+            WorkerEvent::DuplicateAccountIdentity { .. } | WorkerEvent::AccountAdded { .. } => {
+                unreachable!("add-account event reached singleton reducer")
+            }
             WorkerEvent::Phase { phase, .. } => {
                 if phase == WorkerPhase::WaitingForBrowser
                     && matches!(self.session, SessionState::Authorizing { .. })
@@ -1842,6 +2157,7 @@ impl AppState {
                 self.mailbox = Some(snapshot);
                 self.normalize();
                 self.bump_list();
+                self.mirror_singleton_inbox_projection();
                 Update {
                     effects: self.ensure_local_restore(&account_email),
                     ..Default::default()
@@ -1898,6 +2214,7 @@ impl AppState {
                 self.recovery = None;
                 self.normalize();
                 self.bump_list();
+                self.mirror_singleton_inbox_projection();
                 self.background_sync.paused = false;
                 self.background_sync.consecutive_failures = 0;
                 let mut effects = vec![Effect::ClearAuthorization { id }];
@@ -2011,6 +2328,291 @@ impl AppState {
             | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
         }
     }
+    fn upsert_account_mailbox(
+        &mut self,
+        account_id: AccountId,
+        identity: AccountIdentity,
+        session: SessionState,
+        mailbox: Option<MailboxSnapshot>,
+    ) -> Update {
+        let is_existing = self.account_mailboxes.contains_key(&account_id);
+        if !is_existing && self.account_mailboxes.len() >= MAX_ACCOUNTS {
+            return Update {
+                feedback: Some("Whitford can store up to 32 Gmail accounts"),
+                ..Default::default()
+            };
+        }
+        if self.account_mailboxes.iter().any(|(id, account)| {
+            id != &account_id && account.identity.email.eq_ignore_ascii_case(&identity.email)
+        }) {
+            return Update {
+                feedback: Some("That Gmail account is already connected"),
+                ..Default::default()
+            };
+        }
+        let folders = self
+            .account_mailboxes
+            .get(&account_id)
+            .map(|account| account.folders.clone())
+            .unwrap_or_default();
+        self.account_mailboxes.insert(
+            account_id,
+            AccountMailbox {
+                identity,
+                session,
+                inbox: mailbox,
+                folders,
+            },
+        );
+        self.reconcile_account_selection();
+        self.bump_list();
+        Update::default()
+    }
+
+    fn register_legacy_account(
+        &mut self,
+        account_id: AccountId,
+        identity: AccountIdentity,
+    ) -> Update {
+        // A stale registration event must not create a projection for an
+        // account that is no longer the singleton worker's verified identity.
+        if !self
+            .account
+            .as_ref()
+            .is_some_and(|current| current.email.eq_ignore_ascii_case(&identity.email))
+        {
+            return Update::default();
+        }
+        // A reconnect may verify while the legacy UI is showing a non-Inbox
+        // folder. Never misfile that folder snapshot as this account's Inbox.
+        let inbox = if self.selected_folder_id == FolderId::Inbox {
+            self.mailbox.clone()
+        } else {
+            self.account_mailboxes
+                .get(&account_id)
+                .and_then(|account| account.inbox.clone())
+        };
+        self.upsert_account_mailbox(account_id, identity, self.session.clone(), inbox)
+    }
+
+    /// Keeps the account-aware Inbox projection in step with the only live
+    /// worker session. This is intentionally one-way: selecting an account
+    /// projection never changes the legacy singleton worker's identity.
+    fn mirror_singleton_inbox_projection(&mut self) {
+        let Some(identity) = self.account.clone() else {
+            return;
+        };
+        let Some(account_id) = self
+            .account_mailboxes
+            .iter()
+            .find(|(_, account)| account.identity.email.eq_ignore_ascii_case(&identity.email))
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        let _ = self.upsert_account_mailbox(
+            account_id,
+            identity,
+            self.session.clone(),
+            self.mailbox.clone(),
+        );
+    }
+
+    fn project_singleton_folder(&mut self, folder_id: FolderId, snapshot: MailboxSnapshot) {
+        let Some(identity) = self.account.as_ref() else {
+            return;
+        };
+        let Some(account_id) = self
+            .account_mailboxes
+            .iter()
+            .find(|(_, account)| account.identity.email.eq_ignore_ascii_case(&identity.email))
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        let _ = self.upsert_account_folder(
+            AccountFolderId {
+                account_id,
+                folder_id,
+            },
+            snapshot,
+        );
+    }
+
+    fn upsert_account_folder(
+        &mut self,
+        folder: AccountFolderId,
+        snapshot: MailboxSnapshot,
+    ) -> Update {
+        let Some(account) = self.account_mailboxes.get_mut(&folder.account_id) else {
+            return Update {
+                feedback: Some("That Gmail account is unavailable"),
+                ..Default::default()
+            };
+        };
+        if folder.folder_id == FolderId::Inbox {
+            account.inbox = Some(snapshot);
+        } else {
+            account.folders.insert(folder.folder_id, snapshot);
+        }
+        self.reconcile_account_selection();
+        self.bump_list();
+        Update::default()
+    }
+
+    fn remove_account_mailbox(&mut self, account_id: &AccountId) -> Update {
+        if self.account_mailboxes.remove(account_id).is_none() {
+            return Update::default();
+        }
+        self.reconcile_account_selection();
+        self.bump_list();
+        Update::default()
+    }
+
+    fn select_mailbox_view(&mut self, view: MailboxView) -> Update {
+        if let MailboxView::AccountFolder(scope) = &view {
+            let Some(account) = self.account_mailboxes.get(&scope.account_id) else {
+                return Update {
+                    feedback: Some("That Gmail account is unavailable"),
+                    ..Default::default()
+                };
+            };
+            if account
+                .inbox
+                .as_ref()
+                .is_some_and(|mailbox| mailbox.folder_catalog.find(&scope.folder_id).is_none())
+            {
+                return Update {
+                    feedback: Some("That Gmail folder is unavailable"),
+                    ..Default::default()
+                };
+            }
+        }
+        if self.selected_mailbox_view == view {
+            return Update::default();
+        }
+        self.selected_mailbox_view = view;
+        self.reconcile_account_selection();
+        self.bump_list();
+        Update::default()
+    }
+
+    fn select_account_message(&mut self, id: AccountMessageId) -> Update {
+        if !self
+            .account_visible_messages()
+            .iter()
+            .any(|message| message.id == id)
+        {
+            return Update {
+                feedback: Some("Message is unavailable"),
+                ..Default::default()
+            };
+        }
+        self.selected_account_message = Some(id);
+        self.bump_list();
+        Update::default()
+    }
+
+    fn reconcile_account_selection(&mut self) {
+        let selected_view_exists = match &self.selected_mailbox_view {
+            MailboxView::UnifiedInbox => true,
+            MailboxView::AccountFolder(scope) => {
+                self.account_mailboxes.contains_key(&scope.account_id)
+            }
+        };
+        if !selected_view_exists {
+            self.selected_mailbox_view = MailboxView::UnifiedInbox;
+        }
+        if self
+            .selected_account_message
+            .as_ref()
+            .is_some_and(|selected| {
+                !self
+                    .account_visible_messages()
+                    .iter()
+                    .any(|message| &message.id == selected)
+            })
+        {
+            self.selected_account_message = None;
+        }
+    }
+
+    fn account_view_summaries(&self) -> Vec<AccountViewSummary> {
+        self.account_mailboxes
+            .iter()
+            .map(|(id, account)| AccountViewSummary {
+                id: id.clone(),
+                identity: account.identity.clone(),
+                session: account.session.clone(),
+                unread_count: account
+                    .inbox
+                    .as_ref()
+                    .map(|mailbox| {
+                        mailbox
+                            .messages
+                            .iter()
+                            .filter(|message| message.unread && message_is_in_inbox(message))
+                            .count()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn account_visible_messages(&self) -> Vec<AccountMessageSummary> {
+        let mut messages = match &self.selected_mailbox_view {
+            MailboxView::UnifiedInbox => self
+                .account_mailboxes
+                .iter()
+                .flat_map(|(account_id, account)| {
+                    account.inbox.iter().flat_map(move |mailbox| {
+                        mailbox
+                            .messages
+                            .iter()
+                            .filter(|message| message_is_in_inbox(message))
+                            .map(move |message| AccountMessageSummary {
+                                id: AccountMessageId {
+                                    account_id: account_id.clone(),
+                                    message_id: message.id.clone(),
+                                },
+                                account: account.identity.clone(),
+                                message: message.clone(),
+                            })
+                    })
+                })
+                .collect::<Vec<_>>(),
+            MailboxView::AccountFolder(scope) => {
+                let Some(account) = self.account_mailboxes.get(&scope.account_id) else {
+                    return Vec::new();
+                };
+                let mailbox = if scope.folder_id == FolderId::Inbox {
+                    account.inbox.as_ref()
+                } else {
+                    account.folders.get(&scope.folder_id)
+                };
+                mailbox
+                    .map(|mailbox| {
+                        mailbox
+                            .messages
+                            .iter()
+                            .filter(|message| message_is_in_folder(message, &scope.folder_id))
+                            .map(|message| AccountMessageSummary {
+                                id: AccountMessageId {
+                                    account_id: scope.account_id.clone(),
+                                    message_id: message.id.clone(),
+                                },
+                                account: account.identity.clone(),
+                                message: message.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        messages.sort_by(compare_account_messages_newest_first);
+        messages
+    }
+
     pub fn snapshot(&self) -> ViewSnapshot {
         self.snapshot_for_render(true)
     }
@@ -2022,6 +2624,11 @@ impl AppState {
     pub(crate) fn snapshot_for_render(&self, include_visible_messages: bool) -> ViewSnapshot {
         let sidebar_folders =
             sidebar_folders(self.mailbox.as_ref().map(|mailbox| &mailbox.folder_catalog));
+        let account_visible_messages = if include_visible_messages {
+            self.account_visible_messages()
+        } else {
+            Vec::new()
+        };
         let has_visible_messages = self.has_visible_messages();
         let visible = if include_visible_messages {
             self.visible_messages()
@@ -2122,6 +2729,10 @@ impl AppState {
             } else {
                 BackgroundSyncStatus::Idle
             },
+            accounts: self.account_view_summaries(),
+            mailbox_view: self.selected_mailbox_view.clone(),
+            account_visible_messages,
+            selected_account_message: self.selected_account_message.clone(),
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
             selected_folder_id: self.selected_folder_id.clone(),
@@ -2514,6 +3125,33 @@ impl AppState {
         self.normalize();
         self.bump_list();
         Update::default()
+    }
+
+    fn folder_loaded_and_project(
+        &mut self,
+        request_id: FolderRequestId,
+        generation: u64,
+        folder_id: FolderId,
+        snapshot: MailboxSnapshot,
+        cached: bool,
+    ) -> Update {
+        // `folder_loaded` owns the stale-event gate. Keep the exact same gate
+        // here so a late singleton folder result cannot enter the account
+        // projection after the user has navigated elsewhere.
+        let accepted = self.active_folder_request == Some(request_id)
+            && self.folder_generation == generation
+            && self.selected_folder_id == folder_id;
+        let update = self.folder_loaded(
+            request_id,
+            generation,
+            folder_id.clone(),
+            snapshot.clone(),
+            cached,
+        );
+        if accepted {
+            self.project_singleton_folder(folder_id, snapshot);
+        }
+        update
     }
 
     fn folder_failed(

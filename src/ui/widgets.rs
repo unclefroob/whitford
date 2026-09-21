@@ -7,7 +7,11 @@ use crate::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Box {
+pub(super) fn message_row(
+    message: &MessageSummary,
+    selected: bool,
+    account_label: Option<&str>,
+) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["whitford-message-row"])
@@ -55,6 +59,16 @@ pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Box 
             .build(),
     );
     copy.append(&top);
+    if let Some(account_label) = account_label.filter(|label| !label.is_empty()) {
+        copy.append(
+            &gtk::Label::builder()
+                .label(account_label)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
     copy.append(&ellipsized(&message.subject, message.unread));
     line.append(&avatar);
     line.append(&copy);
@@ -80,8 +94,12 @@ pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Box 
     } else {
         format!(", {}", traits.join(", "))
     };
+    let account_prefix = account_label
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("{label}, "))
+        .unwrap_or_default();
     row.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{}: {}{}",
+        "{account_prefix}{}: {}{}",
         message.sender, message.subject, traits
     ))]);
     row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);

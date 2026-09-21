@@ -2,10 +2,14 @@ use adw::prelude::*;
 use gtk::gio;
 
 use super::Ui;
-use crate::state::{Action, EscapeContext, EscapeOutcome, escape_outcome};
+use crate::{
+    model::{AccountFolderId, FolderId},
+    state::{Action, EscapeContext, EscapeOutcome, MailboxView, escape_outcome},
+};
 
 pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "connect", |ui| ui.dispatch(Action::Connect));
+    add(ui, "add-account", |ui| ui.dispatch(Action::AddAccount));
     add(ui, "refresh", |ui| ui.dispatch(Action::Refresh));
     add(ui, "cancel-authorization", |ui| {
         ui.dispatch(Action::CancelAuthorization)
@@ -107,6 +111,23 @@ fn add(ui: &Ui, name: &str, handler: impl Fn(&Ui) + 'static) {
 
 fn move_folder(ui: &Ui, step: isize) {
     let snapshot = ui.state.borrow().snapshot();
+    if !snapshot.accounts.is_empty() {
+        let views = std::iter::once(MailboxView::UnifiedInbox)
+            .chain(snapshot.accounts.iter().map(|account| {
+                MailboxView::AccountFolder(AccountFolderId {
+                    account_id: account.id.clone(),
+                    folder_id: FolderId::Inbox,
+                })
+            }))
+            .collect::<Vec<_>>();
+        let current = views
+            .iter()
+            .position(|view| view == &snapshot.mailbox_view)
+            .unwrap_or(0);
+        let next = current.saturating_add_signed(step).min(views.len() - 1);
+        ui.dispatch(Action::SelectMailboxView(views[next].clone()));
+        return;
+    }
     let folders = snapshot
         .sidebar_folders
         .primary

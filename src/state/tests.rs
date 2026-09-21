@@ -9,6 +9,187 @@ fn account() -> AccountIdentity {
     }
 }
 
+fn multi_account_id(value: u8) -> crate::model::AccountId {
+    crate::model::AccountId::new(format!("acct-{value:032x}")).expect("valid account fixture")
+}
+
+fn multi_account(email: &str) -> AccountIdentity {
+    AccountIdentity {
+        provider: MailProvider::Gmail,
+        email: email.into(),
+    }
+}
+
+fn inbox_snapshot(messages: Vec<MessageSummary>) -> MailboxSnapshot {
+    MailboxSnapshot {
+        messages,
+        folder_catalog: crate::model::FolderCatalog::inbox_only(),
+        metadata: SyncMetadata {
+            completed_at: SystemTime::UNIX_EPOCH,
+            requested_limit: 50,
+            loaded_count: 0,
+            fallback_count: 0,
+            skipped_count: 0,
+        },
+    }
+}
+
+fn navigable_inbox_snapshot(messages: Vec<MessageSummary>) -> MailboxSnapshot {
+    let mut snapshot = inbox_snapshot(messages);
+    snapshot.folder_catalog = browsing_catalog();
+    snapshot
+}
+
+#[test]
+fn unified_inbox_is_newest_first_and_keeps_equal_gmail_ids_account_scoped() {
+    let first = multi_account_id(1);
+    let second = multi_account_id(2);
+    let mut first_messages = fixture_messages();
+    for message in &mut first_messages {
+        message.in_inbox = true;
+        message.received_at_unix = None;
+    }
+    first_messages[0].id = MessageId::gmail(7);
+    first_messages[0].received_at_unix = Some(100);
+    first_messages[1].id = MessageId::gmail(8);
+    first_messages[1].received_at_unix = None;
+
+    let mut second_messages = fixture_messages();
+    for message in &mut second_messages {
+        message.in_inbox = true;
+        message.received_at_unix = None;
+    }
+    second_messages[0].id = MessageId::gmail(7);
+    second_messages[0].received_at_unix = Some(100);
+    second_messages[1].id = MessageId::gmail(9);
+    second_messages[1].received_at_unix = Some(101);
+    second_messages[2].received_at_unix = None;
+
+    let mut state = AppState::new();
+    state.dispatch(Action::UpsertAccountMailbox {
+        account_id: second.clone(),
+        identity: multi_account("work@example.com"),
+        session: SessionState::Ready,
+        mailbox: Some(inbox_snapshot(second_messages)),
+    });
+    state.dispatch(Action::UpsertAccountMailbox {
+        account_id: first.clone(),
+        identity: multi_account("personal@example.com"),
+        session: SessionState::Ready,
+        mailbox: Some(inbox_snapshot(first_messages)),
+    });
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.mailbox_view, MailboxView::UnifiedInbox);
+    assert_eq!(snapshot.accounts.len(), 2);
+    let ids = snapshot
+        .account_visible_messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids[0].account_id, second);
+    assert_eq!(ids[0].message_id, MessageId::gmail(9));
+    // Timestamp ties use opaque account ID, then Gmail message ID. The two
+    // equal Gmail IDs are therefore present as separate rows.
+    assert_eq!(ids[1].account_id, first);
+    assert_eq!(ids[1].message_id, MessageId::gmail(7));
+    assert_eq!(ids[2].account_id, second);
+    assert_eq!(ids[2].message_id, MessageId::gmail(7));
+    assert!(
+        snapshot
+            .account_visible_messages
+            .last()
+            .is_some_and(|message| message.message.received_at_unix.is_none())
+    );
+}
+
+#[test]
+fn account_view_selection_and_removal_are_scoped_without_disturbing_other_accounts() {
+    let first = multi_account_id(11);
+    let second = multi_account_id(12);
+    let mut state = AppState::new();
+    state.dispatch(Action::UpsertAccountMailbox {
+        account_id: first.clone(),
+        identity: multi_account("personal@example.com"),
+        session: SessionState::Ready,
+        mailbox: Some(navigable_inbox_snapshot(fixture_messages())),
+    });
+    state.dispatch(Action::UpsertAccountMailbox {
+        account_id: second.clone(),
+        identity: multi_account("work@example.com"),
+        session: SessionState::Ready,
+        mailbox: Some(inbox_snapshot(fixture_messages())),
+    });
+
+    let projects = FolderId::Label("Projects/Rust".into());
+    state.dispatch(Action::UpsertAccountFolder {
+        folder: crate::model::AccountFolderId {
+            account_id: first.clone(),
+            folder_id: projects.clone(),
+        },
+        snapshot: folder_snapshot(projects.clone(), "Projects/Rust", "Project mail"),
+    });
+    state.dispatch(Action::SelectMailboxView(MailboxView::AccountFolder(
+        crate::model::AccountFolderId {
+            account_id: first.clone(),
+            folder_id: projects,
+        },
+    )));
+    let project_view = state.snapshot();
+    assert_eq!(project_view.account_visible_messages.len(), 1);
+    assert_eq!(
+        project_view.account_visible_messages[0].message.subject,
+        "Project mail"
+    );
+
+    state.dispatch(Action::SelectMailboxView(MailboxView::AccountFolder(
+        crate::model::AccountFolderId {
+            account_id: first.clone(),
+            folder_id: FolderId::Inbox,
+        },
+    )));
+    let selected = crate::model::AccountMessageId {
+        account_id: first.clone(),
+        message_id: MessageId::gmail(1),
+    };
+    state.dispatch(Action::SelectAccountMessage(selected.clone()));
+    assert_eq!(state.snapshot().selected_account_message, Some(selected));
+
+    state.dispatch(Action::RemoveAccountMailbox { account_id: first });
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.mailbox_view, MailboxView::UnifiedInbox);
+    assert_eq!(snapshot.selected_account_message, None);
+    assert_eq!(snapshot.accounts.len(), 1);
+    assert!(
+        snapshot
+            .account_visible_messages
+            .iter()
+            .all(|message| message.id.account_id == second)
+    );
+}
+
+#[test]
+fn account_projection_rejects_a_duplicate_gmail_identity() {
+    let mut state = AppState::new();
+    state.dispatch(Action::UpsertAccountMailbox {
+        account_id: multi_account_id(21),
+        identity: multi_account("same@example.com"),
+        session: SessionState::Ready,
+        mailbox: None,
+    });
+    let update = state.dispatch(Action::UpsertAccountMailbox {
+        account_id: multi_account_id(22),
+        identity: multi_account("SAME@example.com"),
+        session: SessionState::Ready,
+        mailbox: None,
+    });
+    assert_eq!(
+        update.feedback,
+        Some("That Gmail account is already connected")
+    );
+    assert_eq!(state.snapshot().accounts.len(), 1);
+}
+
 #[test]
 fn background_tick_is_separate_from_foreground_and_duplicate_events_notify_once() {
     let mut state = AppState::new();
@@ -2947,9 +3128,11 @@ fn appearance_updates_immediately_and_only_matching_save_acknowledges_it() {
 #[test]
 fn appearance_save_failure_keeps_selection_and_can_retry() {
     let mut state = AppState::new();
-    let update = state.dispatch(Action::SetAppearance(
-        crate::cache::AppearancePreference::Dark,
-    ));
+    let appearance = match state.snapshot().appearance {
+        crate::cache::AppearancePreference::Dark => crate::cache::AppearancePreference::Light,
+        _ => crate::cache::AppearancePreference::Dark,
+    };
+    let update = state.dispatch(Action::SetAppearance(appearance));
     let request_id = match update.effects.as_slice() {
         [Effect::SendWorker(WorkerCommand::SavePreferences { request_id, .. })] => *request_id,
         other => panic!("unexpected effects: {other:?}"),
@@ -2961,10 +3144,7 @@ fn appearance_save_failure_keeps_selection_and_can_retry() {
         failed.feedback,
         Some("Settings changed, but could not be saved")
     );
-    assert_eq!(
-        state.snapshot().appearance,
-        crate::cache::AppearancePreference::Dark
-    );
+    assert_eq!(state.snapshot().appearance, appearance);
     assert_eq!(
         state.snapshot().preferences_save_state,
         PreferencesSaveState::Failed
@@ -2972,7 +3152,7 @@ fn appearance_save_failure_keeps_selection_and_can_retry() {
     assert!(matches!(
         state.dispatch(Action::RetryPreferencesSave).effects.as_slice(),
         [Effect::SendWorker(WorkerCommand::SavePreferences { preferences, .. })]
-            if preferences.appearance == crate::cache::AppearancePreference::Dark
+            if preferences.appearance == appearance
     ));
 }
 

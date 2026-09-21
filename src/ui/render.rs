@@ -11,8 +11,8 @@ use crate::{
     config,
     model::Attachment,
     state::{
-        Action, BackgroundSyncStatus, ComposerState, DraftCatalogState, MessageFilter, ReaderState,
-        ServerSearchView, SessionState, ViewSnapshot, ViewStatus,
+        Action, BackgroundSyncStatus, ComposerState, DraftCatalogState, MailboxView, MessageFilter,
+        ReaderState, ServerSearchView, SessionState, ViewSnapshot, ViewStatus,
     },
     worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
@@ -35,7 +35,7 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
     render_filters(ui, snapshot.message_filter);
     render_sync(ui, snapshot);
     render_cache_usage(ui, snapshot);
-    render_account(ui, snapshot);
+    render_accounts(ui, snapshot);
     render_banners(ui, snapshot);
     set_action_enabled(ui, "connect", snapshot.can_connect);
     set_action_enabled(ui, "refresh", snapshot.can_refresh);
@@ -438,6 +438,45 @@ fn format_bytes(bytes: u64) -> String {
 
 fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
     clear_list(&ui.folders);
+    if has_account_projection(snapshot) {
+        append_mailbox_view_row(
+            ui,
+            "Unified Inbox",
+            "mail-unread-symbolic",
+            snapshot
+                .accounts
+                .iter()
+                .map(|account| account.unread_count)
+                .sum(),
+            &MailboxView::UnifiedInbox,
+            &snapshot.mailbox_view,
+        );
+        ui.folders.append(
+            &gtk::Label::builder()
+                .label("Accounts")
+                .xalign(0.0)
+                .margin_start(22)
+                .margin_top(18)
+                .margin_bottom(4)
+                .css_classes(["heading", "dim-label"])
+                .build(),
+        );
+        for account in &snapshot.accounts {
+            let view = MailboxView::AccountFolder(crate::model::AccountFolderId {
+                account_id: account.id.clone(),
+                folder_id: crate::model::FolderId::Inbox,
+            });
+            append_mailbox_view_row(
+                ui,
+                &account.identity.email,
+                "mail-unread-symbolic",
+                account.unread_count,
+                &view,
+                &snapshot.mailbox_view,
+            );
+        }
+        return;
+    }
     for folder in &snapshot.sidebar_folders.primary {
         append_folder_row(ui, snapshot, folder);
     }
@@ -456,6 +495,72 @@ fn render_folders(ui: &Ui, snapshot: &ViewSnapshot) {
     for folder in &snapshot.sidebar_folders.labels {
         append_folder_row(ui, snapshot, folder);
     }
+}
+
+fn has_account_projection(snapshot: &ViewSnapshot) -> bool {
+    !snapshot.accounts.is_empty()
+}
+
+fn append_mailbox_view_row(
+    ui: &Ui,
+    name: &str,
+    icon: &str,
+    count: usize,
+    view: &MailboxView,
+    selected_view: &MailboxView,
+) {
+    let row = gtk::Button::builder()
+        .has_frame(false)
+        .css_classes(["whitford-folder-row"])
+        .build();
+    let selected = view == selected_view;
+    if selected {
+        row.add_css_class("selected");
+    }
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(10)
+        .margin_bottom(10)
+        .build();
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(
+        &gtk::Label::builder()
+            .label(name)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
+    );
+    if count > 0 {
+        content.append(
+            &gtk::Label::builder()
+                .label(count.to_string())
+                .css_classes(["whitford-count"])
+                .build(),
+        );
+    }
+    row.set_child(Some(&content));
+    let selected_text = if selected { ", selected" } else { "" };
+    row.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{name}, {count} unread{selected_text}"
+    ))]);
+    row.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
+    let view = view.clone();
+    row.connect_clicked({
+        let weak_ui = ui.downgrade();
+        move |_| {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::SelectMailboxView(view.clone()));
+                if ui.outer.is_collapsed() {
+                    ui.outer.set_show_sidebar(false);
+                }
+            }
+        }
+    });
+    ui.folders.append(&row);
 }
 
 fn append_folder_row(ui: &Ui, snapshot: &ViewSnapshot, folder: &crate::model::Folder) {
@@ -519,16 +624,74 @@ fn append_folder_row(ui: &Ui, snapshot: &ViewSnapshot, folder: &crate::model::Fo
     ui.folders.append(&row);
 }
 
-fn render_account(ui: &Ui, snapshot: &ViewSnapshot) {
-    ui.account_email.set_text(
-        snapshot
-            .account
-            .as_ref()
-            .map_or("Not connected", |account| account.email.as_str()),
-    );
+fn render_accounts(ui: &Ui, snapshot: &ViewSnapshot) {
+    clear_box(&ui.accounts_rows);
+    for account in &snapshot.accounts {
+        let unread = match account.unread_count {
+            0 => "No unread messages".into(),
+            1 => "1 unread message".into(),
+            count => format!("{count} unread messages"),
+        };
+        let row = adw::ActionRow::builder()
+            .title(&account.identity.email)
+            .subtitle(unread)
+            .build();
+        row.add_suffix(
+            &gtk::Image::builder()
+                .icon_name(account_session_icon(&account.session))
+                .tooltip_text(account_session_label(&account.session))
+                .build(),
+        );
+        ui.accounts_rows.append(&row);
+    }
+}
+
+fn account_session_icon(session: &SessionState) -> &'static str {
+    match session {
+        SessionState::Ready => "emblem-ok-symbolic",
+        SessionState::Syncing { .. } | SessionState::Authorizing { .. } => {
+            "emblem-synchronizing-symbolic"
+        }
+        SessionState::Offline { .. } => "network-offline-symbolic",
+        SessionState::Disconnected | SessionState::Disconnecting => "network-offline-symbolic",
+        SessionState::AuthRequired { .. }
+        | SessionState::ConfigurationError { .. }
+        | SessionState::ServiceError { .. } => "dialog-warning-symbolic",
+    }
+}
+
+fn account_session_label(session: &SessionState) -> &'static str {
+    match session {
+        SessionState::Ready => "Connected",
+        SessionState::Syncing { .. } => "Synchronizing",
+        SessionState::Authorizing { .. } => "Authorization in progress",
+        SessionState::Offline { .. } => "Offline",
+        SessionState::Disconnected => "Disconnected",
+        SessionState::Disconnecting => "Disconnecting",
+        SessionState::AuthRequired { .. } => "Authorization required",
+        SessionState::ConfigurationError { .. } => "Configuration error",
+        SessionState::ServiceError { .. } => "Connection error",
+    }
 }
 
 fn render_messages(ui: &Ui, snapshot: &ViewSnapshot) {
+    if has_account_projection(snapshot) {
+        ui.message_status.set_visible(false);
+        ui.messages.set_visible(true);
+        let desired = snapshot
+            .account_visible_messages
+            .iter()
+            .map(|account_message| MessageListItem {
+                selected: snapshot.selected_account_message.as_ref() == Some(&account_message.id),
+                message: account_message.message.clone(),
+                account_message_id: Some(account_message.id.clone()),
+                account_label: matches!(snapshot.mailbox_view, MailboxView::UnifiedInbox)
+                    .then(|| account_message.account.email.clone()),
+            })
+            .collect::<Vec<_>>();
+        update_message_model(&ui.message_model, &desired);
+        return;
+    }
     if !should_render_mail(snapshot.status, !snapshot.visible_messages.is_empty()) {
         ui.messages.set_visible(false);
         clear_box(&ui.message_status);
@@ -549,6 +712,8 @@ fn render_messages(ui: &Ui, snapshot: &ViewSnapshot) {
         .map(|message| MessageListItem {
             selected: selected_id == Some(&message.id),
             message,
+            account_message_id: None,
+            account_label: None,
         })
         .collect::<Vec<_>>();
     update_message_model(&ui.message_model, &desired);
@@ -1229,8 +1394,6 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
     ui.sync_retry.set_visible(snapshot.can_retry);
     ui.sync_reopen.set_visible(snapshot.can_reopen);
     ui.sync_cancel.set_visible(snapshot.can_cancel);
-    ui.account_connect.set_visible(snapshot.can_connect);
-    ui.account_disconnect.set_visible(snapshot.can_disconnect);
 }
 
 fn ready_sync_presentation(
@@ -1491,6 +1654,8 @@ mod tests {
                 MessageListItem {
                     message,
                     selected: false,
+                    account_message_id: None,
+                    account_label: None,
                 }
             })
             .collect::<Vec<_>>();

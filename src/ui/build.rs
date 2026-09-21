@@ -36,7 +36,11 @@ pub(super) fn build(
             return;
         };
         let item = object.borrow::<MessageListItem>();
-        list_item.set_child(Some(&message_row(&item.message, item.selected)));
+        list_item.set_child(Some(&message_row(
+            &item.message,
+            item.selected,
+            item.account_label.as_deref(),
+        )));
     });
     message_factory.connect_unbind(|_, object| {
         if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
@@ -149,13 +153,11 @@ pub(super) fn build(
         cache_limit: settings.cache_limit,
         cache_usage: settings.cache_usage,
         appearance: settings.appearance,
-        account_email: settings.account_email,
+        accounts_rows: settings.accounts_rows,
         sync_refresh: settings.sync_refresh,
         sync_retry: settings.sync_retry,
         sync_reopen: settings.sync_reopen,
         sync_cancel: settings.sync_cancel,
-        account_connect: settings.account_connect,
-        account_disconnect: settings.account_disconnect,
         composer_window: composer.window,
         composer_to: composer.to,
         composer_cc: composer.cc,
@@ -775,9 +777,17 @@ pub(super) fn connect_signals(ui: &Ui) {
             else {
                 return;
             };
-            let id = object.borrow::<MessageListItem>().message.id.clone();
-            ui.dispatch(Action::SelectMessage(id));
-            if ui.inner.is_collapsed() {
+            let item = object.borrow::<MessageListItem>();
+            let account_scoped = item.account_message_id.is_some();
+            if let Some(id) = &item.account_message_id {
+                ui.dispatch(Action::SelectAccountMessage(id.clone()));
+            } else {
+                ui.dispatch(Action::SelectMessage(item.message.id.clone()));
+            }
+            // Account-scoped body loading is not on the legacy worker protocol
+            // yet.  Keep the user in the list instead of opening an empty
+            // reader pane; selecting still provides the scoped state identity.
+            if !account_scoped && ui.inner.is_collapsed() {
                 ui.inner.set_show_content(true);
             }
         }
@@ -895,13 +905,11 @@ struct SettingsWidgets {
     cache_limit: gtk::DropDown,
     cache_usage: gtk::Label,
     appearance: gtk::DropDown,
-    account_email: gtk::Label,
+    accounts_rows: gtk::Box,
     sync_refresh: adw::ActionRow,
     sync_retry: adw::ActionRow,
     sync_reopen: adw::ActionRow,
     sync_cancel: adw::ActionRow,
-    account_connect: adw::ActionRow,
-    account_disconnect: adw::ActionRow,
 }
 
 fn build_settings_page() -> SettingsWidgets {
@@ -980,21 +988,18 @@ fn build_settings_page() -> SettingsWidgets {
     );
     preferences.add(&storage_group);
 
-    let account_group = adw::PreferencesGroup::builder().title("Account").build();
-    let account_email = gtk::Label::builder()
-        .label("Not connected")
-        .xalign(1.0)
-        .css_classes(["dim-label"])
+    let accounts_group = adw::PreferencesGroup::builder()
+        .title("Accounts")
+        .description("Each Gmail account keeps its own authorization and local mail.")
         .build();
-    let account_row = adw::ActionRow::builder().title("Gmail account").build();
-    account_row.add_suffix(&account_email);
-    account_group.add(&account_row);
-    let account_connect = setting_action_row("Connect Gmail", "win.connect");
-    let account_disconnect = setting_action_row("Disconnect Gmail", "win.disconnect");
-    account_disconnect.set_subtitle("Remove local authorization and mail data");
-    account_group.add(&account_connect);
-    account_group.add(&account_disconnect);
-    preferences.add(&account_group);
+    let accounts_rows = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    accounts_group.add(&accounts_rows);
+    let add_account = setting_action_row("Add Gmail account", "win.add-account");
+    add_account.set_subtitle("Connect another Gmail account without replacing existing mail");
+    accounts_group.add(&add_account);
+    preferences.add(&accounts_group);
 
     let privacy_group = adw::PreferencesGroup::builder()
         .title("About &amp; Privacy")
@@ -1025,13 +1030,11 @@ fn build_settings_page() -> SettingsWidgets {
         cache_limit,
         cache_usage,
         appearance,
-        account_email,
+        accounts_rows,
         sync_refresh,
         sync_retry,
         sync_reopen,
         sync_cancel,
-        account_connect,
-        account_disconnect,
     }
 }
 

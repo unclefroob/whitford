@@ -3,9 +3,9 @@ use crate::{
     composer::{ComposeDraft, DraftAttachment},
     config, drafts, gmail, message,
     model::{
-        AccountIdentity, CacheUsage, FolderCatalog, FolderDescriptor, FolderId, FolderKind,
-        MailProvider, MailboxSnapshot, MessageBody, MessageId, MessageLocator, MessageMutation,
-        ReconciledMessageState, SyncMetadata,
+        AccountId, AccountIdentity, AccountRecord, CacheUsage, FolderCatalog, FolderDescriptor,
+        FolderId, FolderKind, MailProvider, MailboxSnapshot, MessageBody, MessageId,
+        MessageLocator, MessageMutation, ReconciledMessageState, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
     secrets::{self, RefreshToken},
@@ -16,7 +16,7 @@ use futures_util::FutureExt;
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 pub const MAX_CONTENT_JOBS: usize = 2;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     sync::{
@@ -65,6 +65,240 @@ pub struct FolderRequestId(pub u64);
 pub struct SearchRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AttachmentJobId(pub u64);
+
+/// An operation payload which must only be applied to the account and reducer
+/// generation that originated it.  This is the common envelope for future
+/// account-aware worker events; it prevents a late event from account A being
+/// accepted while account B is selected.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AccountScoped<T> {
+    pub account_id: AccountId,
+    pub generation: u64,
+    pub value: T,
+}
+
+impl<T> AccountScoped<T> {
+    pub fn new(account_id: AccountId, generation: u64, value: T) -> Self {
+        Self {
+            account_id,
+            generation,
+            value,
+        }
+    }
+}
+
+impl<T> fmt::Debug for AccountScoped<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccountScoped")
+            .field("account_id", &self.account_id)
+            .field("generation", &self.generation)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The account-targeted lifecycle protocol that will supersede the singleton
+/// `WorkerCommand`/`WorkerEvent` pair.  It is intentionally separate until
+/// the registry, secrets, cache, and reducer can be migrated atomically.
+/// OAuth credentials are never carried by this protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccountWorkerCommand {
+    Restore {
+        operation_id: OperationId,
+        account_id: AccountId,
+    },
+    BeginOAuthConnect {
+        operation_id: OperationId,
+    },
+    Refresh {
+        operation_id: OperationId,
+        account_id: AccountId,
+    },
+    Disconnect {
+        operation_id: OperationId,
+        account_id: AccountId,
+        generation: u64,
+    },
+    SyncInbox(AccountSyncWork),
+}
+
+/// Account-targeted counterpart to the future lifecycle protocol.  A connect
+/// flow has no account ID until Google has verified its identity, so only that
+/// one event is intentionally unscoped.
+pub enum AccountWorkerEvent {
+    AuthorizationRequired {
+        operation_id: OperationId,
+        url: AuthorizationUrl,
+        deadline: SystemTime,
+    },
+    IdentityVerified {
+        operation_id: OperationId,
+        identity: AccountIdentity,
+    },
+    DuplicateIdentity {
+        operation_id: OperationId,
+        existing_account_id: AccountId,
+    },
+    Phase {
+        operation_id: OperationId,
+        phase: AccountScoped<WorkerPhase>,
+    },
+    SyncComplete {
+        request: AccountScoped<BackgroundSyncRequestId>,
+        snapshot: MailboxSnapshot,
+        new_unread_ids: Vec<MessageId>,
+    },
+    Failed {
+        operation_id: OperationId,
+        account_id: Option<AccountId>,
+        failure: ServiceFailure,
+    },
+}
+
+impl fmt::Debug for AccountWorkerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AuthorizationRequired { operation_id, .. } => f
+                .debug_struct("AccountAuthorizationRequired")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::IdentityVerified { operation_id, .. } => f
+                .debug_struct("AccountIdentityVerified")
+                .field("operation_id", operation_id)
+                .finish(),
+            Self::DuplicateIdentity {
+                operation_id,
+                existing_account_id,
+            } => f
+                .debug_struct("DuplicateAccountIdentity")
+                .field("operation_id", operation_id)
+                .field("existing_account_id", existing_account_id)
+                .finish(),
+            Self::Phase {
+                operation_id,
+                phase,
+                ..
+            } => f
+                .debug_struct("AccountPhase")
+                .field("operation_id", operation_id)
+                .field("phase", phase)
+                .finish(),
+            Self::SyncComplete {
+                request, snapshot, ..
+            } => f
+                .debug_struct("AccountSyncComplete")
+                .field("request", request)
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
+            Self::Failed {
+                operation_id,
+                account_id,
+                failure,
+            } => f
+                .debug_struct("AccountWorkerFailed")
+                .field("operation_id", operation_id)
+                .field("account_id", account_id)
+                .field("failure", failure)
+                .finish(),
+        }
+    }
+}
+
+/// Returns the existing account for a verified provider identity, using Gmail's
+/// case-insensitive email comparison. Call this before any token/cache write;
+/// a duplicate must leave the existing account completely untouched.
+pub fn duplicate_registered_account(
+    accounts: &[AccountRecord],
+    candidate: &AccountIdentity,
+) -> Option<AccountId> {
+    accounts
+        .iter()
+        .find(|account| {
+            account.identity.provider == candidate.provider
+                && account.identity.normalized_email() == candidate.normalized_email()
+        })
+        .map(|account| account.id.clone())
+}
+
+/// A priority assignment for per-account sync. Foreground work is selected
+/// before timer-driven work, while background accounts run FIFO after each
+/// completion so a failing account cannot monopolize the queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountSyncPriority {
+    Foreground,
+    Background,
+}
+
+/// One account-scoped Inbox poll. There can be at most one queued or active
+/// job per account in `FairAccountSyncQueue`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountSyncWork {
+    pub account_id: AccountId,
+    pub request_id: BackgroundSyncRequestId,
+    pub priority: AccountSyncPriority,
+}
+
+/// Bounded, fair scheduler for account-specific sync tasks. It performs no
+/// OAuth/cache I/O itself, which lets the eventual controller own the runtime
+/// auth map and report completion/failure through `AccountWorkerEvent`.
+pub struct FairAccountSyncQueue {
+    max_in_flight: usize,
+    foreground: VecDeque<AccountSyncWork>,
+    background: VecDeque<AccountSyncWork>,
+    scheduled: HashSet<AccountId>,
+    in_flight: HashSet<AccountId>,
+}
+
+impl FairAccountSyncQueue {
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+            foreground: VecDeque::new(),
+            background: VecDeque::new(),
+            scheduled: HashSet::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+
+    /// Returns false when this account already has queued or active work. The
+    /// caller can then coalesce its timer rather than starting a second IMAP
+    /// transaction against the same account.
+    pub fn enqueue(&mut self, work: AccountSyncWork) -> bool {
+        if !self.scheduled.insert(work.account_id.clone()) {
+            return false;
+        }
+        match work.priority {
+            AccountSyncPriority::Foreground => self.foreground.push_back(work),
+            AccountSyncPriority::Background => self.background.push_back(work),
+        }
+        true
+    }
+
+    /// Marks and returns the next permitted job. The completion path must call
+    /// `complete` even on failure, so retry/backoff can re-enter fairly.
+    pub fn dequeue(&mut self) -> Option<AccountSyncWork> {
+        if self.in_flight.len() >= self.max_in_flight {
+            return None;
+        }
+        let work = self
+            .foreground
+            .pop_front()
+            .or_else(|| self.background.pop_front())?;
+        self.in_flight.insert(work.account_id.clone());
+        Some(work)
+    }
+
+    pub fn complete(&mut self, account_id: &AccountId) -> bool {
+        if !self.in_flight.remove(account_id) {
+            return false;
+        }
+        self.scheduled.remove(account_id)
+    }
+
+    pub fn is_scheduled(&self, account_id: &AccountId) -> bool {
+        self.scheduled.contains(account_id)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttachmentDestination {
@@ -206,6 +440,13 @@ pub enum WorkerCommand {
         id: OperationId,
     },
     Connect {
+        id: OperationId,
+    },
+    /// Authorize one additional Gmail account without changing the legacy
+    /// singleton runtime session, token, or cache. The account is published
+    /// only after its identity, scoped secret, scoped cache and registry row
+    /// have all been committed.
+    AddAccount {
         id: OperationId,
     },
     Refresh {
@@ -354,6 +595,7 @@ impl fmt::Debug for WorkerCommand {
         match self {
             Self::Restore { id } => f.debug_tuple("Restore").field(id).finish(),
             Self::Connect { id } => f.debug_tuple("Connect").field(id).finish(),
+            Self::AddAccount { id } => f.debug_tuple("AddAccount").field(id).finish(),
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
             Self::BackgroundSync { request_id, .. } => f
                 .debug_struct("BackgroundSync")
@@ -532,6 +774,18 @@ impl fmt::Debug for WorkerCommand {
 }
 
 pub enum WorkerEvent {
+    /// The durable account-registry identity for the legacy singleton session.
+    ///
+    /// This is deliberately a bridge, not a second OAuth path: the current
+    /// runtime auth, token, and cache remain singleton-owned.  Registering the
+    /// opaque ID lets the reducer expose that same account through the new
+    /// account projection without moving credentials out from under the live
+    /// singleton worker.
+    LegacyAccountRegistered {
+        id: OperationId,
+        account_id: AccountId,
+        account: AccountIdentity,
+    },
     /// The matching full snapshot was durably written and any requested cache
     /// retention pruning completed.
     PreferencesSaved {
@@ -554,6 +808,21 @@ pub enum WorkerEvent {
     IdentityVerified {
         id: OperationId,
         account: AccountIdentity,
+    },
+    /// The additional-account OAuth identity was compared against the durable
+    /// registry before any scoped credential or cache write.
+    DuplicateAccountIdentity {
+        id: OperationId,
+        existing_account_id: AccountId,
+    },
+    /// An additive OAuth flow completed. Unlike `SyncComplete`, this cannot
+    /// replace the singleton account because both the opaque ID and mailbox
+    /// snapshot are explicitly account-scoped.
+    AccountAdded {
+        id: OperationId,
+        account_id: AccountId,
+        account: AccountIdentity,
+        snapshot: MailboxSnapshot,
     },
     AccountPersisted {
         id: OperationId,
@@ -756,6 +1025,11 @@ pub enum WorkerEvent {
 impl fmt::Debug for WorkerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LegacyAccountRegistered { id, account_id, .. } => f
+                .debug_struct("LegacyAccountRegistered")
+                .field("id", id)
+                .field("account_id", account_id)
+                .finish(),
             Self::PreferencesSaved { request_id } => f
                 .debug_struct("PreferencesSaved")
                 .field("request_id", request_id)
@@ -776,6 +1050,25 @@ impl fmt::Debug for WorkerEvent {
             Self::IdentityVerified { id, .. } => {
                 f.debug_struct("IdentityVerified").field("id", id).finish()
             }
+            Self::DuplicateAccountIdentity {
+                id,
+                existing_account_id,
+            } => f
+                .debug_struct("DuplicateAccountIdentity")
+                .field("id", id)
+                .field("existing_account_id", existing_account_id)
+                .finish(),
+            Self::AccountAdded {
+                id,
+                account_id,
+                snapshot,
+                ..
+            } => f
+                .debug_struct("AccountAdded")
+                .field("id", id)
+                .field("account_id", account_id)
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
             Self::AccountPersisted { id, .. } => {
                 f.debug_struct("AccountPersisted").field("id", id).finish()
             }
@@ -2004,6 +2297,18 @@ async fn controller(
                     }
                 })
             }
+            WorkerCommand::AddAccount { id } => {
+                let tx = events.clone();
+                let cache_io = cache_io.clone();
+                tokio::spawn(async move {
+                    // This task deliberately receives no `RuntimeAuth`.
+                    // Adding an account must never replace the account that
+                    // backs legacy compose, folder, and polling commands.
+                    if let Err(failure) = add_account(id, &tx, &cache_io).await {
+                        let _ = tx.send(WorkerEvent::Failed { id, failure });
+                    }
+                })
+            }
             WorkerCommand::Restore { id } => {
                 let tx = events.clone();
                 let cleanup_task = cleanup.clone();
@@ -2796,6 +3101,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
     match command {
         WorkerCommand::Restore { id }
         | WorkerCommand::Connect { id }
+        | WorkerCommand::AddAccount { id }
         | WorkerCommand::Refresh { id }
         | WorkerCommand::Disconnect { id, .. }
         | WorkerCommand::Cancel { id } => Some(*id),
@@ -2893,6 +3199,7 @@ async fn connect(
         id,
         account: account.clone(),
     });
+    emit_legacy_account_registration(id, &account, tx, cache_io).await;
     *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
         email: account.email.clone(),
         access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
@@ -2941,6 +3248,183 @@ async fn connect(
     )
     .await?;
     complete_sync(id, tx, account, fetched, cache_io).await
+}
+
+/// Completes an OAuth authorization as a second, isolated account. This is
+/// intentionally not a variant of `connect`: the singleton `RuntimeAuth`,
+/// legacy keyring item, and legacy cache are left untouched throughout.
+async fn add_account(
+    id: OperationId,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cache_io: &Arc<Mutex<()>>,
+) -> Result<(), ServiceFailure> {
+    emit_phase(tx, id, WorkerPhase::LoadingConfiguration);
+    let config = config::load().map_err(|error| map_config(error, true))?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|_| failure(FailureKind::AuthorizationInvalid, true, true))?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| failure(FailureKind::AuthorizationInvalid, true, true))?
+        .port();
+    let request =
+        oauth::authorization_request(&config, port, SystemTime::now()).map_err(map_oauth)?;
+    let url = AuthorizationUrl::new(request.url.expose().to_owned());
+    let _ = tx.send(WorkerEvent::AuthorizationRequired {
+        id,
+        url,
+        deadline: request.deadline,
+    });
+    emit_phase(tx, id, WorkerPhase::WaitingForBrowser);
+    let host = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + oauth::CALLBACK_TIMEOUT;
+    let (mut socket, code) = loop {
+        let (mut socket, peer) = timeout_at(deadline, listener.accept())
+            .await
+            .map_err(|_| failure(FailureKind::AuthorizationTimedOut, true, true))?
+            .map_err(|_| failure(FailureKind::AuthorizationInvalid, true, true))?;
+        let bytes = read_callback_headers(&mut socket, deadline)
+            .await
+            .map_err(map_oauth)?;
+        match oauth::parse_callback_request(&bytes, peer, &host, request.csrf_state.expose()) {
+            Ok(code) => break (socket, code),
+            Err(oauth::OAuthError::CallbackWrongPath) => {
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+            Err(error) => return Err(map_oauth(error)),
+        }
+    };
+    let response = callback_success_header();
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.write_all(CALLBACK_SUCCESS_BODY).await;
+    emit_phase(tx, id, WorkerPhase::ExchangingCode);
+    let client = oauth::http_client().map_err(map_oauth)?;
+    let grant = oauth::exchange_code(&config, &request, &code, &client)
+        .await
+        .map_err(map_oauth)?;
+    emit_phase(tx, id, WorkerPhase::VerifyingIdentity);
+    let account = oauth::fetch_identity(&grant.access_token, &client)
+        .await
+        .map_err(map_oauth)?;
+    let _ = tx.send(WorkerEvent::IdentityVerified {
+        id,
+        account: account.clone(),
+    });
+
+    // The registry check is the first persistent operation. In particular,
+    // this occurs before creating a keyring item or account cache directory.
+    let account_id =
+        AccountId::generate().map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?;
+    let registry_account = account.clone();
+    let registry_id = account_id.clone();
+    let existing = cache_blocking(cache_io.clone(), move || {
+        let registry = cache::load_account_registry()?;
+        if let Some(existing) = duplicate_registered_account(&registry.accounts, &registry_account)
+        {
+            return Ok::<_, std::io::Error>(Some(existing));
+        }
+        // Validate capacity and the new opaque ID now, before any scoped
+        // write. `add_account_record` repeats this validation at commit.
+        let mut candidate = registry;
+        candidate
+            .add(AccountRecord::new(registry_id, registry_account))
+            .map_err(|error| std::io::Error::other(format!("account registry: {error:?}")))?;
+        Ok(None)
+    })
+    .await
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?
+    .map_err(|_| failure(FailureKind::WorkerUnavailable, true, true))?;
+    if let Some(existing_account_id) = existing {
+        let _ = tx.send(WorkerEvent::DuplicateAccountIdentity {
+            id,
+            existing_account_id,
+        });
+        return Ok(());
+    }
+
+    let refresh = oauth::require_initial_refresh_token(&grant)
+        .map_err(|_| failure(FailureKind::AuthorizationExpired, false, true))?;
+    let token = RefreshToken::new(refresh.expose().to_owned())
+        .map_err(|_| failure(FailureKind::CredentialSaveFailed, true, true))?;
+    let requested_limit = cache_blocking(cache_io.clone(), cache::load_limit)
+        .await
+        .map_err(|_| failure(FailureKind::WorkerUnavailable, false, true))?;
+    emit_phase(tx, id, WorkerPhase::ConnectingImap);
+    let fetched = gmail::fetch_inbox(&account.email, grant.access_token.expose(), requested_limit)
+        .await
+        .map_err(map_gmail)?;
+
+    // A failed scoped-secret write cannot alter the legacy secret. Likewise,
+    // subsequent cleanup only addresses this generated opaque account ID.
+    emit_phase(tx, id, WorkerPhase::OpeningKeyring);
+    if !matches!(
+        timeout(
+            KEYRING_TIMEOUT,
+            secrets::replace_for_account(&account_id, &token)
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return Err(failure(FailureKind::CredentialSaveFailed, true, true));
+    }
+
+    emit_phase(tx, id, WorkerPhase::FetchingInbox);
+    let account_for_cache = account.clone();
+    let cache_account_id = account_id.clone();
+    let saved = cache_blocking(cache_io.clone(), move || {
+        let folder_catalog = fetched.folder_catalog;
+        let (messages, fallback_count) = message::map_summaries(fetched.records);
+        let fresh = MailboxSnapshot {
+            folder_catalog,
+            metadata: SyncMetadata {
+                completed_at: SystemTime::now(),
+                requested_limit,
+                loaded_count: messages.len(),
+                fallback_count,
+                skipped_count: fetched.skipped_count,
+            },
+            messages,
+        };
+        cache::replace_and_save_for_account(
+            &cache_account_id,
+            &account_for_cache,
+            fresh,
+            requested_limit,
+        )
+    })
+    .await;
+    let snapshot = match saved {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(_)) | Err(_) => {
+            let _ = timeout(KEYRING_TIMEOUT, secrets::delete_for_account(&account_id)).await;
+            return Err(failure(FailureKind::WorkerUnavailable, true, true));
+        }
+    };
+
+    let record = AccountRecord::new(account_id.clone(), account.clone());
+    let registry_saved =
+        cache_blocking(cache_io.clone(), move || cache::add_account_record(record)).await;
+    if !matches!(registry_saved, Ok(Ok(_))) {
+        let scoped_id = account_id.clone();
+        let _ = cache_blocking(cache_io.clone(), move || {
+            cache::clear_account_cache(&scoped_id)
+        })
+        .await;
+        let _ = timeout(KEYRING_TIMEOUT, secrets::delete_for_account(&account_id)).await;
+        return Err(failure(FailureKind::WorkerUnavailable, true, true));
+    }
+
+    let _ = tx.send(WorkerEvent::AccountAdded {
+        id,
+        account_id,
+        account,
+        snapshot,
+    });
+    Ok(())
 }
 
 fn callback_success_header() -> String {
@@ -3085,6 +3569,7 @@ async fn restore_or_refresh(
         id,
         account: account.clone(),
     });
+    emit_legacy_account_registration(id, &account, tx, cache_io).await;
     if let Ok((Ok(Some((cached_account, snapshot))), usage)) = cached
         && cached_account.email.eq_ignore_ascii_case(&account.email)
     {
@@ -3103,6 +3588,42 @@ async fn restore_or_refresh(
         token_obtained_at: Instant::now(),
     });
     sync(id, tx, account, grant.access_token.expose(), cache_io).await
+}
+
+/// Gives a pre-multi-account installation an opaque registry ID once its
+/// existing OAuth session has been verified. Registry failure must not break
+/// the established singleton restore/connect path: no credential or cache is
+/// moved here, so the person can continue using the old account unchanged.
+async fn emit_legacy_account_registration(
+    id: OperationId,
+    account: &AccountIdentity,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cache_io: &Arc<Mutex<()>>,
+) {
+    let account = account.clone();
+    let registry_account = account.clone();
+    let registered = cache_blocking(cache_io.clone(), move || {
+        let registry = cache::load_account_registry()?;
+        if let Some(existing) = duplicate_registered_account(&registry.accounts, &registry_account)
+        {
+            return Ok::<_, std::io::Error>(existing);
+        }
+        let account_id = AccountId::generate().map_err(|error| {
+            std::io::Error::other(format!("could not create account id: {error:?}"))
+        })?;
+        cache::add_account_record(AccountRecord::new(account_id.clone(), registry_account))?;
+        Ok(account_id)
+    })
+    .await;
+    if let Ok(Ok(account_id)) = registered {
+        // Identity is sent only to the reducer; WorkerEvent's Debug
+        // implementation deliberately omits it.
+        let _ = tx.send(WorkerEvent::LegacyAccountRegistered {
+            id,
+            account_id,
+            account: account.clone(),
+        });
+    }
 }
 
 async fn sync(
@@ -3967,6 +4488,79 @@ fn map_gmail(error: gmail::GmailError) -> ServiceFailure {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    fn account_id(suffix: char) -> AccountId {
+        AccountId::new(format!("acct-{}", suffix.to_string().repeat(32))).unwrap()
+    }
+
+    fn gmail_identity(email: &str) -> AccountIdentity {
+        AccountIdentity {
+            provider: MailProvider::Gmail,
+            email: email.into(),
+        }
+    }
+
+    #[test]
+    fn account_protocol_is_scoped_and_never_logs_payloads() {
+        let scoped = AccountScoped::new(account_id('a'), 17, "body-canary@example.com");
+        let debug = format!("{scoped:?}");
+        assert!(debug.contains("generation: 17"));
+        assert!(!debug.contains("body-canary"));
+
+        let event = AccountWorkerEvent::IdentityVerified {
+            operation_id: OperationId(4),
+            identity: gmail_identity("identity-canary@example.com"),
+        };
+        assert!(!format!("{event:?}").contains("identity-canary"));
+    }
+
+    #[test]
+    fn duplicate_identity_returns_existing_opaque_account_before_persistence() {
+        let existing_id = account_id('a');
+        let accounts = vec![AccountRecord::new(
+            existing_id.clone(),
+            gmail_identity("Work.Example@gmail.com"),
+        )];
+        assert_eq!(
+            duplicate_registered_account(&accounts, &gmail_identity(" work.example@GMAIL.com ")),
+            Some(existing_id)
+        );
+        assert_eq!(
+            duplicate_registered_account(&accounts, &gmail_identity("other@example.com")),
+            None
+        );
+    }
+
+    #[test]
+    fn sync_scheduler_prioritizes_foreground_and_coalesces_per_account() {
+        let first = account_id('a');
+        let second = account_id('b');
+        let foreground = account_id('c');
+        let mut queue = FairAccountSyncQueue::new(1);
+        let background = |account_id, request_id| AccountSyncWork {
+            account_id,
+            request_id: BackgroundSyncRequestId(request_id),
+            priority: AccountSyncPriority::Background,
+        };
+        assert!(queue.enqueue(background(first.clone(), 1)));
+        assert!(queue.enqueue(background(second.clone(), 2)));
+        assert!(!queue.enqueue(background(first.clone(), 3)));
+        assert!(!queue.complete(&first));
+        assert!(queue.is_scheduled(&first));
+        assert!(queue.enqueue(AccountSyncWork {
+            account_id: foreground.clone(),
+            request_id: BackgroundSyncRequestId(4),
+            priority: AccountSyncPriority::Foreground,
+        }));
+
+        assert_eq!(queue.dequeue().unwrap().account_id, foreground);
+        assert!(queue.dequeue().is_none());
+        assert!(queue.complete(&account_id('c')));
+        assert_eq!(queue.dequeue().unwrap().account_id, first);
+        assert!(queue.complete(&account_id('a')));
+        assert_eq!(queue.dequeue().unwrap().account_id, second);
+    }
+
     #[test]
     fn debug_contract_redacts_payloads() {
         let command = WorkerCommand::Refresh { id: OperationId(3) };

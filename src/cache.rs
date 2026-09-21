@@ -1,7 +1,7 @@
 use crate::model::{
-    AccountIdentity, Attachment, CacheUsage, FolderCatalog, FolderId, MailProvider,
-    MailboxSnapshot, MessageBody, MessageId, MessageMutation, MessageSummary,
-    ReconciledMessageState, SyncMetadata,
+    AccountId, AccountIdentity, AccountRecord, AccountRegistry, AccountRegistryError, Attachment,
+    CacheUsage, FolderCatalog, FolderId, MailProvider, MailboxSnapshot, MessageBody, MessageId,
+    MessageMutation, MessageSummary, ReconciledMessageState, SyncMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,7 +27,43 @@ const BODY_VERSION: u8 = 5;
 const MANIFEST_VERSION: u8 = 3;
 const ACCOUNT_CLEANUP_VERSION: u8 = 1;
 const PREFERENCES_VERSION: u8 = 1;
+const ACCOUNT_REGISTRY_VERSION: u8 = 1;
+const LEGACY_CACHE_MIGRATION_VERSION: u8 = 1;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
+
+/// A physically separate, account-owned cache tree. Its path is constructed
+/// only from a validated opaque AccountId, never an email address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountCacheNamespace {
+    pub account_id: AccountId,
+    pub root: PathBuf,
+}
+
+impl AccountCacheNamespace {
+    pub fn mailbox_path(&self) -> PathBuf {
+        mailbox_path(&self.root)
+    }
+
+    pub fn bodies_path(&self) -> PathBuf {
+        bodies_path(&self.root)
+    }
+
+    pub fn attachments_path(&self) -> PathBuf {
+        attachments_path(&self.root)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredAccountRegistry {
+    version: u8,
+    registry: AccountRegistry,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PendingLegacyCacheMigration {
+    version: u8,
+    account_id: AccountId,
+}
 
 /// The application's colour-scheme choice. `System` deliberately maps to
 /// libadwaita's default scheme at the UI boundary, so desktop theme changes
@@ -192,6 +228,285 @@ pub fn load_preferences() -> Preferences {
 /// cannot lose one preference field while updating another.
 pub fn save_preferences_and_prune(preferences: Preferences) -> io::Result<()> {
     save_preferences_and_prune_at(&config_root(), &cache_root(), preferences)
+}
+
+/// Loads the durable account registry. A missing registry represents a
+/// pre-multi-account installation and is intentionally not an error.
+pub fn load_account_registry() -> io::Result<AccountRegistry> {
+    load_account_registry_at(&config_root())
+}
+
+pub fn load_account_registry_at(config: &Path) -> io::Result<AccountRegistry> {
+    match read_json::<StoredAccountRegistry>(&account_registry_path(config))? {
+        None => Ok(AccountRegistry::default()),
+        Some(stored)
+            if stored.version == ACCOUNT_REGISTRY_VERSION && stored.registry.is_valid() =>
+        {
+            Ok(stored.registry)
+        }
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid account registry",
+        )),
+    }
+}
+
+pub fn save_account_registry(registry: &AccountRegistry) -> io::Result<()> {
+    save_account_registry_at(&config_root(), registry)
+}
+
+pub fn save_account_registry_at(config: &Path, registry: &AccountRegistry) -> io::Result<()> {
+    if !registry.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid account registry",
+        ));
+    }
+    write_private_json(
+        &account_registry_path(config),
+        &StoredAccountRegistry {
+            version: ACCOUNT_REGISTRY_VERSION,
+            registry: registry.clone(),
+        },
+    )
+}
+
+/// Adds an account atomically with respect to the registry file. Duplicate
+/// Gmail identities are rejected before any existing registry is overwritten.
+pub fn add_account_record(record: AccountRecord) -> io::Result<AccountRegistry> {
+    add_account_record_at(&config_root(), record)
+}
+
+pub fn add_account_record_at(config: &Path, record: AccountRecord) -> io::Result<AccountRegistry> {
+    let mut registry = load_account_registry_at(config)?;
+    registry.add(record).map_err(account_registry_error)?;
+    save_account_registry_at(config, &registry)?;
+    Ok(registry)
+}
+
+fn account_registry_error(error: AccountRegistryError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("account registry: {error:?}"),
+    )
+}
+
+/// Returns the isolated cache root for an account. This does not create it.
+pub fn account_cache_namespace(account_id: &AccountId) -> AccountCacheNamespace {
+    account_cache_namespace_at(&cache_root(), account_id)
+}
+
+pub fn account_cache_namespace_at(cache: &Path, account_id: &AccountId) -> AccountCacheNamespace {
+    AccountCacheNamespace {
+        account_id: account_id.clone(),
+        root: accounts_cache_root(cache).join(account_id.as_str()),
+    }
+}
+
+/// Removes only the specified account's namespaced cache. Registry and every
+/// other account tree are intentionally untouched.
+pub fn clear_account_cache(account_id: &AccountId) -> io::Result<()> {
+    clear_account_cache_at(&cache_root(), account_id)
+}
+
+pub fn clear_account_cache_at(cache: &Path, account_id: &AccountId) -> io::Result<()> {
+    let namespace = account_cache_namespace_at(cache, account_id);
+    remove_dir_if_exists(&namespace.root)
+}
+
+/// Account-scoped equivalents of the singleton cache API. They deliberately
+/// route the existing, mature mailbox/body formats through a distinct cache
+/// root so equal Gmail message IDs cannot collide across accounts.
+pub fn load_latest_for_account(
+    account_id: &AccountId,
+    limit: usize,
+) -> io::Result<Option<(AccountIdentity, MailboxSnapshot)>> {
+    load_latest_from(&account_cache_namespace(account_id).root, limit)
+}
+
+pub fn load_folder_for_account(
+    account_id: &AccountId,
+    account_email: &str,
+    folder_id: &FolderId,
+    limit: usize,
+) -> io::Result<Option<MailboxSnapshot>> {
+    load_folder_from(
+        &account_cache_namespace(account_id).root,
+        account_email,
+        folder_id,
+        limit,
+        now_unix(),
+    )
+}
+
+pub fn replace_and_save_for_account(
+    account_id: &AccountId,
+    account: &AccountIdentity,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<MailboxSnapshot> {
+    replace_and_save_at(
+        &account_cache_namespace(account_id).root,
+        account,
+        fresh,
+        limit,
+    )
+}
+
+pub fn replace_folder_and_save_for_account(
+    account_id: &AccountId,
+    account: &AccountIdentity,
+    folder_id: FolderId,
+    fresh: MailboxSnapshot,
+    limit: usize,
+) -> io::Result<MailboxSnapshot> {
+    replace_folder_and_save_at(
+        &account_cache_namespace(account_id).root,
+        account,
+        folder_id,
+        fresh,
+        limit,
+        now_unix(),
+    )
+}
+
+pub fn load_body_for_account(
+    account_id: &AccountId,
+    account_email: &str,
+    id: &MessageId,
+) -> io::Result<Option<MessageBody>> {
+    load_body_at(
+        &account_cache_namespace(account_id).root,
+        account_email,
+        id,
+        now_unix(),
+    )
+}
+
+pub fn save_body_for_account(
+    account_id: &AccountId,
+    account_email: &str,
+    id: &MessageId,
+    body: &MessageBody,
+) -> io::Result<CacheUsage> {
+    save_body_at(
+        &account_cache_namespace(account_id).root,
+        account_email,
+        id,
+        body,
+        now_unix(),
+        BODY_CACHE_BUDGET_BYTES,
+    )
+}
+
+pub fn persist_confirmed_mutation_for_account(
+    account_id: &AccountId,
+    account_email: &str,
+    id: &MessageId,
+    mutation: &MessageMutation,
+) -> io::Result<()> {
+    persist_confirmed_mutation_at(
+        &account_cache_namespace(account_id).root,
+        account_email,
+        id,
+        mutation,
+    )
+}
+
+/// Copies the singleton cache into a new account namespace without deleting
+/// any source files. Call `finalize_legacy_cache_migration` only after the
+/// account registry and scoped Secret Service token have both been committed.
+/// Repeating this operation after interruption is safe.
+pub fn stage_legacy_cache_migration(account_id: &AccountId) -> io::Result<AccountCacheNamespace> {
+    stage_legacy_cache_migration_at(&cache_root(), account_id)
+}
+
+pub fn stage_legacy_cache_migration_at(
+    cache: &Path,
+    account_id: &AccountId,
+) -> io::Result<AccountCacheNamespace> {
+    let marker = legacy_cache_migration_marker_path(cache);
+    match read_json::<PendingLegacyCacheMigration>(&marker)? {
+        Some(pending)
+            if pending.version == LEGACY_CACHE_MIGRATION_VERSION
+                && pending.account_id != *account_id =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "legacy cache migration belongs to another account",
+            ));
+        }
+        Some(pending) if pending.version != LEGACY_CACHE_MIGRATION_VERSION => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid legacy cache migration marker",
+            ));
+        }
+        None => write_private_json(
+            &marker,
+            &PendingLegacyCacheMigration {
+                version: LEGACY_CACHE_MIGRATION_VERSION,
+                account_id: account_id.clone(),
+            },
+        )?,
+        _ => {}
+    }
+    let namespace = account_cache_namespace_at(cache, account_id);
+    ensure_private_dir(&namespace.root)?;
+    for (source, destination) in [
+        (mailbox_path(cache), namespace.mailbox_path()),
+        (v2_mailbox_path(cache), v2_mailbox_path(&namespace.root)),
+        (
+            legacy_mailbox_path(cache),
+            legacy_mailbox_path(&namespace.root),
+        ),
+    ] {
+        copy_private_file_if_exists(&source, &destination)?;
+    }
+    copy_private_dir_if_exists(&bodies_path(cache), &namespace.bodies_path())?;
+    copy_private_dir_if_exists(
+        &legacy_bodies_path(cache),
+        &legacy_bodies_path(&namespace.root),
+    )?;
+    copy_private_dir_if_exists(&attachments_path(cache), &namespace.attachments_path())?;
+    sync_mail_cache_dir(cache)?;
+    Ok(namespace)
+}
+
+/// Finishes a previously staged migration. It refuses to remove singleton
+/// data unless the marker belongs to `account_id`; this makes retry and crash
+/// recovery deterministic and prevents cross-account cleanup.
+pub fn finalize_legacy_cache_migration(account_id: &AccountId) -> io::Result<()> {
+    finalize_legacy_cache_migration_at(&cache_root(), account_id)
+}
+
+pub fn finalize_legacy_cache_migration_at(cache: &Path, account_id: &AccountId) -> io::Result<()> {
+    let marker = legacy_cache_migration_marker_path(cache);
+    let Some(pending) = read_json::<PendingLegacyCacheMigration>(&marker)? else {
+        return Ok(());
+    };
+    if pending.version != LEGACY_CACHE_MIGRATION_VERSION || pending.account_id != *account_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy cache migration marker mismatch",
+        ));
+    }
+    for path in [
+        mailbox_path(cache),
+        v2_mailbox_path(cache),
+        legacy_mailbox_path(cache),
+    ] {
+        remove_file_if_exists(&path)?;
+    }
+    for path in [
+        bodies_path(cache),
+        legacy_bodies_path(cache),
+        attachments_path(cache),
+    ] {
+        remove_dir_if_exists(&path)?;
+    }
+    remove_file_if_exists(&marker)?;
+    sync_mail_cache_dir(cache)
 }
 
 pub fn load_latest(limit: usize) -> io::Result<Option<(AccountIdentity, MailboxSnapshot)>> {
@@ -1370,6 +1685,18 @@ fn preferences_path(config: &Path) -> PathBuf {
     config.join("whitford/preferences.json")
 }
 
+fn account_registry_path(config: &Path) -> PathBuf {
+    config.join("whitford/accounts-v1.json")
+}
+
+fn accounts_cache_root(cache: &Path) -> PathBuf {
+    cache.join("whitford/accounts-v1")
+}
+
+fn legacy_cache_migration_marker_path(cache: &Path) -> PathBuf {
+    cache.join("whitford/legacy-cache-migration-v1.json")
+}
+
 fn mailbox_path(cache: &Path) -> PathBuf {
     cache.join("whitford/mailbox-v3.json")
 }
@@ -1479,6 +1806,70 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         file.flush()?;
         file.sync_all()?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn copy_private_file_if_exists(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            io::Error::new(io::ErrorKind::InvalidData, "unsafe legacy cache file"),
+        ),
+        Ok(metadata) if metadata.len() > MAX_CACHE_JSON_BYTES => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy cache record exceeds size limit",
+        )),
+        Ok(_) => {
+            let bytes = fs::read(source)?;
+            write_private_bytes(destination, &bytes)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_private_dir_if_exists(source: &Path, destination: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    ensure_private_dir(destination)?;
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsafe legacy cache directory entry",
+            ));
+        }
+        let name = entry.file_name();
+        copy_private_file_if_exists(&entry.path(), &destination.join(name))?;
+    }
+    Ok(())
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing parent"))?;
+    ensure_private_dir(parent)?;
+    let serial = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("tmp-{}-{serial}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
         fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -1615,6 +2006,74 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn account_id(value: char) -> AccountId {
+        AccountId::new(format!("acct-{}", value.to_string().repeat(32))).unwrap()
+    }
+
+    #[test]
+    fn registry_persists_opaque_ids_and_rejects_duplicate_gmail_identity() {
+        let config = TestRoot::new();
+        let record = AccountRecord::new(
+            account_id('a'),
+            AccountIdentity {
+                provider: MailProvider::Gmail,
+                email: "Me@Example.com".into(),
+            },
+        );
+        add_account_record_at(&config.0, record.clone()).unwrap();
+        assert_eq!(
+            load_account_registry_at(&config.0).unwrap().accounts,
+            vec![record]
+        );
+        let duplicate = AccountRecord::new(
+            account_id('b'),
+            AccountIdentity {
+                provider: MailProvider::Gmail,
+                email: "me@example.com".into(),
+            },
+        );
+        assert_eq!(
+            add_account_record_at(&config.0, duplicate)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn legacy_cache_staging_is_recoverable_and_finalize_is_account_scoped() {
+        let root = TestRoot::new();
+        let account = account_id('a');
+        write_private_json(&mailbox_path(&root.0), &serde_json::json!({"cache": 1})).unwrap();
+        ensure_bodies_dir(&root.0).unwrap();
+        fs::write(bodies_path(&root.0).join("gm-1.json"), b"body").unwrap();
+        ensure_private_dir(&attachments_path(&root.0)).unwrap();
+        fs::write(attachments_path(&root.0).join("part"), b"attachment").unwrap();
+
+        let namespace = stage_legacy_cache_migration_at(&root.0, &account).unwrap();
+        assert!(mailbox_path(&root.0).exists());
+        assert!(namespace.mailbox_path().exists());
+        assert_eq!(
+            fs::read(namespace.bodies_path().join("gm-1.json")).unwrap(),
+            b"body"
+        );
+        assert_eq!(
+            fs::read(namespace.attachments_path().join("part")).unwrap(),
+            b"attachment"
+        );
+        // Idempotent retry after a crash retains both source and copied cache.
+        assert_eq!(
+            stage_legacy_cache_migration_at(&root.0, &account).unwrap(),
+            namespace
+        );
+
+        finalize_legacy_cache_migration_at(&root.0, &account).unwrap();
+        assert!(!mailbox_path(&root.0).exists());
+        assert!(namespace.mailbox_path().exists());
+        assert!(clear_account_cache_at(&root.0, &account).is_ok());
+        assert!(!namespace.root.exists());
     }
 
     fn summary(uid: u32) -> MessageSummary {

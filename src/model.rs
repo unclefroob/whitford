@@ -1,9 +1,161 @@
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
+use std::{fmt, time::SystemTime};
 
 pub const MAX_FOLDER_MAILBOX_BYTES: usize = 1_024;
 pub const MAX_FOLDER_CATALOG_ENTRIES: usize = 256;
 pub const MAX_MESSAGE_LABELS: usize = 256;
+pub const MAX_ACCOUNTS: usize = 32;
+
+/// An opaque, durable identifier for an account.  It is deliberately unrelated
+/// to the email address: account IDs are used in filenames, cache keys and
+/// Secret Service attributes, where leaking an identity is unnecessary.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct AccountId(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountIdError {
+    Invalid,
+    RandomUnavailable,
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AccountId {
+    const PREFIX: &str = "acct-";
+    const ENCODED_BYTES: usize = 32;
+
+    /// Parses the canonical, filesystem-safe representation.
+    pub fn new(value: impl Into<String>) -> Result<Self, AccountIdError> {
+        let value = value.into();
+        let suffix = value
+            .strip_prefix(Self::PREFIX)
+            .ok_or(AccountIdError::Invalid)?;
+        if suffix.len() != Self::ENCODED_BYTES
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(AccountIdError::Invalid);
+        }
+        Ok(Self(value))
+    }
+
+    /// Creates a random ID suitable for persistence. The encoded value is
+    /// opaque and contains no account identity.
+    pub fn generate() -> Result<Self, AccountIdError> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|_| AccountIdError::RandomUnavailable)?;
+        let mut value = String::from(Self::PREFIX);
+        for byte in bytes {
+            use std::fmt::Write;
+            let _ = write!(value, "{byte:02x}");
+        }
+        Self::new(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccountRecord {
+    pub id: AccountId,
+    pub identity: AccountIdentity,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccountRegistry {
+    pub accounts: Vec<AccountRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountRegistryError {
+    InvalidAccount,
+    DuplicateId,
+    DuplicateIdentity,
+    TooManyAccounts,
+}
+
+impl AccountRegistry {
+    pub fn add(&mut self, record: AccountRecord) -> Result<(), AccountRegistryError> {
+        if !record.identity.is_valid() {
+            return Err(AccountRegistryError::InvalidAccount);
+        }
+        if self.accounts.len() >= MAX_ACCOUNTS {
+            return Err(AccountRegistryError::TooManyAccounts);
+        }
+        if self
+            .accounts
+            .iter()
+            .any(|existing| existing.id == record.id)
+        {
+            return Err(AccountRegistryError::DuplicateId);
+        }
+        if self.accounts.iter().any(|existing| {
+            existing.identity.provider == record.identity.provider
+                && existing.identity.normalized_email() == record.identity.normalized_email()
+        }) {
+            return Err(AccountRegistryError::DuplicateIdentity);
+        }
+        self.accounts.push(record);
+        self.accounts.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(())
+    }
+
+    pub fn get(&self, id: &AccountId) -> Option<&AccountRecord> {
+        self.accounts.iter().find(|record| &record.id == id)
+    }
+
+    pub fn identity_exists(&self, identity: &AccountIdentity) -> bool {
+        self.accounts.iter().any(|record| {
+            record.identity.provider == identity.provider
+                && record.identity.normalized_email() == identity.normalized_email()
+        })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.accounts.len() <= MAX_ACCOUNTS
+            && self
+                .accounts
+                .iter()
+                .all(|record| record.identity.is_valid())
+            && self.accounts.iter().enumerate().all(|(index, record)| {
+                self.accounts[..index].iter().all(|other| {
+                    other.id != record.id
+                        && !(other.identity.provider == record.identity.provider
+                            && other.identity.normalized_email()
+                                == record.identity.normalized_email())
+                })
+            })
+    }
+}
+
+impl AccountRecord {
+    pub fn new(id: AccountId, identity: AccountIdentity) -> Self {
+        Self { id, identity }
+    }
+}
+
+/// Message identity at a storage or event boundary. Gmail message IDs are only
+/// globally unique within one mailbox, so they must never cross this boundary
+/// without their owning account ID.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct AccountMessageId {
+    pub account_id: AccountId,
+    pub message_id: MessageId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct AccountFolderId {
+    pub account_id: AccountId,
+    pub folder_id: FolderId,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum FolderId {
@@ -37,15 +189,30 @@ impl MessageId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MailProvider {
     Gmail,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AccountIdentity {
     pub provider: MailProvider,
     pub email: String,
+}
+
+impl AccountIdentity {
+    /// A comparison key only. Display and persisted values retain the exact
+    /// address returned by the provider, while duplicate detection follows
+    /// Gmail's case-insensitive identity semantics.
+    pub fn normalized_email(&self) -> String {
+        self.email.trim().to_ascii_lowercase()
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.email.trim().is_empty()
+            && self.email.len() <= 320
+            && !self.email.chars().any(char::is_control)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,5 +701,37 @@ mod tests {
         };
         assert_eq!(archive.dimension(), MutationDimension::Inbox);
         assert_eq!(trash.dimension(), MutationDimension::Inbox);
+    }
+
+    #[test]
+    fn account_ids_are_opaque_and_registry_rejects_duplicate_identity() {
+        let id = AccountId::new("acct-0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(id.as_str(), "acct-0123456789abcdef0123456789abcdef");
+        assert!(AccountId::new("me@example.com").is_err());
+        assert!(AccountId::new("acct-0123456789ABCDEF0123456789abcdef").is_err());
+
+        let mut registry = AccountRegistry::default();
+        registry
+            .add(AccountRecord::new(
+                id.clone(),
+                AccountIdentity {
+                    provider: MailProvider::Gmail,
+                    email: "Me@Example.com".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            registry
+                .add(AccountRecord::new(
+                    AccountId::new("acct-fedcba9876543210fedcba9876543210").unwrap(),
+                    AccountIdentity {
+                        provider: MailProvider::Gmail,
+                        email: " me@example.com ".into(),
+                    },
+                ))
+                .unwrap_err(),
+            AccountRegistryError::DuplicateIdentity
+        );
+        assert!(registry.get(&id).is_some());
     }
 }
