@@ -7,17 +7,21 @@ use crate::{
     },
     smtp,
     worker::{
-        AttachmentDestination, AttachmentFailure, AttachmentJobId, BodyFailure, BodyRequestId,
-        CacheOperationId, DraftOperationId, FailureKind, FolderRequestId, MutationRequestId,
-        OperationId, SearchRequestId, SendFailure, SendRequestId, ServiceFailure, SyncKind,
-        WorkerCommand, WorkerEvent, WorkerPhase,
+        AttachmentDestination, AttachmentFailure, AttachmentJobId, BackgroundSyncRequestId,
+        BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
+        FolderRequestId, MutationRequestId, OperationId, SearchRequestId, SendFailure,
+        SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
     },
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
+
+const BACKGROUND_SYNC_FLOOR: Duration = Duration::from_secs(60);
+const BACKGROUND_SYNC_CAP: Duration = Duration::from_secs(15 * 60);
+const MAX_EMITTED_BACKGROUND_IDS: usize = cache::MAX_SUMMARIES_PER_FOLDER;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -70,6 +74,41 @@ pub struct AppState {
     undo_operation: Option<UndoOperation>,
     next_attachment_job: u64,
     attachment_jobs: HashMap<AttachmentJobId, AttachmentDownload>,
+    background_sync: BackgroundSyncState,
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundSyncState {
+    in_flight: Option<BackgroundSyncRequestId>,
+    next_request: u64,
+    consecutive_failures: u8,
+    schedule_generation: u64,
+    pending_tick: bool,
+    paused: bool,
+    emitted_ids: HashSet<MessageId>,
+}
+
+impl Default for BackgroundSyncState {
+    fn default() -> Self {
+        Self {
+            in_flight: None,
+            next_request: 1,
+            consecutive_failures: 0,
+            schedule_generation: 1,
+            pending_tick: false,
+            paused: true,
+            emitted_ids: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BackgroundSyncStatus {
+    #[default]
+    Idle,
+    Syncing,
+    BackingOff,
+    Paused,
 }
 
 #[derive(Clone, Debug)]
@@ -337,13 +376,28 @@ pub enum Action {
     SelectPrevious,
     BrowserLaunchFailed(OperationId),
     WorkerUnavailable,
+    BackgroundSyncTimer {
+        schedule_generation: u64,
+    },
     Worker(WorkerEvent),
 }
 #[derive(Debug)]
 pub enum Effect {
     SendWorker(WorkerCommand),
-    LaunchAuthorization { id: OperationId },
-    ClearAuthorization { id: OperationId },
+    ScheduleBackgroundSync {
+        after: Duration,
+        schedule_generation: u64,
+    },
+    CancelBackgroundSyncTimer,
+    NotifyNewUnread {
+        count: usize,
+    },
+    LaunchAuthorization {
+        id: OperationId,
+    },
+    ClearAuthorization {
+        id: OperationId,
+    },
     PresentDisconnectConfirmation,
     PresentClearCacheConfirmation,
     PresentUncertainResendConfirmation,
@@ -396,6 +450,7 @@ pub struct ViewSnapshot {
     pub undo_message_operation: Option<UndoMessageOperationView>,
     pub label_options: Vec<(String, String, bool)>,
     pub attachment_downloads: Vec<AttachmentDownload>,
+    pub background_sync_status: BackgroundSyncStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -516,6 +571,7 @@ impl AppState {
             undo_operation: None,
             next_attachment_job: 1,
             attachment_jobs: HashMap::new(),
+            background_sync: BackgroundSyncState::default(),
         }
     }
     pub fn dispatch(&mut self, action: Action) -> Update {
@@ -589,6 +645,7 @@ impl AppState {
                 }
             }
             Action::WorkerUnavailable => {
+                let cancel_background = self.stop_background_sync();
                 self.active_operation = None;
                 self.recovery = None;
                 let _ = self.invalidate_server_search();
@@ -634,9 +691,12 @@ impl AppState {
                 };
                 Update {
                     feedback: Some("The mail worker stopped unexpectedly"),
-                    ..Default::default()
+                    effects: cancel_background.into_iter().collect(),
                 }
             }
+            Action::BackgroundSyncTimer {
+                schedule_generation,
+            } => self.background_sync_timer(schedule_generation),
             Action::Worker(event) => self.worker_event(event),
             Action::SelectFolder(id) => self.load_folder(id),
             Action::SelectMessage(id) => self.select_message(id),
@@ -808,6 +868,7 @@ impl AppState {
             return Update::default();
         };
         let mut effects = self.invalidate_server_search();
+        let cancel_background = self.stop_background_sync();
         self.cache_generation = self.cache_generation.wrapping_add(1);
         self.folder_generation = self.folder_generation.wrapping_add(1).max(1);
         self.active_folder_request = None;
@@ -832,6 +893,9 @@ impl AppState {
             draft_generation: self.draft_generation,
             account_email,
         }));
+        if let Some(cancel) = cancel_background {
+            effects.push(cancel);
+        }
         Update {
             effects,
             ..Default::default()
@@ -1327,7 +1391,170 @@ impl AppState {
                 message_id,
                 uncertain,
             } => self.finish_mutation(request_id, generation, &message_id, false, None, uncertain),
+            event @ (WorkerEvent::BackgroundSyncComplete { .. }
+            | WorkerEvent::BackgroundSyncFailed { .. }) => self
+                .background_worker_event(event)
+                .expect("background event"),
             other => self.account_worker_event(other),
+        }
+    }
+
+    fn background_sync_delay(failures: u8) -> Duration {
+        let multiplier = 1u64.checked_shl(u32::from(failures.min(4))).unwrap_or(16);
+        BACKGROUND_SYNC_FLOOR
+            .saturating_mul(multiplier as u32)
+            .min(BACKGROUND_SYNC_CAP)
+    }
+
+    fn arm_background_sync(&mut self, after: Duration) -> Effect {
+        self.background_sync.schedule_generation = self
+            .background_sync
+            .schedule_generation
+            .wrapping_add(1)
+            .max(1);
+        Effect::ScheduleBackgroundSync {
+            after,
+            schedule_generation: self.background_sync.schedule_generation,
+        }
+    }
+
+    fn stop_background_sync(&mut self) -> Option<Effect> {
+        let was_active = self.background_sync.in_flight.take().is_some()
+            || self.background_sync.pending_tick
+            || !self.background_sync.paused;
+        self.background_sync.pending_tick = false;
+        self.background_sync.paused = true;
+        self.background_sync.schedule_generation = self
+            .background_sync
+            .schedule_generation
+            .wrapping_add(1)
+            .max(1);
+        was_active.then_some(Effect::CancelBackgroundSyncTimer)
+    }
+
+    /// Gmail message IDs are only stable within an account.  Keep the
+    /// process-local notification dedup scoped to the current identity, and
+    /// invalidate any old account's request/timer before accepting its state.
+    fn reset_background_for_account_transition(&mut self) {
+        self.background_sync.in_flight = None;
+        self.background_sync.pending_tick = false;
+        self.background_sync.consecutive_failures = 0;
+        self.background_sync.paused = true;
+        self.background_sync.emitted_ids.clear();
+        self.background_sync.schedule_generation = self
+            .background_sync
+            .schedule_generation
+            .wrapping_add(1)
+            .max(1);
+    }
+
+    fn can_begin_background_sync(&self) -> bool {
+        matches!(self.session, SessionState::Ready)
+            && self.account.is_some()
+            && self.mailbox.is_some()
+            && self.active_operation.is_none()
+            && self.active_folder_request.is_none()
+            && !self.folder_loading
+            && self.background_sync.in_flight.is_none()
+            && !self.background_sync.paused
+    }
+
+    fn background_sync_timer(&mut self, schedule_generation: u64) -> Update {
+        if schedule_generation != self.background_sync.schedule_generation
+            || self.background_sync.paused
+        {
+            return Update::default();
+        }
+        if !self.can_begin_background_sync() {
+            self.background_sync.pending_tick = true;
+            return Update {
+                effects: vec![self.arm_background_sync(BACKGROUND_SYNC_FLOOR)],
+                ..Default::default()
+            };
+        }
+        let request_id = BackgroundSyncRequestId(self.background_sync.next_request);
+        self.background_sync.next_request =
+            self.background_sync.next_request.wrapping_add(1).max(1);
+        self.background_sync.in_flight = Some(request_id);
+        self.background_sync.pending_tick = false;
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::BackgroundSync {
+                request_id,
+                account_email: self.account.as_ref().expect("ready account").email.clone(),
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn background_worker_event(&mut self, event: WorkerEvent) -> Option<Update> {
+        match event {
+            WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email,
+                snapshot,
+                new_unread_ids,
+            } => {
+                if self.background_sync.in_flight != Some(request_id)
+                    || !self
+                        .account
+                        .as_ref()
+                        .is_some_and(|account| account.email.eq_ignore_ascii_case(&account_email))
+                {
+                    return Some(Update::default());
+                }
+                self.background_sync.in_flight = None;
+                self.background_sync.consecutive_failures = 0;
+                let mut count = 0;
+                for id in new_unread_ids {
+                    if self.background_sync.emitted_ids.len() >= MAX_EMITTED_BACKGROUND_IDS {
+                        self.background_sync.emitted_ids.clear();
+                    }
+                    if self.background_sync.emitted_ids.insert(id) {
+                        count += 1;
+                    }
+                }
+                // A background Inbox snapshot must never disturb an interactive
+                // search or reader. Publish it only when the Inbox list itself is
+                // the whole visible surface.
+                if self.selected_folder_id == FolderId::Inbox
+                    && matches!(self.server_search, ServerSearchState::Idle)
+                    && matches!(self.reader, ReaderState::Closed)
+                {
+                    self.mailbox = Some(snapshot);
+                    self.normalize();
+                    self.bump_list();
+                }
+                let mut effects = Vec::new();
+                if count > 0 {
+                    effects.push(Effect::NotifyNewUnread { count });
+                }
+                effects.push(self.arm_background_sync(BACKGROUND_SYNC_FLOOR));
+                Some(Update {
+                    effects,
+                    ..Default::default()
+                })
+            }
+            WorkerEvent::BackgroundSyncFailed {
+                request_id,
+                failure,
+            } => {
+                if self.background_sync.in_flight != Some(request_id) {
+                    return Some(Update::default());
+                }
+                self.background_sync.in_flight = None;
+                if !failure.retryable {
+                    self.background_sync.paused = true;
+                    return Some(Update::default());
+                }
+                self.background_sync.consecutive_failures =
+                    self.background_sync.consecutive_failures.saturating_add(1);
+                let after = Self::background_sync_delay(self.background_sync.consecutive_failures);
+                Some(Update {
+                    effects: vec![self.arm_background_sync(after)],
+                    ..Default::default()
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1370,7 +1597,9 @@ impl AppState {
             | WorkerEvent::DraftOperationFailed { .. }
             | WorkerEvent::MutationConfirmed { .. }
             | WorkerEvent::MutationReconciled { .. }
-            | WorkerEvent::MutationFailed { .. } => unreachable!(),
+            | WorkerEvent::MutationFailed { .. }
+            | WorkerEvent::BackgroundSyncComplete { .. }
+            | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
         };
         if self.active_operation != Some(id) {
             return Update::default();
@@ -1402,6 +1631,7 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.reset_background_for_account_transition();
                     self.pending_mutations.clear();
                     self.undo_operation = None;
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
@@ -1429,6 +1659,7 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.reset_background_for_account_transition();
                     self.pending_mutations.clear();
                     self.undo_operation = None;
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
@@ -1466,6 +1697,7 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.reset_background_for_account_transition();
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
                     self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
@@ -1511,6 +1743,7 @@ impl AppState {
                     .as_ref()
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
+                    self.reset_background_for_account_transition();
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
                     self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
@@ -1533,14 +1766,18 @@ impl AppState {
                 self.recovery = None;
                 self.normalize();
                 self.bump_list();
+                self.background_sync.paused = false;
+                self.background_sync.consecutive_failures = 0;
                 let mut effects = vec![Effect::ClearAuthorization { id }];
                 effects.extend(self.ensure_local_restore(&draft_account));
+                effects.push(self.arm_background_sync(BACKGROUND_SYNC_FLOOR));
                 Update {
                     effects,
                     ..Default::default()
                 }
             }
             WorkerEvent::Disconnected { .. } => {
+                let cancel_background = self.stop_background_sync();
                 self.pending_mutations.clear();
                 self.undo_operation = None;
                 self.search_generation = self.search_generation.wrapping_add(1).max(1);
@@ -1567,7 +1804,10 @@ impl AppState {
                 self.cache_usage = CacheUsage::default();
                 self.bump_list();
                 self.bump_reader();
-                Update::default()
+                Update {
+                    effects: cancel_background.into_iter().collect(),
+                    ..Default::default()
+                }
             }
             WorkerEvent::Failed { failure, .. } => {
                 if matches!(
@@ -1632,7 +1872,9 @@ impl AppState {
             | WorkerEvent::DraftOperationFailed { .. } => unreachable!(),
             WorkerEvent::MutationConfirmed { .. }
             | WorkerEvent::MutationReconciled { .. }
-            | WorkerEvent::MutationFailed { .. } => unreachable!(),
+            | WorkerEvent::MutationFailed { .. }
+            | WorkerEvent::BackgroundSyncComplete { .. }
+            | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
         }
     }
     pub fn snapshot(&self) -> ViewSnapshot {
@@ -1724,6 +1966,15 @@ impl AppState {
                 let mut jobs = self.attachment_jobs.values().cloned().collect::<Vec<_>>();
                 jobs.sort_by_key(|job| job.job_id.0);
                 jobs
+            },
+            background_sync_status: if self.background_sync.paused {
+                BackgroundSyncStatus::Paused
+            } else if self.background_sync.in_flight.is_some() {
+                BackgroundSyncStatus::Syncing
+            } else if self.background_sync.consecutive_failures > 0 {
+                BackgroundSyncStatus::BackingOff
+            } else {
+                BackgroundSyncStatus::Idle
             },
             folders: self
                 .mailbox

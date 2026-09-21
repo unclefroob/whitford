@@ -10,6 +10,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
+    time::Duration,
 };
 
 use adw::prelude::*;
@@ -31,6 +32,14 @@ thread_local! {
     // ToastOverlay owns presentation, while this reference lets a later state snapshot
     // dismiss the exact operation's toast when Gmail rejects or consumes it.
     static UNDO_TOAST: RefCell<Option<(u64, adw::Toast)>> = const { RefCell::new(None) };
+}
+
+/// The GLib handle is deliberately kept outside `AppState`: state only describes
+/// scheduling intent, while this owns the main-loop resource that can be removed
+/// as soon as a window goes away.
+pub(super) struct BackgroundSyncTimer {
+    pub(super) source: gtk::glib::SourceId,
+    pub(super) generation: u64,
 }
 
 #[derive(Clone)]
@@ -83,6 +92,8 @@ pub struct Ui {
     pub(crate) filter_buttons: Vec<(MessageFilter, gtk::Button)>,
     pub(crate) worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     pub(crate) authorization: Rc<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
+    pub(crate) background_sync_timer: Rc<RefCell<Option<BackgroundSyncTimer>>>,
+    pub(crate) application: gtk::glib::WeakRef<adw::Application>,
 }
 
 #[derive(Clone)]
@@ -134,6 +145,8 @@ pub(crate) struct WeakUi {
     filter_buttons: Vec<(MessageFilter, gtk::glib::WeakRef<gtk::Button>)>,
     worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     authorization: Weak<RefCell<Option<(OperationId, AuthorizationUrl)>>>,
+    background_sync_timer: Weak<RefCell<Option<BackgroundSyncTimer>>>,
+    application: gtk::glib::WeakRef<adw::Application>,
 }
 
 pub fn build(
@@ -218,9 +231,15 @@ impl Ui {
                 .collect(),
             worker: self.worker.clone(),
             authorization: Rc::downgrade(&self.authorization),
+            background_sync_timer: Rc::downgrade(&self.background_sync_timer),
+            application: self.application.clone(),
         }
     }
-    pub(crate) fn dispatch(&self, action: Action) {
+    /// Apply an application action from the GTK main context.
+    ///
+    /// This is public for the binary's application-level notification action;
+    /// worker and cache code continue to communicate through state effects.
+    pub fn dispatch(&self, action: Action) {
         let update = self.state.borrow_mut().dispatch(action);
         if let Some(message) = update.feedback {
             self.toast_overlay.add_toast(adw::Toast::new(message));
@@ -363,6 +382,12 @@ impl Ui {
     }
     fn execute(&self, effect: Effect) {
         match effect {
+            Effect::ScheduleBackgroundSync {
+                after,
+                schedule_generation,
+            } => self.schedule_background_sync(after, schedule_generation),
+            Effect::CancelBackgroundSyncTimer => self.cancel_background_sync_timer(),
+            Effect::NotifyNewUnread { count } => self.notify_new_unread(count),
             Effect::SendWorker(command) => {
                 if self.worker.send(command).is_err() {
                     self.toast("Mail worker is unavailable");
@@ -486,6 +511,62 @@ impl Ui {
             Effect::CloseApplicationWindow => self.window.close(),
         }
     }
+
+    fn schedule_background_sync(&self, after: Duration, schedule_generation: u64) {
+        self.cancel_background_sync_timer();
+
+        let weak_ui = self.downgrade();
+        let weak_timer = Rc::downgrade(&self.background_sync_timer);
+        let source = gtk::glib::timeout_add_local_once(after, move || {
+            let Some(timer) = weak_timer.upgrade() else {
+                return;
+            };
+            // A replacement timer may have been armed after this callback entered
+            // the main context. Only its matching generation can dispatch a tick.
+            let is_current = timer
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current.generation == schedule_generation);
+            if !is_current {
+                return;
+            }
+            timer.borrow_mut().take();
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.dispatch(Action::BackgroundSyncTimer {
+                    schedule_generation,
+                });
+            }
+        });
+        *self.background_sync_timer.borrow_mut() = Some(BackgroundSyncTimer {
+            source,
+            generation: schedule_generation,
+        });
+    }
+
+    fn cancel_background_sync_timer(&self) {
+        if let Some(timer) = self.background_sync_timer.borrow_mut().take() {
+            timer.source.remove();
+        }
+    }
+
+    fn notify_new_unread(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(application) = self.application.upgrade() else {
+            tracing::debug!(
+                count,
+                "skipped new-unread notification after application shutdown"
+            );
+            return;
+        };
+        let notification = gtk::gio::Notification::new("New unread mail");
+        notification.set_body(Some(&new_unread_notification_body(count)));
+        notification.set_default_action("app.open-inbox");
+        // gio deliberately does not report desktop delivery failures. Sending is
+        // best-effort and, importantly, does not feed back into sync state.
+        application.send_notification(Some("inbox-new-unread"), &notification);
+    }
 }
 
 impl WeakUi {
@@ -542,6 +623,8 @@ impl WeakUi {
                 .collect::<Option<Vec<_>>>()?,
             worker: self.worker.clone(),
             authorization: self.authorization.upgrade()?,
+            background_sync_timer: self.background_sync_timer.upgrade()?,
+            application: self.application.clone(),
         })
     }
 }
@@ -576,5 +659,23 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn new_unread_notification_body(count: usize) -> String {
+    format!(
+        "{count} new unread message{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_unread_notification_body;
+
+    #[test]
+    fn unread_notification_body_is_count_only() {
+        assert_eq!(new_unread_notification_body(1), "1 new unread message");
+        assert_eq!(new_unread_notification_body(3), "3 new unread messages");
     }
 }

@@ -11,8 +11,8 @@ use crate::{
     config,
     model::Attachment,
     state::{
-        Action, ComposerState, DraftCatalogState, MessageFilter, ReaderState, ServerSearchView,
-        SessionState, ViewSnapshot, ViewStatus,
+        Action, BackgroundSyncStatus, ComposerState, DraftCatalogState, MessageFilter, ReaderState,
+        ServerSearchView, SessionState, ViewSnapshot, ViewStatus,
     },
     worker::{BodyFailure, FailureKind, SendFailure, ServiceFailure, WorkerPhase},
 };
@@ -1123,7 +1123,10 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
         SessionState::Syncing { phase, .. } => {
             ("Syncing Gmail…".into(), worker_phase_copy(*phase).into(), false)
         }
-        SessionState::Ready => ("●  Inbox up to date".into(), sync_detail(snapshot), true),
+        SessionState::Ready => ready_sync_presentation(
+            snapshot.background_sync_status,
+            sync_detail(snapshot),
+        ),
         SessionState::Offline { failure } => (
             "●  Inbox is stale".into(),
             format!("{} · {}", failure_presentation(failure).1, sync_detail(snapshot)),
@@ -1158,11 +1161,40 @@ fn render_sync(ui: &Ui, snapshot: &ViewSnapshot) {
     };
     ui.sync_title.set_text(&title);
     ui.sync_detail.set_text(&detail);
+    // Keep the changing state explicit to assistive technologies as well as to
+    // sighted users: the subtitle alone must not make a retrying or paused poll
+    // sound like a successfully current Inbox.
+    ui.sync_title
+        .update_property(&[gtk::accessible::Property::Label(&title)]);
+    ui.sync_detail
+        .update_property(&[gtk::accessible::Property::Label(&detail)]);
     if online {
         ui.sync_title.add_css_class("whitford-online");
     } else {
         ui.sync_title.remove_css_class("whitford-online");
     }
+}
+
+fn ready_sync_presentation(
+    background_status: BackgroundSyncStatus,
+    detail: String,
+) -> (String, String, bool) {
+    let (title, background_detail) = match background_status {
+        BackgroundSyncStatus::Idle => return ("●  Inbox up to date".into(), detail, true),
+        BackgroundSyncStatus::Syncing => (
+            "●  Checking for new mail…",
+            "Checking Inbox in the background.",
+        ),
+        BackgroundSyncStatus::BackingOff => (
+            "●  Background sync will retry",
+            "Inbox checks will resume automatically after a connection problem.",
+        ),
+        BackgroundSyncStatus::Paused => (
+            "●  Background sync paused",
+            "Automatic Inbox checks are paused. Reconnect Gmail to resume.",
+        ),
+    };
+    (title.into(), format!("{background_detail} {detail}"), true)
 }
 
 fn sync_detail(snapshot: &ViewSnapshot) -> String {
@@ -1348,6 +1380,31 @@ fn clear_box(container: &gtk::Box) {
 mod tests {
     use super::*;
     use crate::model::SyncMetadata;
+
+    #[test]
+    fn background_sync_status_never_claims_the_inbox_is_current() {
+        let detail = "person@example.com · Synced just now".to_owned();
+        let (title, syncing_detail, online) =
+            ready_sync_presentation(BackgroundSyncStatus::Syncing, detail.clone());
+        assert_eq!(title, "●  Checking for new mail…");
+        assert!(syncing_detail.contains("Checking Inbox in the background"));
+        assert!(online);
+
+        let (title, retry_detail, _) =
+            ready_sync_presentation(BackgroundSyncStatus::BackingOff, detail.clone());
+        assert_eq!(title, "●  Background sync will retry");
+        assert!(retry_detail.contains("resume automatically"));
+
+        let (title, paused_detail, _) =
+            ready_sync_presentation(BackgroundSyncStatus::Paused, detail.clone());
+        assert_eq!(title, "●  Background sync paused");
+        assert!(paused_detail.contains("Reconnect Gmail"));
+
+        let (title, idle_detail, _) = ready_sync_presentation(BackgroundSyncStatus::Idle, detail);
+        assert_eq!(title, "●  Inbox up to date");
+        assert!(idle_detail.contains("Synced just now"));
+    }
+
     #[test]
     fn virtual_message_model_keeps_unchanged_rows_stable_at_five_hundred_items() {
         let model = gtk::gio::ListStore::new::<gtk::glib::BoxedAnyObject>();

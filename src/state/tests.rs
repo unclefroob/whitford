@@ -8,6 +8,256 @@ fn account() -> AccountIdentity {
         email: "person@example.com".into(),
     }
 }
+
+#[test]
+fn background_tick_is_separate_from_foreground_and_duplicate_events_notify_once() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let scheduled = state.arm_background_sync(std::time::Duration::from_secs(60));
+    let generation = match scheduled {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    let update = state.dispatch(Action::BackgroundSyncTimer {
+        schedule_generation: generation,
+    });
+    let request_id = match &update.effects[0] {
+        Effect::SendWorker(WorkerCommand::BackgroundSync { request_id, .. }) => *request_id,
+        other => panic!("unexpected effect: {other:?}"),
+    };
+    let mut snapshot = state.mailbox.clone().unwrap();
+    let mut message = fixture_messages().remove(0);
+    message.id = MessageId::gmail(999);
+    message.unread = true;
+    snapshot.messages.push(message);
+    let update = state.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot,
+        new_unread_ids: vec![MessageId::gmail(999)],
+    }));
+    assert!(
+        update
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+    // The same worker event is stale after its request is cleared and cannot
+    // produce a second desktop notification.
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: account().email,
+                snapshot: state.mailbox.clone().unwrap(),
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .is_empty()
+    );
+}
+
+fn begin_background_sync(state: &mut AppState) -> BackgroundSyncRequestId {
+    let generation = match state.arm_background_sync(std::time::Duration::from_secs(60)) {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    match &state
+        .dispatch(Action::BackgroundSyncTimer {
+            schedule_generation: generation,
+        })
+        .effects[0]
+    {
+        Effect::SendWorker(WorkerCommand::BackgroundSync { request_id, .. }) => *request_id,
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+#[test]
+fn background_notification_dedup_is_scoped_to_the_account() {
+    let mut state = AppState::new();
+    let first_id = ready(&mut state);
+    let request_id = begin_background_sync(&mut state);
+    let initial = state.mailbox.clone().unwrap();
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: account().email,
+                snapshot: initial,
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+
+    let other = AccountIdentity {
+        provider: MailProvider::Gmail,
+        email: "other@example.com".into(),
+    };
+    let connect = state.dispatch(Action::Connect);
+    let connect_id = match connect.effects[0] {
+        Effect::SendWorker(WorkerCommand::Connect { id }) => id,
+        _ => panic!(),
+    };
+    assert_ne!(connect_id, first_id);
+    state.dispatch(Action::Worker(WorkerEvent::IdentityVerified {
+        id: connect_id,
+        account: other.clone(),
+    }));
+    state.dispatch(Action::Worker(WorkerEvent::SyncComplete {
+        id: connect_id,
+        account: other.clone(),
+        snapshot: MailboxSnapshot {
+            messages: fixture_messages(),
+            folder_catalog: crate::model::FolderCatalog::inbox_only(),
+            metadata: SyncMetadata {
+                completed_at: SystemTime::UNIX_EPOCH,
+                requested_limit: 50,
+                loaded_count: 3,
+                fallback_count: 0,
+                skipped_count: 0,
+            },
+        },
+    }));
+    let request_id = begin_background_sync(&mut state);
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email: other.email,
+                snapshot: state.mailbox.clone().unwrap(),
+                new_unread_ids: vec![MessageId::gmail(999)],
+            }))
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyNewUnread { count: 1 }))
+    );
+}
+
+#[test]
+fn background_completion_does_not_publish_over_active_search_or_reader() {
+    let mut searching = AppState::new();
+    ready(&mut searching);
+    searching.mailbox = Some(folder_snapshot(FolderId::Inbox, "INBOX", "Inbox"));
+    let request_id = begin_background_sync(&mut searching);
+    searching.dispatch(Action::SetSearch("anything".into()));
+    searching.dispatch(Action::SubmitServerSearch);
+    let before = searching.mailbox.clone().unwrap();
+    searching.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot: MailboxSnapshot {
+            messages: Vec::new(),
+            ..before.clone()
+        },
+        new_unread_ids: Vec::new(),
+    }));
+    assert!(matches!(
+        searching.server_search,
+        ServerSearchState::Loading { .. }
+    ));
+    assert_eq!(searching.mailbox, Some(before));
+
+    let mut reading = AppState::new();
+    ready(&mut reading);
+    let request_id = begin_background_sync(&mut reading);
+    reading.dispatch(Action::SelectMessage(MessageId::gmail(1)));
+    let before = reading.mailbox.clone().unwrap();
+    reading.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+        request_id,
+        account_email: account().email,
+        snapshot: MailboxSnapshot {
+            messages: Vec::new(),
+            ..before.clone()
+        },
+        new_unread_ids: Vec::new(),
+    }));
+    assert!(matches!(reading.reader, ReaderState::Loading { .. }));
+    assert_eq!(reading.mailbox, Some(before));
+}
+
+#[test]
+fn background_timer_and_terminal_failure_ignore_stale_or_late_work() {
+    let mut state = AppState::new();
+    ready(&mut state);
+    let stale_generation = match state.arm_background_sync(std::time::Duration::from_secs(60)) {
+        Effect::ScheduleBackgroundSync {
+            schedule_generation,
+            ..
+        } => schedule_generation,
+        _ => unreachable!(),
+    };
+    let _current = state.arm_background_sync(std::time::Duration::from_secs(60));
+    assert!(
+        state
+            .dispatch(Action::BackgroundSyncTimer {
+                schedule_generation: stale_generation,
+            })
+            .effects
+            .is_empty()
+    );
+
+    let request_id = begin_background_sync(&mut state);
+    let failure = ServiceFailure {
+        kind: FailureKind::AuthorizationExpired,
+        retryable: false,
+        preserve_mail: true,
+        cleanup_failed: false,
+        config_path: None,
+    };
+    assert!(
+        state
+            .dispatch(Action::Worker(WorkerEvent::BackgroundSyncFailed {
+                request_id,
+                failure,
+            }))
+            .effects
+            .is_empty()
+    );
+    assert_eq!(
+        state.snapshot().background_sync_status,
+        BackgroundSyncStatus::Paused
+    );
+
+    let mut late = AppState::new();
+    ready(&mut late);
+    let late_request = begin_background_sync(&mut late);
+    let disconnect = late.dispatch(Action::ConfirmDisconnect);
+    assert!(
+        disconnect
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendWorker(WorkerCommand::Disconnect { .. })))
+    );
+    assert!(
+        late.dispatch(Action::Worker(WorkerEvent::BackgroundSyncComplete {
+            request_id: late_request,
+            account_email: account().email,
+            snapshot: MailboxSnapshot {
+                messages: fixture_messages(),
+                folder_catalog: crate::model::FolderCatalog::inbox_only(),
+                metadata: SyncMetadata {
+                    completed_at: SystemTime::UNIX_EPOCH,
+                    requested_limit: 50,
+                    loaded_count: 3,
+                    fallback_count: 0,
+                    skipped_count: 0,
+                },
+            },
+            new_unread_ids: vec![MessageId::gmail(1000)],
+        }))
+        .effects
+        .is_empty()
+    );
+}
 fn ready(state: &mut AppState) -> OperationId {
     let update = state.dispatch(Action::Connect);
     let id = match &update.effects[0] {

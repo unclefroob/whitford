@@ -2,7 +2,7 @@ use adw::prelude::*;
 use gtk::gdk;
 use std::{cell::RefCell, rc::Rc};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
-use whitford::{ui, worker::WorkerHandle};
+use whitford::{model::FolderId, ui, worker::WorkerHandle};
 
 const APP_ID: &str = "dev.whitford.Whitford";
 
@@ -42,6 +42,31 @@ fn main() -> gtk::glib::ExitCode {
     let worker_sender = worker.sender.clone();
     let pending_events = Rc::new(RefCell::new(Some(events)));
     let active_ui = Rc::new(RefCell::new(None::<ui::Ui>));
+    // Notifications must use an application action: window actions are not available
+    // to the shell when the window is inactive. The weak-ish `active_ui` container is
+    // cleared on destroy, so an old notification cannot retain a destroyed window.
+    let open_inbox = gtk::gio::SimpleAction::new("open-inbox", None);
+    open_inbox.connect_activate({
+        let active_ui = active_ui.clone();
+        let application = application.clone();
+        move |_, _| {
+            let ui = active_ui.borrow().clone();
+            if let Some(ui) = ui {
+                ui.window.present();
+                ui.dispatch(whitford::state::Action::SelectFolder(FolderId::Inbox));
+            } else {
+                // A notification can be activated while the application has no
+                // window. Build it through the normal lifecycle, then apply the
+                // same Inbox action if activation supplied a fresh UI.
+                application.activate();
+                if let Some(ui) = active_ui.borrow().clone() {
+                    ui.window.present();
+                    ui.dispatch(whitford::state::Action::SelectFolder(FolderId::Inbox));
+                }
+            }
+        }
+    });
+    application.add_action(&open_inbox);
     application.connect_activate({
         let active_ui = active_ui.clone();
         move |application| {

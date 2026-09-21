@@ -17,6 +17,7 @@ pub(super) fn build(
         RefCell<Option<(crate::worker::OperationId, crate::oauth::AuthorizationUrl)>>,
     >,
 ) -> Ui {
+    let background_sync_timer = Rc::new(RefCell::new(None::<super::BackgroundSyncTimer>));
     let folders = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["whitford-folder-list"])
@@ -107,7 +108,11 @@ pub(super) fn build(
         &list_header,
     );
     let shutdown = worker.clone();
+    let timer_on_destroy = background_sync_timer.clone();
     window.connect_destroy(move |_| {
+        if let Some(timer) = timer_on_destroy.borrow_mut().take() {
+            timer.source.remove();
+        }
         let _ = shutdown.send(crate::worker::WorkerCommand::Shutdown);
     });
 
@@ -159,6 +164,8 @@ pub(super) fn build(
         filter_buttons,
         worker,
         authorization,
+        background_sync_timer,
+        application: application.downgrade(),
     }
 }
 

@@ -21,7 +21,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle as ThreadJoinHandle},
     time::SystemTime,
@@ -41,6 +41,11 @@ const CALLBACK_SUCCESS_BODY: &[u8] =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationId(pub u64);
+/// Identifies one timer-driven Inbox synchronization attempt.  This is
+/// intentionally distinct from `OperationId`: background work must never be
+/// mistaken for a foreground account lifecycle operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackgroundSyncRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BodyRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +208,12 @@ pub enum WorkerCommand {
     Refresh {
         id: OperationId,
     },
+    /// A bounded, Inbox-only poll.  It has its own controller slot and event
+    /// family so it cannot drive foreground authorization or phase UI.
+    BackgroundSync {
+        request_id: BackgroundSyncRequestId,
+        account_email: String,
+    },
     Disconnect {
         id: OperationId,
         generation: u64,
@@ -334,6 +345,10 @@ impl fmt::Debug for WorkerCommand {
             Self::Restore { id } => f.debug_tuple("Restore").field(id).finish(),
             Self::Connect { id } => f.debug_tuple("Connect").field(id).finish(),
             Self::Refresh { id } => f.debug_tuple("Refresh").field(id).finish(),
+            Self::BackgroundSync { request_id, .. } => f
+                .debug_struct("BackgroundSync")
+                .field("request_id", request_id)
+                .finish(),
             Self::Disconnect { id, generation, .. } => f
                 .debug_struct("Disconnect")
                 .field("id", id)
@@ -527,6 +542,20 @@ pub enum WorkerEvent {
         id: OperationId,
         account: AccountIdentity,
         snapshot: MailboxSnapshot,
+    },
+    /// Completion of the narrow timer-driven Inbox path.  It deliberately
+    /// carries no phase/account lifecycle signal and no message preview data.
+    BackgroundSyncComplete {
+        request_id: BackgroundSyncRequestId,
+        account_email: String,
+        snapshot: MailboxSnapshot,
+        new_unread_ids: Vec<MessageId>,
+    },
+    /// Typed failure for background work.  State decides whether retrying is
+    /// appropriate without disturbing the visible foreground session.
+    BackgroundSyncFailed {
+        request_id: BackgroundSyncRequestId,
+        failure: ServiceFailure,
     },
     FolderCacheLoaded {
         request_id: FolderRequestId,
@@ -725,6 +754,25 @@ impl fmt::Debug for WorkerEvent {
                 .debug_struct("SyncComplete")
                 .field("id", id)
                 .field("loaded", &snapshot.metadata.loaded_count)
+                .finish(),
+            Self::BackgroundSyncComplete {
+                request_id,
+                snapshot,
+                new_unread_ids,
+                ..
+            } => f
+                .debug_struct("BackgroundSyncComplete")
+                .field("request_id", request_id)
+                .field("loaded", &snapshot.metadata.loaded_count)
+                .field("new_unread_count", &new_unread_ids.len())
+                .finish(),
+            Self::BackgroundSyncFailed {
+                request_id,
+                failure,
+            } => f
+                .debug_struct("BackgroundSyncFailed")
+                .field("request_id", request_id)
+                .field("failure", failure)
                 .finish(),
             Self::FolderCacheLoaded {
                 request_id,
@@ -1009,8 +1057,15 @@ async fn controller(
         cleanup: Arc<AtomicBool>,
     }
     let mut active: Option<Active> = None;
+    // Background polling is deliberately not an `Active` operation.  An
+    // account lifecycle command owns that slot, while this independent slot
+    // is the defensive backstop for duplicate timer delivery.
+    let mut background_task: Option<(BackgroundSyncRequestId, JoinHandle<()>)> = None;
     let auth = Arc::new(Mutex::new(None::<RuntimeAuth>));
     let cache_io = Arc::new(Mutex::new(()));
+    // Account boundaries must invalidate background work before aborting it:
+    // aborting a Tokio task cannot interrupt a spawn_blocking cache closure.
+    let background_epoch = Arc::new(AtomicU64::new(0));
     let metadata_lane = Arc::new(tokio::sync::Mutex::new(()));
     let cache_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let folder_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1062,6 +1117,7 @@ async fn controller(
             commands.recv().await
         };
         let Some(command) = command else {
+            background_epoch.fetch_add(1, Ordering::AcqRel);
             if let Some(current) = active.take() {
                 let Active { id, task, cleanup } = current;
                 let cleanup_failed = abort_with_cleanup(task, &cleanup, async {
@@ -1087,6 +1143,10 @@ async fn controller(
                 task.abort();
                 let _ = task.await;
             }
+            if let Some((_, task)) = background_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
             for (_, task) in attachment_tasks.drain() {
                 task.abort();
                 let _ = task.await;
@@ -1103,6 +1163,56 @@ async fn controller(
             if let Ok(Ok(usage)) = result {
                 let _ = events.send(WorkerEvent::CacheUsageChanged { usage });
             }
+            continue;
+        }
+        if let WorkerCommand::BackgroundSync {
+            request_id,
+            account_email,
+        } = &command
+        {
+            if let Some((active_id, task)) = background_task.take() {
+                if task.is_finished() {
+                    let _ = task.await;
+                } else {
+                    // State normally coalesces this.  Keep the first request
+                    // running if a command is injected directly and give the
+                    // second a typed, retryable outcome instead of creating
+                    // competing IMAP/cache transactions.
+                    background_task = Some((active_id, task));
+                    let _ = events.send(WorkerEvent::BackgroundSyncFailed {
+                        request_id: *request_id,
+                        failure: failure(FailureKind::WorkerUnavailable, true, true),
+                    });
+                    continue;
+                }
+            }
+            let request_id = *request_id;
+            let account_email = account_email.clone();
+            let tx = events.clone();
+            let task_auth = auth.clone();
+            let task_cache_io = cache_io.clone();
+            let task_metadata_lane = metadata_lane.clone();
+            let task_epoch_gate = background_epoch.clone();
+            let task_epoch = task_epoch_gate.load(Ordering::Acquire);
+            background_task = Some((
+                request_id,
+                tokio::spawn(async move {
+                    // Network/token work deliberately stays outside the
+                    // metadata lane. Foreground folder/mutation work must not
+                    // wait behind a 30-second background IMAP poll.
+                    background_sync(
+                        request_id,
+                        account_email,
+                        &tx,
+                        &task_auth,
+                        &task_cache_io,
+                        &task_metadata_lane,
+                        &task_epoch_gate,
+                        task_epoch,
+                    )
+                    .await;
+                }),
+            ));
             continue;
         }
         attachment_tasks.retain(|_, task| !task.is_finished());
@@ -1628,6 +1738,17 @@ async fn controller(
                 | WorkerCommand::Disconnect { .. }
         );
         if account_boundary {
+            // This must precede task abort. A cache closure already running
+            // on the blocking lane cannot be cancelled by `abort`.
+            background_epoch.fetch_add(1, Ordering::AcqRel);
+            if let Some((request_id, task)) = background_task.take() {
+                task.abort();
+                let _ = task.await;
+                let _ = events.send(WorkerEvent::BackgroundSyncFailed {
+                    request_id,
+                    failure: failure(FailureKind::WorkerUnavailable, true, true),
+                });
+            }
             // The barrier is queued behind every transmitted mutation. It is
             // deliberately awaited before auth replacement or local purge.
             if !drain_mutations(&mutation_tx).await {
@@ -1687,6 +1808,7 @@ async fn controller(
                 .take();
         }
         if matches!(command, WorkerCommand::Shutdown) {
+            background_epoch.fetch_add(1, Ordering::AcqRel);
             cache_generation.fetch_add(1, Ordering::AcqRel);
             send_generation.fetch_add(1, Ordering::AcqRel);
             folder_generation.fetch_add(1, Ordering::AcqRel);
@@ -1700,6 +1822,10 @@ async fn controller(
                 let _ = task.await;
             }
             if let Some((_, task)) = search_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some((_, task)) = background_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -1852,6 +1978,7 @@ async fn controller(
                     }
                 })
             }
+            WorkerCommand::BackgroundSync { .. } => unreachable!(),
             WorkerCommand::Cancel { .. }
             | WorkerCommand::SetCacheLimit { .. }
             | WorkerCommand::FetchFolder { .. }
@@ -2455,6 +2582,10 @@ fn materialize_submission(draft: ComposeDraft) -> Result<smtp::MailSubmission, s
 struct RuntimeAuth {
     email: String,
     access_token: Zeroizing<String>,
+    // OAuth does not expose expiry through its current public TokenGrant
+    // contract.  Gmail access tokens are short-lived; refresh conservatively
+    // before the usual one-hour lifetime without putting OAuth on every poll.
+    token_obtained_at: Instant,
 }
 
 struct BodyCacheServices {
@@ -2605,7 +2736,8 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::Refresh { id }
         | WorkerCommand::Disconnect { id, .. }
         | WorkerCommand::Cancel { id } => Some(*id),
-        WorkerCommand::SetCacheLimit { .. }
+        WorkerCommand::BackgroundSync { .. }
+        | WorkerCommand::SetCacheLimit { .. }
         | WorkerCommand::FetchFolder { .. }
         | WorkerCommand::SearchGmail { .. }
         | WorkerCommand::CancelSearch { .. }
@@ -2700,6 +2832,7 @@ async fn connect(
     *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
         email: account.email.clone(),
         access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
+        token_obtained_at: Instant::now(),
     });
     let refresh = oauth::require_initial_refresh_token(&grant)
         .map_err(|_| failure(FailureKind::AuthorizationExpired, false, false))?;
@@ -2903,6 +3036,7 @@ async fn restore_or_refresh(
     *auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeAuth {
         email: account.email.clone(),
         access_token: Zeroizing::new(grant.access_token.expose().to_owned()),
+        token_obtained_at: Instant::now(),
     });
     sync(id, tx, account, grant.access_token.expose(), cache_io).await
 }
@@ -2922,6 +3056,271 @@ async fn sync(
         .await
         .map_err(map_gmail)?;
     complete_sync(id, tx, account, fetched, cache_io).await
+}
+
+/// Executes the narrow polling path.  Unlike `sync`, this never emits a
+/// foreground phase, authorization request, or `Failed` event: the state
+/// machine can therefore retry/pause it without replacing the ready mailbox.
+#[allow(clippy::too_many_arguments)] // The task boundary keeps stale-write guards explicit.
+async fn background_sync(
+    request_id: BackgroundSyncRequestId,
+    account_email: String,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: &Arc<Mutex<()>>,
+    metadata_lane: &Arc<tokio::sync::Mutex<()>>,
+    epoch_gate: &Arc<AtomicU64>,
+    epoch: u64,
+) {
+    const BACKGROUND_TOKEN_REFRESH_AGE: std::time::Duration =
+        std::time::Duration::from_secs(55 * 60);
+    let runtime_token = auth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|runtime| runtime.email.eq_ignore_ascii_case(&account_email))
+        .map(|runtime| {
+            (
+                Zeroizing::new(runtime.access_token.as_str().to_owned()),
+                runtime.token_obtained_at,
+            )
+        });
+    let Some((access_token, obtained_at)) = runtime_token else {
+        emit_background_failure_if_current(
+            tx,
+            request_id,
+            failure(FailureKind::AuthorizationExpired, false, true),
+            epoch_gate,
+            epoch,
+        );
+        return;
+    };
+    let access_token =
+        if Instant::now().saturating_duration_since(obtained_at) >= BACKGROUND_TOKEN_REFRESH_AGE {
+            match refresh_background_access_token(&account_email, auth, cache_io, epoch_gate, epoch)
+                .await
+            {
+                Ok(Some(token)) => token,
+                Ok(None) => return,
+                Err(failure) => {
+                    emit_background_failure_if_current(tx, request_id, failure, epoch_gate, epoch);
+                    return;
+                }
+            }
+        } else {
+            access_token
+        };
+    let requested_limit = match cache_blocking(cache_io.clone(), cache::load_limit).await {
+        Ok(limit) => limit,
+        Err(_) => {
+            emit_background_failure_if_current(
+                tx,
+                request_id,
+                failure(FailureKind::WorkerUnavailable, true, true),
+                epoch_gate,
+                epoch,
+            );
+            return;
+        }
+    };
+    let fetched =
+        match gmail::fetch_inbox(&account_email, access_token.as_str(), requested_limit).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                emit_background_failure_if_current(
+                    tx,
+                    request_id,
+                    map_background_gmail(error),
+                    epoch_gate,
+                    epoch,
+                );
+                return;
+            }
+        };
+    // Do not wait for the remote fetch while owning the metadata lane.  The
+    // lane only protects final cache publication against foreground metadata
+    // work, and the epoch makes an aborted poll harmless.
+    if !background_is_current(epoch_gate, epoch, auth, &account_email) {
+        return;
+    }
+    let _metadata_lane = metadata_lane.lock().await;
+    if !background_is_current(epoch_gate, epoch, auth, &account_email) {
+        return;
+    }
+    let account_for_cache = AccountIdentity {
+        provider: MailProvider::Gmail,
+        email: account_email.clone(),
+    };
+    let cache_auth = auth.clone();
+    let cache_epoch_gate = epoch_gate.clone();
+    let cache_account_email = account_email.clone();
+    let committed = cache_blocking(cache_io.clone(), move || {
+        // This runs while cache_io is held. An account boundary increments the
+        // epoch before cancelling us, so a stale spawn_blocking closure cannot
+        // replace the mailbox after Disconnect/Connect/Restore/Refresh.
+        if !background_is_current(&cache_epoch_gate, epoch, &cache_auth, &cache_account_email) {
+            return Ok::<_, std::io::Error>(None);
+        }
+        let folder_catalog = fetched.folder_catalog;
+        let (messages, fallback_count) = message::map_summaries(fetched.records);
+        let fresh = MailboxSnapshot {
+            folder_catalog,
+            metadata: SyncMetadata {
+                completed_at: SystemTime::now(),
+                requested_limit,
+                loaded_count: messages.len(),
+                fallback_count,
+                skipped_count: fetched.skipped_count,
+            },
+            messages,
+        };
+        cache::replace_inbox_and_save_with_notification_gate(
+            &account_for_cache,
+            fresh,
+            requested_limit,
+        )
+        .map(Some)
+    })
+    .await;
+    match committed {
+        Ok(Ok(Some(commit))) if background_is_current(epoch_gate, epoch, auth, &account_email) => {
+            let _ = tx.send(WorkerEvent::BackgroundSyncComplete {
+                request_id,
+                account_email,
+                snapshot: commit.snapshot,
+                new_unread_ids: commit.new_unread_ids,
+            });
+        }
+        Ok(Ok(None)) | Ok(Ok(Some(_))) => {}
+        Ok(Err(_)) | Err(_) => {
+            // Do not report completion when the atomic mailbox/watermark
+            // commit failed; the prior durable watermark remains authoritative.
+            emit_background_failure_if_current(
+                tx,
+                request_id,
+                failure(FailureKind::WorkerUnavailable, true, true),
+                epoch_gate,
+                epoch,
+            );
+        }
+    }
+}
+
+/// Refreshes a known account's OAuth credential without entering the browser
+/// authorization path.  It runs only when the in-memory token is old enough;
+/// a failure leaves both the existing session and keyring token untouched.
+async fn refresh_background_access_token(
+    account_email: &str,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    cache_io: &Arc<Mutex<()>>,
+    epoch_gate: &Arc<AtomicU64>,
+    epoch: u64,
+) -> Result<Option<Zeroizing<String>>, ServiceFailure> {
+    let Some(refresh_token) = timeout(KEYRING_TIMEOUT, secrets::load())
+        .await
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
+    else {
+        return Err(failure(FailureKind::AuthorizationExpired, false, true));
+    };
+    let config = config::load().map_err(|error| map_config(error, true))?;
+    let client = oauth::http_client().map_err(map_oauth)?;
+    let grant = oauth::refresh(&config, refresh_token.expose(), &client)
+        .await
+        .map_err(map_oauth)?;
+    if let Some(replacement) = grant.refresh_token.as_ref() {
+        // A refresh-token rotation is persistent state too. Revalidate under
+        // the serialized cache lane immediately before replacing it.
+        if !background_cache_write_permitted(cache_io, epoch_gate, epoch, auth, account_email).await
+        {
+            return Ok(None);
+        }
+        let replacement = RefreshToken::new(replacement.expose().to_owned())
+            .map_err(|_| failure(FailureKind::CredentialSaveFailed, true, true))?;
+        if !matches!(
+            timeout(KEYRING_TIMEOUT, secrets::replace(&replacement)).await,
+            Ok(Ok(()))
+        ) {
+            return Err(failure(FailureKind::CredentialSaveFailed, true, true));
+        }
+    }
+    let access_token = Zeroizing::new(grant.access_token.expose().to_owned());
+    if !background_is_current(epoch_gate, epoch, auth, account_email) {
+        return Ok(None);
+    }
+    let mut guard = auth.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(runtime) = guard
+        .as_mut()
+        .filter(|runtime| runtime.email.eq_ignore_ascii_case(account_email))
+    else {
+        return Err(failure(FailureKind::AuthorizationExpired, false, true));
+    };
+    runtime.access_token = Zeroizing::new(access_token.as_str().to_owned());
+    runtime.token_obtained_at = Instant::now();
+    Ok(Some(access_token))
+}
+
+fn background_epoch_is_current(epoch_gate: &AtomicU64, epoch: u64) -> bool {
+    epoch_gate.load(Ordering::Acquire) == epoch
+}
+
+fn background_is_current(
+    epoch_gate: &AtomicU64,
+    epoch: u64,
+    auth: &Mutex<Option<RuntimeAuth>>,
+    account_email: &str,
+) -> bool {
+    background_epoch_is_current(epoch_gate, epoch)
+        && auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|runtime| runtime.email.eq_ignore_ascii_case(account_email))
+}
+
+async fn background_cache_write_permitted(
+    cache_io: &Arc<Mutex<()>>,
+    epoch_gate: &Arc<AtomicU64>,
+    epoch: u64,
+    auth: &Arc<Mutex<Option<RuntimeAuth>>>,
+    account_email: &str,
+) -> bool {
+    let epoch_gate = epoch_gate.clone();
+    let auth = auth.clone();
+    let account_email = account_email.to_owned();
+    matches!(
+        cache_blocking(cache_io.clone(), move || {
+            background_is_current(&epoch_gate, epoch, &auth, &account_email)
+        })
+        .await,
+        Ok(true)
+    )
+}
+
+fn emit_background_failure_if_current(
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    request_id: BackgroundSyncRequestId,
+    failure: ServiceFailure,
+    epoch_gate: &AtomicU64,
+    epoch: u64,
+) {
+    if background_epoch_is_current(epoch_gate, epoch) {
+        let _ = tx.send(WorkerEvent::BackgroundSyncFailed {
+            request_id,
+            failure,
+        });
+    }
+}
+
+fn map_background_gmail(error: gmail::GmailError) -> ServiceFailure {
+    match error {
+        // A refresh/login is a foreground action.  Treat this as terminal for
+        // the timer rather than repeatedly attempting with stale credentials.
+        gmail::GmailError::AuthenticationFailed => {
+            failure(FailureKind::AuthorizationExpired, false, true)
+        }
+        error => map_gmail(error),
+    }
 }
 
 async fn complete_sync(
@@ -3508,6 +3907,12 @@ mod tests {
     fn debug_contract_redacts_payloads() {
         let command = WorkerCommand::Refresh { id: OperationId(3) };
         assert!(!format!("{command:?}").contains("token"));
+        let background_command = WorkerCommand::BackgroundSync {
+            request_id: BackgroundSyncRequestId(12),
+            account_email: "background-canary@example.com".into(),
+        };
+        assert_eq!(command_id(&background_command), None);
+        assert!(!format!("{background_command:?}").contains("background-canary"));
         let body_command = WorkerCommand::FetchBody {
             request_id: BodyRequestId(4),
             generation: 1,
@@ -3603,6 +4008,76 @@ mod tests {
             failure: failure(FailureKind::Network, true, true),
         };
         assert!(!format!("{event:?}").contains("canary@example.com"));
+    }
+
+    #[test]
+    fn background_authentication_failure_is_terminal_but_network_is_retryable() {
+        let auth = map_background_gmail(gmail::GmailError::AuthenticationFailed);
+        assert_eq!(auth.kind, FailureKind::AuthorizationExpired);
+        assert!(!auth.retryable);
+        assert!(auth.preserve_mail);
+
+        let offline = map_background_gmail(gmail::GmailError::Offline);
+        assert_eq!(offline.kind, FailureKind::Network);
+        assert!(offline.retryable);
+        assert!(offline.preserve_mail);
+    }
+
+    #[test]
+    fn background_epoch_rejects_stale_account_work_before_commit() {
+        let epoch_gate = AtomicU64::new(41);
+        let auth = Mutex::new(Some(RuntimeAuth {
+            email: "account@example.com".into(),
+            access_token: Zeroizing::new("access-token".into()),
+            token_obtained_at: Instant::now(),
+        }));
+        assert!(background_is_current(
+            &epoch_gate,
+            41,
+            &auth,
+            "ACCOUNT@example.com"
+        ));
+        // This is the synchronous boundary step that occurs before aborting
+        // a background task. A later blocking cache closure sees it stale.
+        epoch_gate.fetch_add(1, Ordering::AcqRel);
+        assert!(!background_is_current(
+            &epoch_gate,
+            41,
+            &auth,
+            "account@example.com"
+        ));
+    }
+
+    #[test]
+    fn background_without_verified_runtime_auth_emits_only_background_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(controller(command_rx, event_tx));
+            command_tx
+                .send(WorkerCommand::BackgroundSync {
+                    request_id: BackgroundSyncRequestId(27),
+                    account_email: "missing-auth@example.com".into(),
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(WorkerEvent::BackgroundSyncFailed {
+                    request_id: BackgroundSyncRequestId(27),
+                    failure: ServiceFailure {
+                        kind: FailureKind::AuthorizationExpired,
+                        retryable: false,
+                        ..
+                    },
+                })
+            ));
+            command_tx.send(WorkerCommand::Shutdown).unwrap();
+            task.await.unwrap();
+        });
     }
     #[test]
     fn configuration_failures_keep_category_and_safe_path() {
