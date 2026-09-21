@@ -23,3 +23,8 @@ scope: cross-stack
 - `cargo test --all-targets --all-features`: PASS (219 library tests)
 - `cargo build --release`: PASS
 - Critical, testing, and GTK pre-ship findings: repaired and re-verified.
+
+### Completed
+
+PR: https://github.com/unclefroob/whitford/pull/1
+Status: SHIPPED
