@@ -1,5 +1,5 @@
 use crate::{
-    cache,
+    cache::{self, AppearancePreference, Preferences},
     composer::{self, ComposeDraft, Recipient},
     model::{
         AccountIdentity, CacheUsage, Folder, FolderId, FolderKind, MailboxSnapshot, MessageBody,
@@ -9,8 +9,9 @@ use crate::{
     worker::{
         AttachmentDestination, AttachmentFailure, AttachmentJobId, BackgroundSyncRequestId,
         BodyFailure, BodyRequestId, CacheOperationId, DraftOperationId, FailureKind,
-        FolderRequestId, MutationRequestId, OperationId, SearchRequestId, SendFailure,
-        SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent, WorkerPhase,
+        FolderRequestId, MutationRequestId, OperationId, PreferencesRequestId, SearchRequestId,
+        SendFailure, SendRequestId, ServiceFailure, SyncKind, WorkerCommand, WorkerEvent,
+        WorkerPhase,
     },
 };
 use std::{
@@ -43,6 +44,10 @@ pub struct AppState {
     message_filter: MessageFilter,
     recovery: Option<RecoveryAction>,
     cache_limit: usize,
+    appearance: AppearancePreference,
+    preferences_save_state: PreferencesSaveState,
+    next_preferences_request: u64,
+    pending_preferences_request: Option<PreferencesRequestId>,
     next_body_request: u64,
     next_send_request: u64,
     send_generation: u64,
@@ -109,6 +114,17 @@ pub enum BackgroundSyncStatus {
     Syncing,
     BackingOff,
     Paused,
+}
+
+/// Whether the current in-memory preferences have been acknowledged by the
+/// background persistence worker. A failed save is deliberately recoverable:
+/// the UI continues using the selected value and can ask for a retry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreferencesSaveState {
+    #[default]
+    Saved,
+    Saving,
+    Failed,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +341,8 @@ pub enum Action {
     UndoMessageOperation,
     ToggleLabel(String),
     SetCacheLimit(usize),
+    SetAppearance(AppearancePreference),
+    RetryPreferencesSave,
     RetryBody,
     OpenAttachment(crate::model::Attachment),
     SaveAttachment {
@@ -412,6 +430,11 @@ pub struct Update {
 #[derive(Clone, Debug)]
 pub struct ViewSnapshot {
     pub folders: Vec<Folder>,
+    /// The mail navigation catalog, arranged for the sidebar. `folders` is
+    /// retained for the moment for non-sidebar consumers; new sidebar code
+    /// should use this semantic projection so special folders and labels do
+    /// not get mixed together.
+    pub sidebar_folders: SidebarFolders,
     pub visible_messages: Vec<MessageSummary>,
     pub selected_message: Option<MessageSummary>,
     pub selected_folder_id: FolderId,
@@ -431,6 +454,8 @@ pub struct ViewSnapshot {
     pub can_retry: bool,
     pub can_compose: bool,
     pub cache_limit: usize,
+    pub appearance: AppearancePreference,
+    pub preferences_save_state: PreferencesSaveState,
     pub reader: ReaderState,
     pub composer: ComposerState,
     pub saved_draft: Option<SavedDraftSummary>,
@@ -451,6 +476,83 @@ pub struct ViewSnapshot {
     pub label_options: Vec<(String, String, bool)>,
     pub attachment_downloads: Vec<AttachmentDownload>,
     pub background_sync_status: BackgroundSyncStatus,
+}
+
+/// A UI-ready projection of the provider folder catalog.
+///
+/// Primary folders retain the catalog's special-folder ordering. Labels are
+/// kept in their supplied order, except that labels indistinguishable from a
+/// displayed special folder are omitted and colliding label names are made
+/// unambiguous with their mailbox name.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SidebarFolders {
+    pub primary: Vec<Folder>,
+    pub labels: Vec<Folder>,
+}
+
+fn sidebar_folders(catalog: Option<&crate::model::FolderCatalog>) -> SidebarFolders {
+    let Some(catalog) = catalog else {
+        return SidebarFolders::default();
+    };
+
+    let folder = |descriptor: &crate::model::FolderDescriptor| Folder {
+        id: descriptor.id.clone(),
+        name: descriptor.display_name.clone(),
+        icon: match descriptor.kind {
+            FolderKind::Inbox => "mail-unread-symbolic",
+            FolderKind::Sent => "mail-send-symbolic",
+            FolderKind::AllMail => "mail-read-symbolic",
+            FolderKind::Trash => "user-trash-symbolic",
+            FolderKind::Starred => "starred-symbolic",
+            FolderKind::Label => "tag-symbolic",
+        },
+    };
+    let primary = catalog
+        .folders
+        .iter()
+        .filter(|descriptor| descriptor.kind != FolderKind::Label)
+        .map(folder)
+        .collect::<Vec<_>>();
+    let primary_names = primary
+        .iter()
+        .map(|entry| entry.name.to_lowercase())
+        .collect::<HashSet<_>>();
+
+    // Gmail can expose two distinct label mailboxes with the same friendly
+    // name. Keeping both destinations is useful, but rendering two identical
+    // rows is not; disambiguate only those collisions without changing the
+    // order supplied by the catalog.
+    let mut label_name_counts = HashMap::<String, usize>::new();
+    for descriptor in &catalog.folders {
+        if descriptor.kind == FolderKind::Label
+            && !primary_names.contains(&descriptor.display_name.to_lowercase())
+        {
+            *label_name_counts
+                .entry(descriptor.display_name.to_lowercase())
+                .or_default() += 1;
+        }
+    }
+    let labels = catalog
+        .folders
+        .iter()
+        .filter(|descriptor| {
+            descriptor.kind == FolderKind::Label
+                && !primary_names.contains(&descriptor.display_name.to_lowercase())
+        })
+        .map(|descriptor| {
+            let mut entry = folder(descriptor);
+            if label_name_counts
+                .get(&descriptor.display_name.to_lowercase())
+                .copied()
+                .unwrap_or_default()
+                > 1
+            {
+                entry.name = format!("{} ({})", descriptor.display_name, descriptor.mailbox);
+            }
+            entry
+        })
+        .collect();
+    SidebarFolders { primary, labels }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -522,6 +624,7 @@ impl Default for AppState {
 }
 impl AppState {
     pub fn new() -> Self {
+        let preferences = cache::load_preferences();
         Self {
             session: SessionState::Disconnected,
             active_operation: None,
@@ -540,7 +643,11 @@ impl AppState {
             server_search: ServerSearchState::Idle,
             message_filter: MessageFilter::All,
             recovery: None,
-            cache_limit: cache::load_limit(),
+            cache_limit: preferences.retained_messages,
+            appearance: preferences.appearance,
+            preferences_save_state: PreferencesSaveState::Saved,
+            next_preferences_request: 1,
+            pending_preferences_request: None,
             next_body_request: 1,
             next_send_request: 1,
             send_generation: 0,
@@ -747,6 +854,8 @@ impl AppState {
                 })
             }
             Action::SetCacheLimit(limit) => self.set_cache_limit(limit),
+            Action::SetAppearance(appearance) => self.set_appearance(appearance),
+            Action::RetryPreferencesSave => self.retry_preferences_save(),
             Action::RetryBody => self.retry_body(),
             Action::OpenAttachment(attachment) => {
                 self.start_attachment(attachment, AttachmentDestination::Open)
@@ -1391,6 +1500,27 @@ impl AppState {
                 message_id,
                 uncertain,
             } => self.finish_mutation(request_id, generation, &message_id, false, None, uncertain),
+            WorkerEvent::PreferencesSaved { request_id } => {
+                if self.pending_preferences_request == Some(request_id) {
+                    self.pending_preferences_request = None;
+                    self.preferences_save_state = PreferencesSaveState::Saved;
+                }
+                Update::default()
+            }
+            WorkerEvent::PreferencesSaveFailed { request_id } => {
+                if self.pending_preferences_request == Some(request_id) {
+                    self.pending_preferences_request = None;
+                    self.preferences_save_state = PreferencesSaveState::Failed;
+                    return Update {
+                        feedback: Some("Settings changed, but could not be saved"),
+                        ..Default::default()
+                    };
+                }
+                // A completion is authoritative only for its request. In
+                // particular, an old failure must not mark a newer selection
+                // as unsaved.
+                Update::default()
+            }
             event @ (WorkerEvent::BackgroundSyncComplete { .. }
             | WorkerEvent::BackgroundSyncFailed { .. }) => self
                 .background_worker_event(event)
@@ -1598,6 +1728,8 @@ impl AppState {
             | WorkerEvent::MutationConfirmed { .. }
             | WorkerEvent::MutationReconciled { .. }
             | WorkerEvent::MutationFailed { .. }
+            | WorkerEvent::PreferencesSaved { .. }
+            | WorkerEvent::PreferencesSaveFailed { .. }
             | WorkerEvent::BackgroundSyncComplete { .. }
             | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
         };
@@ -1873,6 +2005,8 @@ impl AppState {
             WorkerEvent::MutationConfirmed { .. }
             | WorkerEvent::MutationReconciled { .. }
             | WorkerEvent::MutationFailed { .. }
+            | WorkerEvent::PreferencesSaved { .. }
+            | WorkerEvent::PreferencesSaveFailed { .. }
             | WorkerEvent::BackgroundSyncComplete { .. }
             | WorkerEvent::BackgroundSyncFailed { .. } => unreachable!(),
         }
@@ -1886,6 +2020,8 @@ impl AppState {
     }
 
     pub(crate) fn snapshot_for_render(&self, include_visible_messages: bool) -> ViewSnapshot {
+        let sidebar_folders =
+            sidebar_folders(self.mailbox.as_ref().map(|mailbox| &mailbox.folder_catalog));
         let has_visible_messages = self.has_visible_messages();
         let visible = if include_visible_messages {
             self.visible_messages()
@@ -1930,6 +2066,16 @@ impl AppState {
             _ => ViewStatus::Ready,
         };
         ViewSnapshot {
+            // Compatibility flattened form of the rendered sidebar. Message
+            // label actions retain the provider's full catalog separately in
+            // `label_options` above.
+            folders: sidebar_folders
+                .primary
+                .iter()
+                .chain(sidebar_folders.labels.iter())
+                .cloned()
+                .collect(),
+            sidebar_folders,
             can_mutate: self.can_change_selected_message(),
             can_archive: self.can_archive_selected(),
             can_move_to_trash: self.can_trash_selected(),
@@ -1976,29 +2122,6 @@ impl AppState {
             } else {
                 BackgroundSyncStatus::Idle
             },
-            folders: self
-                .mailbox
-                .as_ref()
-                .map(|mailbox| {
-                    mailbox
-                        .folder_catalog
-                        .folders
-                        .iter()
-                        .map(|folder| Folder {
-                            id: folder.id.clone(),
-                            name: folder.display_name.clone(),
-                            icon: match folder.kind {
-                                FolderKind::Inbox => "mail-unread-symbolic",
-                                FolderKind::Sent => "mail-send-symbolic",
-                                FolderKind::AllMail => "mail-read-symbolic",
-                                FolderKind::Trash => "user-trash-symbolic",
-                                FolderKind::Starred => "starred-symbolic",
-                                FolderKind::Label => "tag-symbolic",
-                            },
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
             selected_folder_id: self.selected_folder_id.clone(),
@@ -2059,6 +2182,8 @@ impl AppState {
             can_compose: matches!(self.session, SessionState::Ready)
                 && matches!(self.composer, ComposerState::Closed),
             cache_limit: self.cache_limit,
+            appearance: self.appearance,
+            preferences_save_state: self.preferences_save_state,
             reader: self.reader.clone(),
             composer: self.composer.clone(),
             saved_draft: (self.draft_catalog_state == DraftCatalogState::Ready)
@@ -3107,7 +3232,9 @@ impl AppState {
         }
         self.normalize();
         self.bump_list();
-        let mut effects = vec![Effect::SendWorker(WorkerCommand::SetCacheLimit { limit })];
+        // Persist the complete snapshot. Saving a retention field on its own
+        // would race an appearance change and could erase it on disk.
+        let mut effects = self.save_preferences().effects;
         if increased && self.account.is_some() {
             let refresh = self.load_folder(self.selected_folder_id.clone());
             effects.extend(refresh.effects);
@@ -3116,6 +3243,47 @@ impl AppState {
             feedback: Some("Local mail limit updated"),
             effects,
         }
+    }
+
+    fn preferences_snapshot(&self) -> Preferences {
+        Preferences::new(self.cache_limit, self.appearance)
+    }
+
+    fn save_preferences(&mut self) -> Update {
+        let request_id = PreferencesRequestId(self.next_preferences_request);
+        self.next_preferences_request = self.next_preferences_request.wrapping_add(1).max(1);
+        self.pending_preferences_request = Some(request_id);
+        self.preferences_save_state = PreferencesSaveState::Saving;
+        Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::SavePreferences {
+                request_id,
+                preferences: self.preferences_snapshot(),
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn set_appearance(&mut self, appearance: AppearancePreference) -> Update {
+        if self.appearance == appearance {
+            return if self.preferences_save_state == PreferencesSaveState::Failed {
+                self.retry_preferences_save()
+            } else {
+                Update::default()
+            };
+        }
+        // The UI reads this value directly from the snapshot, so theme changes
+        // apply immediately without waiting for filesystem I/O.
+        self.appearance = appearance;
+        let mut update = self.save_preferences();
+        update.feedback = Some("Appearance updated");
+        update
+    }
+
+    fn retry_preferences_save(&mut self) -> Update {
+        if self.preferences_save_state != PreferencesSaveState::Failed {
+            return Update::default();
+        }
+        self.save_preferences()
     }
     fn normalize(&mut self) {
         let visible = self.visible_message_ids();

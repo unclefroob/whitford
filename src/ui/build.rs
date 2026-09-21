@@ -7,7 +7,10 @@ use adw::prelude::*;
 use gtk::glib::value::ToValue;
 
 use super::{MessageListItem, Ui, widgets::message_row};
-use crate::state::{Action, AppState, MessageFilter};
+use crate::{
+    cache::AppearancePreference,
+    state::{Action, AppState, MessageFilter},
+};
 
 pub(super) fn build(
     application: &adw::Application,
@@ -63,8 +66,8 @@ pub(super) fn build(
 
     let list_menu = sidebar_button();
     let reader_menu = sidebar_button();
-    let (folder_pane, sync_title, sync_detail, cache_limit, cache_usage) =
-        build_folder_pane(&folders);
+    let folder_pane = build_folder_pane(&folders);
+    let settings = build_settings_page();
     let (message_page, list_header, filter_buttons, list_banner) =
         build_message_page(&messages, &message_status, &search, &list_menu);
     let (reader_page, reader, reader_banner, label_menu) = build_reader_page(&reader_menu);
@@ -88,8 +91,17 @@ pub(super) fn build(
         .enable_hide_gesture(true)
         .build();
 
+    let mail_page = adw::NavigationPage::builder()
+        .child(&outer)
+        .tag("mail")
+        .title("Whitford")
+        .can_pop(false)
+        .build();
+    let navigation = adw::NavigationView::new();
+    navigation.add(&mail_page);
+    navigation.add(&settings.page);
     let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&outer));
+    toast_overlay.set_child(Some(&navigation));
     let window = adw::ApplicationWindow::builder()
         .application(application)
         .title("Whitford")
@@ -130,11 +142,20 @@ pub(super) fn build(
         label_menu,
         outer,
         inner,
+        navigation,
         toast_overlay,
-        sync_title,
-        sync_detail,
-        cache_limit,
-        cache_usage,
+        sync_title: settings.sync_title,
+        sync_detail: settings.sync_detail,
+        cache_limit: settings.cache_limit,
+        cache_usage: settings.cache_usage,
+        appearance: settings.appearance,
+        account_email: settings.account_email,
+        sync_refresh: settings.sync_refresh,
+        sync_retry: settings.sync_retry,
+        sync_reopen: settings.sync_reopen,
+        sync_cancel: settings.sync_cancel,
+        account_connect: settings.account_connect,
+        account_disconnect: settings.account_disconnect,
         composer_window: composer.window,
         composer_to: composer.to,
         composer_cc: composer.cc,
@@ -772,6 +793,22 @@ pub(super) fn connect_signals(ui: &Ui) {
             }
         }
     });
+    ui.appearance.connect_selected_notify({
+        let weak_ui = ui.downgrade();
+        move |dropdown| {
+            let preference = match dropdown.selected() {
+                0 => AppearancePreference::System,
+                1 => AppearancePreference::Light,
+                2 => AppearancePreference::Dark,
+                _ => return,
+            };
+            if let Some(ui) = weak_ui.upgrade()
+                && ui.state.borrow().snapshot().appearance != preference
+            {
+                ui.dispatch(Action::SetAppearance(preference));
+            }
+        }
+    });
 }
 
 fn media_type_for_path(path: &std::path::Path) -> &'static str {
@@ -792,9 +829,7 @@ fn media_type_for_path(path: &std::path::Path) -> &'static str {
     }
 }
 
-fn build_folder_pane(
-    folders: &gtk::ListBox,
-) -> (gtk::Box, gtk::Label, gtk::Label, gtk::DropDown, gtk::Label) {
+fn build_folder_pane(folders: &gtk::ListBox) -> gtk::Box {
     let pane = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["whitford-folder-pane"])
@@ -808,149 +843,22 @@ fn build_folder_pane(
         .margin_bottom(18)
         .build();
     let name = gtk::Label::builder()
-        .label("Gmail developer preview")
+        .label("Whitford")
         .xalign(0.0)
         .css_classes(["title-3"])
         .build();
     let address = gtk::Label::builder()
-        .label("Lightweight Gmail")
+        .label("Gmail, made quiet")
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
     account.append(&name);
     account.append(&address);
 
-    let connect = gtk::Button::builder()
-        .label("Connect Gmail")
-        .icon_name("network-server-symbolic")
-        .action_name("win.connect")
-        .tooltip_text("Authorize a Gmail account")
-        .margin_start(16)
-        .margin_end(16)
-        .margin_bottom(18)
-        .css_classes(["suggested-action", "whitford-compose"])
-        .build();
-    let account_actions = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_bottom(18)
-        .build();
-    account_actions.append(
-        &gtk::Button::builder()
-            .label("Refresh")
-            .action_name("win.refresh")
-            .hexpand(true)
-            .build(),
-    );
-    account_actions.append(
-        &gtk::Button::builder()
-            .label("Disconnect")
-            .action_name("win.disconnect")
-            .hexpand(true)
-            .build(),
-    );
-    let recovery_actions = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_bottom(18)
-        .build();
-    recovery_actions.append(
-        &gtk::Button::builder()
-            .label("Retry")
-            .action_name("win.retry")
-            .hexpand(true)
-            .build(),
-    );
-    recovery_actions.append(
-        &gtk::Button::builder()
-            .label("Reopen Browser")
-            .action_name("win.reopen-authorization")
-            .hexpand(true)
-            .build(),
-    );
-    recovery_actions.append(
-        &gtk::Button::builder()
-            .label("Cancel")
-            .action_name("win.cancel-authorization")
-            .hexpand(true)
-            .build(),
-    );
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(folders)
         .build();
-    let cache_limit = gtk::DropDown::from_strings(&[
-        "50 messages",
-        "100 messages",
-        "250 messages",
-        "500 messages",
-    ]);
-    cache_limit.update_property(&[gtk::accessible::Property::Label(
-        "Number of messages to keep locally",
-    )]);
-    let cache_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(24)
-        .margin_end(24)
-        .margin_top(12)
-        .build();
-    cache_row.append(
-        &gtk::Label::builder()
-            .label("Keep summaries")
-            .xalign(0.0)
-            .hexpand(true)
-            .build(),
-    );
-    cache_row.append(&cache_limit);
-    let cache_usage = gtk::Label::builder()
-        .label("No downloaded messages")
-        .xalign(0.0)
-        .hexpand(true)
-        .css_classes(["dim-label", "caption"])
-        .build();
-    let clear_cache = gtk::Button::builder()
-        .label("Clear Cache")
-        .has_frame(false)
-        .halign(gtk::Align::Start)
-        .action_name("win.clear-cache")
-        .build();
-    let cache_actions = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(24)
-        .margin_end(24)
-        .margin_top(4)
-        .build();
-    cache_actions.append(&cache_usage);
-    cache_actions.append(&clear_cache);
-    let sync = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_start(24)
-        .margin_end(24)
-        .margin_top(18)
-        .margin_bottom(22)
-        .build();
-    let sync_title = gtk::Label::builder()
-        .label("Not connected")
-        .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .css_classes(["whitford-online"])
-        .build();
-    let sync_detail = gtk::Label::builder()
-        .label("Place google-oauth.json in the Whitford XDG config directory.")
-        .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .css_classes(["dim-label", "caption"])
-        .build();
-    sync.append(&sync_title);
-    sync.append(&sync_detail);
     pane.append(&account);
     pane.append(
         &gtk::Button::builder()
@@ -964,14 +872,175 @@ fn build_folder_pane(
             .css_classes(["suggested-action", "whitford-compose"])
             .build(),
     );
-    pane.append(&connect);
-    pane.append(&account_actions);
-    pane.append(&recovery_actions);
     pane.append(&scroll);
-    pane.append(&cache_row);
-    pane.append(&cache_actions);
-    pane.append(&sync);
-    (pane, sync_title, sync_detail, cache_limit, cache_usage)
+    pane.append(
+        &gtk::Button::builder()
+            .label("Settings")
+            .icon_name("emblem-system-symbolic")
+            .action_name("win.open-settings")
+            .tooltip_text("Open settings (Ctrl+,)")
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(10)
+            .margin_bottom(14)
+            .build(),
+    );
+    pane
+}
+
+struct SettingsWidgets {
+    page: adw::NavigationPage,
+    sync_title: gtk::Label,
+    sync_detail: adw::ActionRow,
+    cache_limit: gtk::DropDown,
+    cache_usage: gtk::Label,
+    appearance: gtk::DropDown,
+    account_email: gtk::Label,
+    sync_refresh: adw::ActionRow,
+    sync_retry: adw::ActionRow,
+    sync_reopen: adw::ActionRow,
+    sync_cancel: adw::ActionRow,
+    account_connect: adw::ActionRow,
+    account_disconnect: adw::ActionRow,
+}
+
+fn build_settings_page() -> SettingsWidgets {
+    let preferences = adw::PreferencesPage::new();
+    preferences.set_title("Settings");
+
+    let appearance_group = adw::PreferencesGroup::builder()
+        .title("Appearance")
+        .description("Choose how Whitford follows your desktop color scheme.")
+        .build();
+    let appearance = gtk::DropDown::from_strings(&["System default", "Light", "Dark"]);
+    appearance.update_property(&[gtk::accessible::Property::Label("Color scheme")]);
+    let appearance_row = adw::ActionRow::builder()
+        .title("Color scheme")
+        .subtitle("System default follows the desktop automatically")
+        .activatable_widget(&appearance)
+        .build();
+    appearance_row.add_suffix(&appearance);
+    appearance_group.add(&appearance_row);
+    preferences.add(&appearance_group);
+
+    let sync_group = adw::PreferencesGroup::builder()
+        .title("Synchronization")
+        .build();
+    let sync_title = gtk::Label::builder()
+        .xalign(1.0)
+        .css_classes(["whitford-online"])
+        .build();
+    let sync_row = adw::ActionRow::builder().title("Gmail status").build();
+    sync_row.add_suffix(&sync_title);
+    sync_group.add(&sync_row);
+    let sync_detail = adw::ActionRow::builder()
+        .title("Sync details")
+        .subtitle_lines(3)
+        .build();
+    sync_group.add(&sync_detail);
+    let sync_refresh = setting_action_row("Refresh now", "win.refresh");
+    let sync_retry = setting_action_row("Retry", "win.retry");
+    let sync_reopen = setting_action_row("Reopen browser", "win.reopen-authorization");
+    let sync_cancel = setting_action_row("Cancel sign-in", "win.cancel-authorization");
+    for row in [&sync_refresh, &sync_retry, &sync_reopen, &sync_cancel] {
+        sync_group.add(row);
+    }
+    preferences.add(&sync_group);
+
+    let storage_group = adw::PreferencesGroup::builder().title("Storage").build();
+    let cache_limit = gtk::DropDown::from_strings(&[
+        "50 messages",
+        "100 messages",
+        "250 messages",
+        "500 messages",
+    ]);
+    cache_limit.update_property(&[gtk::accessible::Property::Label(
+        "Number of messages to keep locally",
+    )]);
+    let limit_row = adw::ActionRow::builder()
+        .title("Keep summaries")
+        .activatable_widget(&cache_limit)
+        .build();
+    limit_row.add_suffix(&cache_limit);
+    storage_group.add(&limit_row);
+    let cache_usage = gtk::Label::builder()
+        .xalign(1.0)
+        .css_classes(["dim-label"])
+        .build();
+    let usage_row = adw::ActionRow::builder().title("Local cache").build();
+    usage_row.add_suffix(&cache_usage);
+    storage_group.add(&usage_row);
+    storage_group.add(
+        &adw::ActionRow::builder()
+            .title("Clear cache")
+            .subtitle("Remove downloaded mail from this device")
+            .activatable(true)
+            .action_name("win.clear-cache")
+            .build(),
+    );
+    preferences.add(&storage_group);
+
+    let account_group = adw::PreferencesGroup::builder().title("Account").build();
+    let account_email = gtk::Label::builder()
+        .label("Not connected")
+        .xalign(1.0)
+        .css_classes(["dim-label"])
+        .build();
+    let account_row = adw::ActionRow::builder().title("Gmail account").build();
+    account_row.add_suffix(&account_email);
+    account_group.add(&account_row);
+    let account_connect = setting_action_row("Connect Gmail", "win.connect");
+    let account_disconnect = setting_action_row("Disconnect Gmail", "win.disconnect");
+    account_disconnect.set_subtitle("Remove local authorization and mail data");
+    account_group.add(&account_connect);
+    account_group.add(&account_disconnect);
+    preferences.add(&account_group);
+
+    let privacy_group = adw::PreferencesGroup::builder()
+        .title("About &amp; Privacy")
+        .description("Whitford stores its local cache, drafts, and authorization data privately on this device. Gmail access can be revoked from your Google Account.")
+        .build();
+    privacy_group.add(
+        &adw::ActionRow::builder()
+            .title("Whitford")
+            .subtitle("A lightweight native Gmail client for Wayland")
+            .build(),
+    );
+    preferences.add(&privacy_group);
+
+    let toolbar = adw::ToolbarView::new();
+    let header = adw::HeaderBar::new();
+    header.set_show_title(true);
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&preferences));
+
+    SettingsWidgets {
+        page: adw::NavigationPage::builder()
+            .child(&toolbar)
+            .tag("settings")
+            .title("Settings")
+            .build(),
+        sync_title,
+        sync_detail,
+        cache_limit,
+        cache_usage,
+        appearance,
+        account_email,
+        sync_refresh,
+        sync_retry,
+        sync_reopen,
+        sync_cancel,
+        account_connect,
+        account_disconnect,
+    }
+}
+
+fn setting_action_row(title: &str, action_name: &str) -> adw::ActionRow {
+    adw::ActionRow::builder()
+        .title(title)
+        .activatable(true)
+        .action_name(action_name)
+        .build()
 }
 
 fn build_message_page(

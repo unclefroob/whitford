@@ -1,219 +1,37 @@
-@define-color whitford_bg #10171d;
-@define-color whitford_surface #151e24;
-@define-color whitford_surface_2 #1b272f;
-@define-color whitford_border alpha(#a9c1ce, 0.20);
-@define-color whitford_text #f2f7fa;
-@define-color whitford_muted #aabac4;
-@define-color whitford_accent #35c7ee;
-
 .whitford-window,
 .whitford-window window,
-.whitford-window headerbar {
-  background-color: @whitford_bg;
-  color: @whitford_text;
-}
-
-.whitford-window headerbar {
-  min-height: 56px;
-  border-bottom: 1px solid @whitford_border;
-  box-shadow: none;
-}
-
-.whitford-folder-pane {
-  background-color: #11191f;
-  border-right: 1px solid @whitford_border;
-}
-
-.whitford-compose {
-  min-height: 44px;
-  border-radius: 9px;
-  background: linear-gradient(90deg, #138bb2, #219eba);
-  color: white;
-}
-
-.whitford-composer-body {
-  border: 1px solid @whitford_border;
-  border-radius: 8px;
-  background-color: @whitford_surface_2;
-  color: @whitford_text;
-}
-
-.whitford-folder-list,
-.whitford-message-list,
-.whitford-reader {
-  background-color: @whitford_surface;
-}
-
-.whitford-folder-row,
-.whitford-message-row {
-  border-radius: 0;
-  border: 0;
-  background: transparent;
-  color: @whitford_text;
-  padding: 0;
-}
-
-.whitford-folder-row {
-  margin: 2px 10px;
-  border-radius: 8px;
-}
-
-.whitford-folder-row:hover,
-.whitford-folder-row.selected {
-  background-color: alpha(@whitford_accent, 0.14);
-}
-
-.whitford-folder-row.selected {
-  color: #eaffff;
-}
-
-.whitford-count {
-  min-width: 24px;
-  min-height: 22px;
-  border-radius: 6px;
-  background-color: alpha(@whitford_accent, 0.22);
-  color: #dffaff;
-  font-weight: 700;
-}
-
-.whitford-message-list {
-  border-right: 1px solid @whitford_border;
-}
-
-.whitford-message-row {
-  border-bottom: 1px solid @whitford_border;
-  border-left: 3px solid transparent;
-}
-
-.whitford-message-row:hover {
-  background-color: alpha(white, 0.035);
-}
-
-.whitford-message-row.selected {
-  border-left-color: @whitford_accent;
-  background-color: alpha(@whitford_accent, 0.14);
-}
-
-.whitford-message-row.unread {
-  background-color: alpha(@whitford_accent, 0.045);
-}
-
-.whitford-message-row.selected.unread {
-  background-color: alpha(@whitford_accent, 0.14);
-}
-
-.whitford-avatar {
-  min-width: 44px;
-  min-height: 44px;
-  border-radius: 999px;
-  background: linear-gradient(145deg, #40525d, #26343d);
-  color: #e6f5fa;
-}
-
-.whitford-avatar.large {
-  min-width: 50px;
-  min-height: 50px;
-  border: 1px solid @whitford_accent;
-}
-
-.whitford-search {
-  min-height: 38px;
-  border-radius: 8px;
-  border: 1px solid @whitford_border;
-  background-color: alpha(white, 0.025);
-}
-
-.whitford-filter {
-  min-height: 36px;
-  padding: 0 2px 6px;
-  border-radius: 0;
-  color: @whitford_muted;
-  background: transparent;
-}
-
-.whitford-filter-active {
-  color: @whitford_text;
-  font-weight: 700;
-  border-bottom: 2px solid @whitford_accent;
-}
-
-.whitford-window button.circular {
-  min-width: 44px;
-  min-height: 44px;
-}
-
-.whitford-reader {
-  color: @whitford_text;
-}
-
-.whitford-body {
-  font-size: 1.08em;
-  line-height: 1.45;
-}
-
-.whitford-email-view {
-  min-height: 620px;
-  border: 1px solid @whitford_border;
-  border-radius: 10px;
-  background-color: white;
-}
-
-.whitford-remote-content {
-  padding: 10px 14px;
-  border: 1px solid @whitford_border;
-  border-radius: 9px;
-  background-color: @whitford_surface_2;
-}
-
-.whitford-attachment {
-  min-height: 54px;
-  padding: 12px 16px;
-  border: 1px solid @whitford_border;
-  border-radius: 9px;
-  background-color: @whitford_surface_2;
-}
-
-.whitford-composer-toolbar {
-  padding: 6px;
-  border: 1px solid @whitford_border;
-  border-radius: 9px;
-  background-color: @whitford_surface_2;
-}
-
-.whitford-composer-toolbar button {
-  min-width: 34px;
-  min-height: 34px;
-  padding: 4px;
-}
-
-.whitford-reader-action {
-  min-height: 42px;
-  padding: 0 18px;
-  border: 1px solid @whitford_border;
-  border-radius: 8px;
-  background-color: @whitford_surface_2;
-}
-
-.whitford-reader-action:first-child {
-  color: @whitford_accent;
-  background-color: alpha(@whitford_accent, 0.10);
-}
-
-.whitford-online {
-  color: #8de39c;
-}
-
-.whitford-status {
-  padding: 28px;
-  color: @whitford_muted;
-}
-
-.dim-label {
-  color: @whitford_muted;
-}
-
-button:focus-visible,
-entry:focus-visible {
-  outline: 2px solid @whitford_accent;
-  outline-offset: -2px;
-}
+.whitford-window headerbar { background-color: @window_bg_color; color: @window_fg_color; }
+.whitford-window headerbar { min-height: 56px; border-bottom: 1px solid @borders; box-shadow: none; }
+.whitford-folder-pane { background-color: @sidebar_bg_color; border-right: 1px solid @borders; }
+.whitford-compose { min-height: 44px; border-radius: 9px; }
+.whitford-composer-body, .whitford-remote-content, .whitford-attachment, .whitford-composer-toolbar, .whitford-reader-action { border: 1px solid @borders; border-radius: 9px; background-color: @card_bg_color; color: @window_fg_color; }
+.whitford-remote-content { padding: 10px 14px; }
+.whitford-attachment { min-height: 54px; padding: 12px 16px; }
+.whitford-composer-toolbar { padding: 6px; }
+.whitford-reader-action { min-height: 42px; padding: 0 18px; }
+.whitford-folder-list, .whitford-message-list, .whitford-reader { background-color: @view_bg_color; color: @view_fg_color; }
+.whitford-folder-row, .whitford-message-row { border: 0; background: transparent; color: @window_fg_color; padding: 0; }
+.whitford-folder-row { margin: 2px 10px; border-radius: 8px; }
+.whitford-folder-row:hover, .whitford-folder-row.selected, .whitford-message-row.selected { background-color: alpha(@accent_bg_color, 0.16); }
+.whitford-folder-row.selected, .whitford-filter-active { color: @accent_fg_color; }
+.whitford-count { min-width: 24px; min-height: 22px; border-radius: 6px; background-color: alpha(@accent_bg_color, 0.22); color: @window_fg_color; font-weight: 700; }
+.whitford-message-list { border-right: 1px solid @borders; }
+.whitford-message-row { border-bottom: 1px solid @borders; border-left: 3px solid transparent; }
+.whitford-message-row:hover { background-color: alpha(@window_fg_color, 0.05); }
+.whitford-message-row.selected { border-left-color: @accent_bg_color; }
+.whitford-message-row.unread { background-color: alpha(@accent_bg_color, 0.06); }
+.whitford-avatar { min-width: 44px; min-height: 44px; border-radius: 999px; background-color: @card_bg_color; color: @window_fg_color; }
+.whitford-avatar.large { min-width: 50px; min-height: 50px; border: 1px solid @accent_bg_color; }
+.whitford-search { min-height: 38px; border-radius: 8px; border: 1px solid @borders; background-color: @card_bg_color; }
+.whitford-filter { min-height: 36px; padding: 0 2px 6px; border-radius: 0; color: @insensitive_fg_color; background: transparent; }
+.whitford-filter-active { font-weight: 700; border-bottom: 2px solid @accent_bg_color; }
+.whitford-window button.circular { min-width: 44px; min-height: 44px; }
+.whitford-body { font-size: 1.08em; line-height: 1.45; }
+/* The remote document is isolated in WebKit; its edge follows the system surface. */
+.whitford-email-view { min-height: 620px; border: 1px solid @borders; border-radius: 10px; background-color: @view_bg_color; }
+.whitford-composer-toolbar button { min-width: 34px; min-height: 34px; padding: 4px; }
+.whitford-reader-action:first-child { color: @accent_fg_color; background-color: alpha(@accent_bg_color, 0.14); }
+.whitford-online { color: @success_color; }
+.whitford-status, .dim-label { color: @insensitive_fg_color; }
+.whitford-status { padding: 28px; }
+button:focus-visible, entry:focus-visible { outline: 2px solid @accent_bg_color; outline-offset: -2px; }

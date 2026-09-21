@@ -2878,3 +2878,149 @@ fn folder_navigation_invalidates_ephemeral_search_results() {
         Effect::SendWorker(WorkerCommand::FetchFolder { folder, .. }) if folder.id == FolderId::Sent
     )));
 }
+
+#[test]
+fn appearance_updates_immediately_and_only_matching_save_acknowledges_it() {
+    let mut state = AppState::new();
+    let first = state.dispatch(Action::SetAppearance(
+        crate::cache::AppearancePreference::Light,
+    ));
+    let first_id = match first.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::SavePreferences {
+                request_id,
+                preferences,
+            }),
+        ] => {
+            assert_eq!(
+                preferences.appearance,
+                crate::cache::AppearancePreference::Light
+            );
+            *request_id
+        }
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    assert_eq!(
+        state.snapshot().appearance,
+        crate::cache::AppearancePreference::Light
+    );
+    assert_eq!(
+        state.snapshot().preferences_save_state,
+        PreferencesSaveState::Saving
+    );
+
+    let second = state.dispatch(Action::SetAppearance(
+        crate::cache::AppearancePreference::Dark,
+    ));
+    let second_id = match second.effects.as_slice() {
+        [
+            Effect::SendWorker(WorkerCommand::SavePreferences {
+                request_id,
+                preferences,
+            }),
+        ] => {
+            assert_eq!(
+                preferences.appearance,
+                crate::cache::AppearancePreference::Dark
+            );
+            *request_id
+        }
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    assert_ne!(first_id, second_id);
+    state.dispatch(Action::Worker(WorkerEvent::PreferencesSaved {
+        request_id: first_id,
+    }));
+    assert_eq!(
+        state.snapshot().preferences_save_state,
+        PreferencesSaveState::Saving
+    );
+    state.dispatch(Action::Worker(WorkerEvent::PreferencesSaved {
+        request_id: second_id,
+    }));
+    assert_eq!(
+        state.snapshot().preferences_save_state,
+        PreferencesSaveState::Saved
+    );
+}
+
+#[test]
+fn appearance_save_failure_keeps_selection_and_can_retry() {
+    let mut state = AppState::new();
+    let update = state.dispatch(Action::SetAppearance(
+        crate::cache::AppearancePreference::Dark,
+    ));
+    let request_id = match update.effects.as_slice() {
+        [Effect::SendWorker(WorkerCommand::SavePreferences { request_id, .. })] => *request_id,
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    let failed = state.dispatch(Action::Worker(WorkerEvent::PreferencesSaveFailed {
+        request_id,
+    }));
+    assert_eq!(
+        failed.feedback,
+        Some("Settings changed, but could not be saved")
+    );
+    assert_eq!(
+        state.snapshot().appearance,
+        crate::cache::AppearancePreference::Dark
+    );
+    assert_eq!(
+        state.snapshot().preferences_save_state,
+        PreferencesSaveState::Failed
+    );
+    assert!(matches!(
+        state.dispatch(Action::RetryPreferencesSave).effects.as_slice(),
+        [Effect::SendWorker(WorkerCommand::SavePreferences { preferences, .. })]
+            if preferences.appearance == crate::cache::AppearancePreference::Dark
+    ));
+}
+
+#[test]
+fn sidebar_projection_separates_primary_labels_and_suppresses_special_duplicates() {
+    let mut state = AppState::new();
+    state.mailbox = Some(folder_snapshot(FolderId::Inbox, "INBOX", "Inbox"));
+    state.mailbox.as_mut().unwrap().folder_catalog = crate::model::FolderCatalog::bounded(vec![
+        crate::model::FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            display_name: "Inbox".into(),
+            kind: crate::model::FolderKind::Inbox,
+        },
+        crate::model::FolderDescriptor {
+            id: FolderId::Sent,
+            mailbox: "Sent".into(),
+            display_name: "Sent".into(),
+            kind: crate::model::FolderKind::Sent,
+        },
+        crate::model::FolderDescriptor {
+            id: FolderId::Label("Inbox label".into()),
+            mailbox: "Inbox label".into(),
+            display_name: "inBOX".into(),
+            kind: crate::model::FolderKind::Label,
+        },
+        crate::model::FolderDescriptor {
+            id: FolderId::Label("Projects".into()),
+            mailbox: "Projects".into(),
+            display_name: "Projects".into(),
+            kind: crate::model::FolderKind::Label,
+        },
+    ]);
+    let sidebar = state.snapshot().sidebar_folders;
+    assert_eq!(
+        sidebar
+            .primary
+            .iter()
+            .map(|folder| &folder.name)
+            .collect::<Vec<_>>(),
+        ["Inbox", "Sent"]
+    );
+    assert_eq!(
+        sidebar
+            .labels
+            .iter()
+            .map(|folder| &folder.name)
+            .collect::<Vec<_>>(),
+        ["Projects"]
+    );
+}

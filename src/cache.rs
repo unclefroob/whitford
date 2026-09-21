@@ -26,11 +26,48 @@ const PREVIOUS_MAILBOX_VERSION: u8 = 3;
 const BODY_VERSION: u8 = 5;
 const MANIFEST_VERSION: u8 = 3;
 const ACCOUNT_CLEANUP_VERSION: u8 = 1;
+const PREFERENCES_VERSION: u8 = 1;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Deserialize, Serialize)]
-struct Preferences {
-    retained_messages: usize,
+/// The application's colour-scheme choice. `System` deliberately maps to
+/// libadwaita's default scheme at the UI boundary, so desktop theme changes
+/// remain live.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AppearancePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// The complete, private preferences snapshot persisted in preferences.json.
+///
+/// Callers must save this whole value rather than individual fields. That
+/// prevents a retention change and an appearance change from overwriting one
+/// another when they are queued close together.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Preferences {
+    #[serde(default)]
+    version: u8,
+    pub retained_messages: usize,
+    #[serde(default, deserialize_with = "deserialize_appearance_preference")]
+    pub appearance: AppearancePreference,
+}
+
+impl Preferences {
+    pub fn new(retained_messages: usize, appearance: AppearancePreference) -> Self {
+        Self {
+            version: PREFERENCES_VERSION,
+            retained_messages,
+            appearance,
+        }
+    }
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self::new(DEFAULT_RETENTION, AppearancePreference::System)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -133,11 +170,28 @@ pub fn limit_at(index: u32) -> Option<usize> {
 }
 
 pub fn load_limit() -> usize {
-    load_limit_from(&config_root())
+    load_preferences().retained_messages
 }
 
 pub fn save_limit_and_prune(limit: usize) -> io::Result<()> {
-    save_limit_and_prune_at(&config_root(), &cache_root(), limit)
+    let mut preferences = load_preferences();
+    preferences.retained_messages = limit;
+    save_preferences_and_prune(preferences)
+}
+
+/// Loads the complete preferences snapshot. A missing, corrupt, unsupported,
+/// or invalid-retention record falls back to safe defaults. An old
+/// retention-only record is migrated in memory by defaulting appearance to
+/// `System`; it is written in the current shape on the next successful save.
+pub fn load_preferences() -> Preferences {
+    load_preferences_from(&config_root())
+}
+
+/// Persists a complete preferences snapshot and applies its retention setting
+/// to cached summaries/bodies. This is intentionally one operation so callers
+/// cannot lose one preference field while updating another.
+pub fn save_preferences_and_prune(preferences: Preferences) -> io::Result<()> {
+    save_preferences_and_prune_at(&config_root(), &cache_root(), preferences)
 }
 
 pub fn load_latest(limit: usize) -> io::Result<Option<(AccountIdentity, MailboxSnapshot)>> {
@@ -544,30 +598,55 @@ pub fn clear_mailbox() -> io::Result<()> {
     clear_all_mail()
 }
 
-fn load_limit_from(config: &Path) -> usize {
-    read_json::<Preferences>(&preferences_path(config))
-        .ok()
-        .flatten()
-        .map(|value| value.retained_messages)
-        .filter(|value| is_valid_limit(*value))
-        .unwrap_or(DEFAULT_RETENTION)
+fn deserialize_appearance_preference<'de, D>(
+    deserializer: D,
+) -> Result<AppearancePreference, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        Some("System") => AppearancePreference::System,
+        Some("Light") => AppearancePreference::Light,
+        Some("Dark") => AppearancePreference::Dark,
+        _ => AppearancePreference::System,
+    })
 }
 
-fn save_limit_and_prune_at(config: &Path, cache: &Path, limit: usize) -> io::Result<()> {
-    validate_limit(limit)?;
-    write_private_json(
-        &preferences_path(config),
-        &Preferences {
-            retained_messages: limit,
-        },
-    )?;
+fn load_preferences_from(config: &Path) -> Preferences {
+    let Ok(Some(mut preferences)) = read_json::<Preferences>(&preferences_path(config)) else {
+        return Preferences::default();
+    };
+    if preferences.version > PREFERENCES_VERSION || !is_valid_limit(preferences.retained_messages) {
+        return Preferences::default();
+    }
+    // Version zero is the retention-only schema, for which serde supplied the
+    // appearance default. Normalize it before exposing the value to callers.
+    preferences.version = PREFERENCES_VERSION;
+    preferences
+}
+
+#[cfg(test)]
+fn load_limit_from(config: &Path) -> usize {
+    load_preferences_from(config).retained_messages
+}
+
+fn save_preferences_and_prune_at(
+    config: &Path,
+    cache: &Path,
+    mut preferences: Preferences,
+) -> io::Result<()> {
+    validate_limit(preferences.retained_messages)?;
+    preferences.version = PREFERENCES_VERSION;
+    write_private_json(&preferences_path(config), &preferences)?;
     if let Some(mut stored) = read_json::<StoredMailbox>(&mailbox_path(cache))?
         && valid_stored_mailbox(&stored)
     {
         for view in &mut stored.views {
             sort_summaries(&mut view.messages);
-            view.messages.truncate(limit.min(MAX_SUMMARIES_PER_FOLDER));
-            view.requested_limit = limit;
+            view.messages
+                .truncate(preferences.retained_messages.min(MAX_SUMMARIES_PER_FOLDER));
+            view.requested_limit = preferences.retained_messages;
         }
         write_private_json(&mailbox_path(cache), &stored)?;
         reconcile_bodies(
@@ -579,6 +658,13 @@ fn save_limit_and_prune_at(config: &Path, cache: &Path, limit: usize) -> io::Res
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn save_limit_and_prune_at(config: &Path, cache: &Path, limit: usize) -> io::Result<()> {
+    let mut preferences = load_preferences_from(config);
+    preferences.retained_messages = limit;
+    save_preferences_and_prune_at(config, cache, preferences)
 }
 
 fn load_latest_from(
@@ -1696,6 +1782,92 @@ mod tests {
         assert_eq!(RETENTION_OPTIONS, [50, 100, 250, 500]);
         assert_eq!(limit_at(selected_index(250)), Some(250));
         assert!(!is_valid_limit(51));
+    }
+
+    #[test]
+    fn preferences_missing_file_uses_system_defaults() {
+        let config = TestRoot::new();
+        assert_eq!(load_preferences_from(&config.0), Preferences::default());
+    }
+
+    #[test]
+    fn retention_only_preferences_migrate_to_system_appearance() {
+        let config = TestRoot::new();
+        write_private_json(
+            &preferences_path(&config.0),
+            &serde_json::json!({ "retained_messages": 250 }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_preferences_from(&config.0),
+            Preferences::new(250, AppearancePreference::System)
+        );
+    }
+
+    #[test]
+    fn malformed_appearance_does_not_discard_valid_retention() {
+        let config = TestRoot::new();
+        write_private_json(
+            &preferences_path(&config.0),
+            &serde_json::json!({
+                "version": PREFERENCES_VERSION,
+                "retained_messages": 500,
+                "appearance": "Solarized"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_preferences_from(&config.0),
+            Preferences::new(500, AppearancePreference::System)
+        );
+    }
+
+    #[test]
+    fn invalid_preferences_retention_is_rejected() {
+        let config = TestRoot::new();
+        write_private_json(
+            &preferences_path(&config.0),
+            &serde_json::json!({
+                "version": PREFERENCES_VERSION,
+                "retained_messages": 51,
+                "appearance": "Dark"
+            }),
+        )
+        .unwrap();
+        assert_eq!(load_preferences_from(&config.0), Preferences::default());
+    }
+
+    #[test]
+    fn complete_preferences_round_trip_in_current_version() {
+        let config = TestRoot::new();
+        let cache = TestRoot::new();
+        let preferences = Preferences::new(250, AppearancePreference::Dark);
+        save_preferences_and_prune_at(&config.0, &cache.0, preferences.clone()).unwrap();
+
+        assert_eq!(load_preferences_from(&config.0), preferences);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(preferences_path(&config.0)).unwrap()).unwrap();
+        assert_eq!(stored["version"], PREFERENCES_VERSION);
+        assert_eq!(stored["appearance"], "Dark");
+    }
+
+    #[test]
+    fn preferences_write_error_is_returned_without_modifying_existing_file() {
+        let config = TestRoot::new();
+        let cache = TestRoot::new();
+        let obstructing_path = config.0.join("whitford");
+        fs::write(&obstructing_path, b"not a directory").unwrap();
+
+        let result = save_preferences_and_prune_at(
+            &config.0,
+            &cache.0,
+            Preferences::new(250, AppearancePreference::Dark),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(obstructing_path).unwrap(), b"not a directory");
     }
 
     #[test]

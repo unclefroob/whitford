@@ -69,11 +69,17 @@ pub(super) fn install(ui: &Ui, application: &adw::Application) {
     add(ui, "toggle-folders", |ui| {
         ui.outer.set_show_sidebar(!ui.outer.shows_sidebar())
     });
+    add(ui, "open-settings", |ui| {
+        if ui.navigation.visible_page_tag().as_deref() != Some("settings") {
+            ui.navigation.push_by_tag("settings");
+        }
+    });
     add(ui, "back", handle_back);
 
     for (action, accelerators) in [
         ("win.focus-search", &["<Primary>f"]),
         ("win.compose", &["<Primary>n"]),
+        ("win.open-settings", &["<Primary>comma"]),
         ("win.folder-next", &["<Alt>Down"]),
         ("win.folder-previous", &["<Alt>Up"]),
         ("win.message-next", &["<Primary>Down"]),
@@ -101,21 +107,28 @@ fn add(ui: &Ui, name: &str, handler: impl Fn(&Ui) + 'static) {
 
 fn move_folder(ui: &Ui, step: isize) {
     let snapshot = ui.state.borrow().snapshot();
-    if snapshot.folders.is_empty() {
+    let folders = snapshot
+        .sidebar_folders
+        .primary
+        .iter()
+        .chain(&snapshot.sidebar_folders.labels)
+        .collect::<Vec<_>>();
+    if folders.is_empty() {
         return;
     }
-    let current = snapshot
-        .folders
+    let current = folders
         .iter()
         .position(|folder| folder.id == snapshot.selected_folder_id)
         .unwrap_or(0);
-    let next = current
-        .saturating_add_signed(step)
-        .min(snapshot.folders.len() - 1);
-    ui.dispatch(Action::SelectFolder(snapshot.folders[next].id.clone()));
+    let next = current.saturating_add_signed(step).min(folders.len() - 1);
+    ui.dispatch(Action::SelectFolder(folders[next].id.clone()));
 }
 
 fn handle_back(ui: &Ui) {
+    if ui.navigation.visible_page_tag().as_deref() == Some("settings") {
+        ui.navigation.pop();
+        return;
+    }
     let outcome = escape_outcome(EscapeContext {
         search_active: !ui.search.text().is_empty(),
         reader_visible: ui.inner.is_collapsed() && ui.inner.shows_content(),
