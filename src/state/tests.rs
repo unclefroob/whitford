@@ -148,6 +148,17 @@ fn unified_reader_load_is_account_scoped_and_ignores_a_same_id_other_account() {
     let normalized = state.snapshot();
     assert!(normalized.selected_message.is_none());
     assert_eq!(normalized.selected_account_message, Some(selected.clone()));
+    // Reader-only renders intentionally omit list rows for performance, but
+    // must still carry the selected summary needed to render the body.
+    let reader_only = state.snapshot_for_render(false);
+    assert!(reader_only.account_visible_messages.is_empty());
+    assert_eq!(
+        reader_only
+            .selected_account_summary
+            .as_ref()
+            .map(|message| &message.id),
+        Some(&selected)
+    );
     let (request_id, generation) = match update.effects.as_slice() {
         [
             Effect::SendWorker(WorkerCommand::FetchAccountBody {

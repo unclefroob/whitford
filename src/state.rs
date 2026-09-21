@@ -629,6 +629,9 @@ pub struct ViewSnapshot {
     /// newest-first merge across all account Inbox projections.
     pub account_visible_messages: Vec<AccountMessageSummary>,
     pub selected_account_message: Option<AccountMessageId>,
+    /// Always present when an account-scoped reader is open, even when the
+    /// list itself was deliberately omitted from a reader-only render.
+    pub selected_account_summary: Option<AccountMessageSummary>,
 }
 
 /// A UI-ready projection of the provider folder catalog.
@@ -2936,9 +2939,32 @@ impl AppState {
 
     fn selected_account_summary(&self) -> Option<AccountMessageSummary> {
         let id = self.selected_account_message.as_ref()?;
-        self.account_visible_messages()
-            .into_iter()
-            .find(|message| &message.id == id)
+        let account = self.account_mailboxes.get(&id.account_id)?;
+        let mailbox = match &self.selected_mailbox_view {
+            MailboxView::UnifiedInbox => account.inbox.as_ref(),
+            MailboxView::AccountFolder(scope) if scope.account_id == id.account_id => {
+                if scope.folder_id == FolderId::Inbox {
+                    account.inbox.as_ref()
+                } else {
+                    account.folders.get(&scope.folder_id)
+                }
+            }
+            MailboxView::AccountFolder(_) => None,
+        };
+        let message = mailbox?.messages.iter().find(|message| {
+            message.id == id.message_id
+                && match &self.selected_mailbox_view {
+                    MailboxView::UnifiedInbox => message_is_in_inbox(message),
+                    MailboxView::AccountFolder(scope) => {
+                        message_is_in_folder(message, &scope.folder_id)
+                    }
+                }
+        })?;
+        Some(AccountMessageSummary {
+            id: id.clone(),
+            account: account.identity.clone(),
+            message: message.clone(),
+        })
     }
 
     fn open_selected_account(&mut self) -> Update {
@@ -3106,6 +3132,7 @@ impl AppState {
         } else {
             Vec::new()
         };
+        let selected_account_summary = self.selected_account_summary();
         let has_visible_messages = self.has_visible_messages();
         let visible = if include_visible_messages {
             self.visible_messages()
@@ -3228,6 +3255,7 @@ impl AppState {
             mailbox_view: self.selected_mailbox_view.clone(),
             account_visible_messages,
             selected_account_message: self.selected_account_message.clone(),
+            selected_account_summary,
             visible_messages: visible,
             selected_message: self.selected_message().cloned(),
             selected_folder_id: self.selected_folder_id.clone(),

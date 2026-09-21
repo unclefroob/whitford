@@ -862,12 +862,7 @@ fn render_reader(ui: &Ui, snapshot: &ViewSnapshot) {
         ui.reader.append(&status_panel(ViewStatus::Ready));
         return;
     }
-    let account_message = snapshot.selected_account_message.as_ref().and_then(|id| {
-        snapshot
-            .account_visible_messages
-            .iter()
-            .find(|message| &message.id == id)
-    });
+    let account_message = snapshot.selected_account_summary.as_ref();
     if snapshot.selected_message.is_none() && account_message.is_none() {
         ui.reader.append(&main_status_panel(snapshot));
         return;
