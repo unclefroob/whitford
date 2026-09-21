@@ -63,6 +63,11 @@ pub struct AppState {
     reader_revision: u64,
     next_mutation_request: u64,
     pending_mutations: HashMap<(MessageId, MutationDimension), PendingMutation>,
+    // Deliberately process-local for this milestone. The cache is changed only by worker
+    // confirmations, so restart drops an in-flight Undo rather than claiming it completed.
+    // A durable journal needs worker events carrying the restored summary/locator before it can
+    // safely recreate an Inbox/Trash projection after restart.
+    undo_operation: Option<UndoOperation>,
     next_attachment_job: u64,
     attachment_jobs: HashMap<AttachmentJobId, AttachmentDownload>,
 }
@@ -76,13 +81,63 @@ struct PendingMutation {
 }
 
 #[derive(Clone, Debug)]
+struct UndoOperation {
+    id: u64,
+    message_id: MessageId,
+    forward: MessageMutation,
+    previous: PendingValue,
+    locator: crate::model::MessageLocator,
+    catalog: crate::model::FolderCatalog,
+    title: String,
+    phase: UndoPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndoPhase {
+    ForwardPending {
+        request_id: MutationRequestId,
+        requested: bool,
+    },
+    Available,
+    UndoPending {
+        request_id: MutationRequestId,
+    },
+}
+
+#[derive(Clone, Debug)]
 enum PendingValue {
     Bool(bool),
     Label(bool),
-    Inbox {
-        message: Box<MessageSummary>,
-        index: usize,
-    },
+    Removed(Vec<RemovedMessage>),
+}
+
+#[derive(Clone, Debug)]
+struct RemovedMessage {
+    view: RemovedMessageView,
+    message: MessageSummary,
+    index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RemovedMessageView {
+    Folder,
+    Search,
+}
+
+fn undo_labels(previous: &PendingValue) -> Vec<String> {
+    let PendingValue::Removed(rows) = previous else {
+        return Vec::new();
+    };
+    rows.first()
+        .map(|row| row.message.labels.clone())
+        .unwrap_or_default()
+}
+
+fn undo_was_in_inbox(previous: &PendingValue) -> bool {
+    let PendingValue::Removed(rows) = previous else {
+        return false;
+    };
+    rows.iter().any(|row| row.message.in_inbox)
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RecoveryAction {
@@ -228,6 +283,7 @@ pub enum Action {
     ToggleStar,
     Archive,
     MoveToTrash,
+    UndoMessageOperation,
     ToggleLabel(String),
     SetCacheLimit(usize),
     RetryBody,
@@ -333,8 +389,22 @@ pub struct ViewSnapshot {
     pub list_revision: u64,
     pub reader_revision: u64,
     pub can_mutate: bool,
+    /// Action-specific availability is deliberately independent of the folder being viewed.
+    /// `can_mutate` remains as a compatibility summary for existing renderers.
+    pub can_archive: bool,
+    pub can_move_to_trash: bool,
+    pub undo_message_operation: Option<UndoMessageOperationView>,
     pub label_options: Vec<(String, String, bool)>,
     pub attachment_downloads: Vec<AttachmentDownload>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UndoMessageOperationView {
+    pub id: u64,
+    pub message_id: MessageId,
+    pub title: String,
+    pub can_undo: bool,
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,6 +513,7 @@ impl AppState {
             reader_revision: 1,
             next_mutation_request: 1,
             pending_mutations: HashMap::new(),
+            undo_operation: None,
             next_attachment_job: 1,
             attachment_jobs: HashMap::new(),
         }
@@ -522,6 +593,7 @@ impl AppState {
                 self.recovery = None;
                 let _ = self.invalidate_server_search();
                 self.pending_mutations.clear();
+                self.undo_operation = None;
                 self.attachment_jobs.clear();
                 if let ReaderState::Loading { id, .. } = &self.reader {
                     self.reader = ReaderState::Failed {
@@ -607,6 +679,7 @@ impl AppState {
                         mailbox: String::new(),
                     })
             }),
+            Action::UndoMessageOperation => self.undo_message_operation(),
             Action::ToggleLabel(mailbox) => {
                 self.mutate_selected(|message, _| MessageMutation::SetLabel {
                     applied: !message.labels.contains(&mailbox),
@@ -741,6 +814,7 @@ impl AppState {
         self.folder_loading = false;
         self.selected_folder_id = FolderId::Inbox;
         self.pending_mutations.clear();
+        self.undo_operation = None;
         self.attachment_jobs.clear();
         self.send_generation = self.send_generation.wrapping_add(1);
         self.reset_draft_session();
@@ -1329,6 +1403,7 @@ impl AppState {
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
                     self.pending_mutations.clear();
+                    self.undo_operation = None;
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
                     self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
@@ -1355,6 +1430,7 @@ impl AppState {
                     .is_none_or(|current| !current.email.eq_ignore_ascii_case(&account.email));
                 if account_is_new {
                     self.pending_mutations.clear();
+                    self.undo_operation = None;
                     self.search_generation = self.search_generation.wrapping_add(1).max(1);
                     self.server_search = ServerSearchState::Idle;
                     self.reset_draft_session();
@@ -1466,6 +1542,7 @@ impl AppState {
             }
             WorkerEvent::Disconnected { .. } => {
                 self.pending_mutations.clear();
+                self.undo_operation = None;
                 self.search_generation = self.search_generation.wrapping_add(1).max(1);
                 self.server_search = ServerSearchState::Idle;
                 self.attachment_jobs.clear();
@@ -1611,10 +1688,18 @@ impl AppState {
             _ => ViewStatus::Ready,
         };
         ViewSnapshot {
-            can_mutate: matches!(self.session, SessionState::Ready)
-                && self.selected_folder_id == FolderId::Inbox
-                && !matches!(self.server_search, ServerSearchState::Loaded { .. })
-                && self.selected_message().is_some(),
+            can_mutate: self.can_change_selected_message(),
+            can_archive: self.can_archive_selected(),
+            can_move_to_trash: self.can_trash_selected(),
+            undo_message_operation: self.undo_operation.as_ref().map(|undo| {
+                UndoMessageOperationView {
+                    id: undo.id,
+                    message_id: undo.message_id.clone(),
+                    title: undo.title.clone(),
+                    can_undo: matches!(undo.phase, UndoPhase::Available),
+                    pending: !matches!(undo.phase, UndoPhase::Available),
+                }
+            }),
             label_options: self
                 .mailbox
                 .as_ref()
@@ -1877,6 +1962,11 @@ impl AppState {
             generation: self.search_generation,
             query: query.clone(),
         };
+        // While search has no result set, a folder selection is not a valid action target.
+        // Clearing it prevents toolbar/keyboard actions from mutating a stale row.
+        self.selected_message_id = None;
+        self.reader = ReaderState::Closed;
+        self.bump_reader();
         self.bump_list();
         effects.push(Effect::SendWorker(WorkerCommand::SearchGmail {
             request_id,
@@ -2121,12 +2211,6 @@ impl AppState {
         &mut self,
         build: impl FnOnce(&MessageSummary, &crate::model::FolderCatalog) -> MessageMutation,
     ) -> Update {
-        if self.selected_folder_id != FolderId::Inbox {
-            return Update {
-                feedback: Some("Inbox triage actions are available from Inbox"),
-                ..Default::default()
-            };
-        }
         if !matches!(self.session, SessionState::Ready) {
             return Update {
                 feedback: Some("Connect Gmail before changing messages"),
@@ -2147,6 +2231,20 @@ impl AppState {
             return Update::default();
         };
         let mutation = build(&message, &catalog);
+        if matches!(mutation, MessageMutation::Archive) && !self.can_archive_message(&message) {
+            return Update {
+                feedback: Some("This message is not in Inbox"),
+                ..Default::default()
+            };
+        }
+        if matches!(mutation, MessageMutation::MoveToTrash { .. })
+            && !self.can_trash_message(&message)
+        {
+            return Update {
+                feedback: Some("This message is already in Trash"),
+                ..Default::default()
+            };
+        }
         if matches!(&mutation, MessageMutation::MoveToTrash { mailbox } if mailbox.is_empty()) {
             return Update {
                 feedback: Some("Gmail did not expose a Trash mailbox"),
@@ -2171,46 +2269,28 @@ impl AppState {
         }
         let request_id = MutationRequestId(self.next_mutation_request);
         self.next_mutation_request = self.next_mutation_request.wrapping_add(1).max(1);
-        let previous = match &mutation {
-            MessageMutation::SetRead(_) => PendingValue::Bool(message.unread),
-            MessageMutation::SetStarred(_) => PendingValue::Bool(message.starred),
-            MessageMutation::SetLabel { mailbox, .. } => {
-                PendingValue::Label(message.labels.contains(mailbox))
-            }
-            MessageMutation::Archive | MessageMutation::MoveToTrash { .. } => {
-                let index = self
-                    .mailbox
-                    .as_ref()
-                    .and_then(|mailbox| {
-                        mailbox
-                            .messages
-                            .iter()
-                            .position(|item| item.id == message.id)
-                    })
-                    .unwrap_or(0);
-                PendingValue::Inbox {
-                    message: Box::new(message.clone()),
-                    index,
+        let previous =
+            match &mutation {
+                MessageMutation::SetRead(_) => PendingValue::Bool(message.unread),
+                MessageMutation::SetStarred(_) => PendingValue::Bool(message.starred),
+                MessageMutation::SetLabel { mailbox, .. } => {
+                    PendingValue::Label(message.labels.contains(mailbox))
                 }
-            }
-        };
+                MessageMutation::Archive | MessageMutation::MoveToTrash { .. } => self
+                    .remove_from_views(&message.id, matches!(mutation, MessageMutation::Archive)),
+                // Restore mutations are internal Undo transport operations and are never built by
+                // the public selection path. Keep this arm defensive for future callers.
+                MessageMutation::RestoreArchive { .. }
+                | MessageMutation::RestoreFromTrash { .. } => PendingValue::Removed(Vec::new()),
+            };
         if matches!(
             mutation,
             MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
         ) {
-            if let Some(mailbox) = self.mailbox.as_mut() {
-                mailbox.messages.retain(|item| item.id != message.id);
-                mailbox.metadata.loaded_count = mailbox.messages.len();
-            }
             self.normalize();
             self.bump_reader();
-        } else if let Some(current) = self.mailbox.as_mut().and_then(|mailbox| {
-            mailbox
-                .messages
-                .iter_mut()
-                .find(|item| item.id == message.id)
-        }) {
-            mutation.apply(current);
+        } else {
+            self.apply_to_visible_representations(&message.id, &mutation);
         }
         self.pending_mutations.insert(
             key,
@@ -2221,15 +2301,41 @@ impl AppState {
                 previous,
             },
         );
+        if matches!(
+            mutation,
+            MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
+        ) {
+            let previous = self
+                .pending_mutations
+                .values()
+                .find(|pending| pending.request_id == request_id)
+                .expect("new pending mutation exists")
+                .previous
+                .clone();
+            self.undo_operation = Some(UndoOperation {
+                id: request_id.0,
+                message_id: message.id.clone(),
+                forward: mutation.clone(),
+                previous,
+                locator: message.locator.clone(),
+                catalog: catalog.clone(),
+                title: message.subject.clone(),
+                phase: UndoPhase::ForwardPending {
+                    request_id,
+                    requested: false,
+                },
+            });
+        }
         self.bump_list();
         self.bump_reader();
         Update {
-            effects: vec![Effect::SendWorker(WorkerCommand::MutateMessage {
+            effects: vec![Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
                 request_id,
                 generation: self.cache_generation,
                 account_email,
                 message_id: message.id,
                 locator: message.locator,
+                catalog,
                 mutation,
             })],
             ..Default::default()
@@ -2248,6 +2354,12 @@ impl AppState {
         if generation != self.cache_generation {
             return Update::default();
         }
+        if self.undo_operation.as_ref().is_some_and(|undo| {
+            matches!(undo.phase, UndoPhase::UndoPending { request_id: current } if current == request_id)
+                && undo.message_id == *message_id
+        }) {
+            return self.finish_undo_mutation(confirmed, reconciled, uncertain, message_id);
+        }
         let key = self.pending_mutations.iter().find_map(|(key, pending)| {
             (pending.request_id == request_id && &key.0 == message_id).then(|| key.clone())
         });
@@ -2258,80 +2370,90 @@ impl AppState {
             .pending_mutations
             .remove(&key)
             .expect("pending mutation exists");
+        let mut preconfirmed_undo_requested = false;
+        if let Some(undo) = self.undo_operation.as_mut()
+            && undo.message_id == *message_id
+            && matches!(undo.phase, UndoPhase::ForwardPending { request_id: current, .. } if current == request_id)
+        {
+            if confirmed {
+                let requested = matches!(
+                    undo.phase,
+                    UndoPhase::ForwardPending {
+                        requested: true,
+                        ..
+                    }
+                );
+                undo.phase = UndoPhase::Available;
+                if requested {
+                    let mut undo = self.undo_operation.take().expect("undo operation exists");
+                    return match self.dispatch_undo(&mut undo) {
+                        Ok(update) => {
+                            self.undo_operation = Some(undo);
+                            update
+                        }
+                        Err(feedback) => Update {
+                            feedback: Some(feedback),
+                            ..Default::default()
+                        },
+                    };
+                }
+                return Update {
+                    feedback: Some("Message changed — Undo is available"),
+                    ..Default::default()
+                };
+            }
+            // A failed or uncertain forward is handled by the normal rollback/reconciliation
+            // path below. An Undo token must not survive a result we could not confirm.
+            preconfirmed_undo_requested = matches!(
+                undo.phase,
+                UndoPhase::ForwardPending {
+                    requested: true,
+                    ..
+                }
+            );
+            self.undo_operation = None;
+        }
         let origin_is_visible = self.selected_folder_id == pending.origin_folder_id;
         let definite_failure = !confirmed && reconciled.is_none() && !uncertain;
-        if definite_failure && origin_is_visible {
+        if uncertain && preconfirmed_undo_requested && origin_is_visible {
+            // The user restored locally while the forward request was pending. Its outcome is
+            // unknown, so retain the safer forward presentation rather than claiming Undo won.
+            self.remove_from_views(
+                message_id,
+                matches!(pending.mutation, MessageMutation::Archive),
+            );
+        } else if definite_failure && origin_is_visible {
             match pending.previous {
                 PendingValue::Bool(value) => {
-                    if let Some(message) = self.mailbox.as_mut().and_then(|mailbox| {
-                        mailbox
-                            .messages
-                            .iter_mut()
-                            .find(|message| &message.id == message_id)
-                    }) {
-                        match pending.mutation {
-                            MessageMutation::SetRead(_) => message.unread = value,
-                            MessageMutation::SetStarred(_) => message.starred = value,
-                            _ => {}
-                        }
-                    }
+                    self.restore_boolean_to_visible_representations(
+                        message_id,
+                        &pending.mutation,
+                        value,
+                    );
                 }
                 PendingValue::Label(applied) => {
-                    if let MessageMutation::SetLabel { mailbox, .. } = pending.mutation
-                        && let Some(message) = self.mailbox.as_mut().and_then(|mailbox| {
-                            mailbox
-                                .messages
-                                .iter_mut()
-                                .find(|message| &message.id == message_id)
-                        })
-                    {
-                        message.labels.retain(|label| label != &mailbox);
-                        if applied {
-                            message.labels.push(mailbox);
-                            message.labels.sort();
-                            message.labels.dedup();
-                        }
-                    }
+                    self.restore_label_to_visible_representations(
+                        message_id,
+                        &pending.mutation,
+                        applied,
+                    );
                 }
-                PendingValue::Inbox { message, index } => {
-                    if let Some(mailbox) = self.mailbox.as_mut() {
-                        if !mailbox.messages.iter().any(|item| item.id == message.id) {
-                            let index = index.min(mailbox.messages.len());
-                            mailbox.messages.insert(index, *message);
-                        }
-                        mailbox.metadata.loaded_count = mailbox.messages.len();
-                    }
-                }
+                PendingValue::Removed(rows) => self.restore_removed_rows(rows),
             }
         } else if origin_is_visible && let Some(state) = reconciled {
             match state {
                 Some(state) => {
-                    if let Some(mailbox) = self.mailbox.as_mut() {
-                        if let Some(message) = mailbox
-                            .messages
-                            .iter_mut()
-                            .find(|message| &message.id == message_id)
-                        {
-                            message.unread = state.unread;
-                            message.starred = state.starred;
-                            message.labels = state.labels;
-                        } else if let PendingValue::Inbox { message, index } = &pending.previous {
-                            let mut message = (**message).clone();
-                            message.unread = state.unread;
-                            message.starred = state.starred;
-                            message.labels = state.labels;
-                            mailbox
-                                .messages
-                                .insert((*index).min(mailbox.messages.len()), message);
-                            mailbox.metadata.loaded_count = mailbox.messages.len();
-                        }
+                    // Reconciliation says the message remains in Inbox. Put back the exact
+                    // projections removed optimistically only where its authoritative system
+                    // membership permits them (for example, archive may have succeeded even
+                    // though flags/labels were reconciled through All Mail).
+                    if let PendingValue::Removed(rows) = &pending.previous {
+                        self.restore_reconciled_rows(rows.clone(), &state);
                     }
+                    self.apply_reconciled_to_visible_representations(message_id, &state);
                 }
                 None => {
-                    if let Some(mailbox) = self.mailbox.as_mut() {
-                        mailbox.messages.retain(|message| &message.id != message_id);
-                        mailbox.metadata.loaded_count = mailbox.messages.len();
-                    }
+                    self.remove_message_from_all_visible_representations(message_id);
                 }
             }
         }
@@ -2349,6 +2471,374 @@ impl AppState {
             ..Default::default()
         }
     }
+
+    fn finish_undo_mutation(
+        &mut self,
+        confirmed: bool,
+        reconciled: Option<Option<ReconciledMessageState>>,
+        uncertain: bool,
+        message_id: &MessageId,
+    ) -> Update {
+        let undo = self.undo_operation.take().expect("matching undo exists");
+        if confirmed {
+            self.normalize();
+            self.bump_list();
+            self.bump_reader();
+            return Update {
+                feedback: Some("Message action undone"),
+                ..Default::default()
+            };
+        }
+        if let Some(state) = reconciled {
+            match state {
+                Some(state) => {
+                    if let PendingValue::Removed(rows) = undo.previous {
+                        self.restore_reconciled_rows(rows, &state);
+                    }
+                    self.apply_reconciled_to_visible_representations(message_id, &state);
+                }
+                None => self.remove_message_from_all_visible_representations(message_id),
+            }
+        } else {
+            // The local restore was optimistic. If Gmail rejected it, reinstate the forward
+            // presentation so the UI does not claim an Undo that never reached the server.
+            self.remove_from_views(message_id, matches!(undo.forward, MessageMutation::Archive));
+        }
+        self.normalize();
+        self.bump_list();
+        self.bump_reader();
+        Update {
+            feedback: if uncertain {
+                Some("Undo may have reached Gmail, but its final state could not be verified")
+            } else {
+                Some("Gmail could not undo the message action")
+            },
+            ..Default::default()
+        }
+    }
+
+    fn can_change_selected_message(&self) -> bool {
+        matches!(self.session, SessionState::Ready) && self.selected_message().is_some()
+    }
+
+    fn undo_message_operation(&mut self) -> Update {
+        let Some(mut undo) = self.undo_operation.take() else {
+            return Update {
+                feedback: Some("There is no message action to undo"),
+                ..Default::default()
+            };
+        };
+        match undo.phase {
+            UndoPhase::ForwardPending { request_id, .. } => {
+                self.restore_pending_value(undo.previous.clone());
+                undo.phase = UndoPhase::ForwardPending {
+                    request_id,
+                    requested: true,
+                };
+                self.undo_operation = Some(undo);
+                self.normalize();
+                self.bump_list();
+                self.bump_reader();
+                Update {
+                    feedback: Some("Undo will finish after Gmail confirms the message action"),
+                    ..Default::default()
+                }
+            }
+            UndoPhase::Available => match self.dispatch_undo(&mut undo) {
+                Ok(update) => {
+                    self.undo_operation = Some(undo);
+                    update
+                }
+                Err(feedback) => Update {
+                    feedback: Some(feedback),
+                    ..Default::default()
+                },
+            },
+            UndoPhase::UndoPending { .. } => {
+                self.undo_operation = Some(undo);
+                Update {
+                    feedback: Some("Undo is already in progress"),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    fn dispatch_undo(&mut self, undo: &mut UndoOperation) -> Result<Update, &'static str> {
+        let mutation = self.inverse_mutation(undo)?;
+        let account_email = self
+            .account
+            .as_ref()
+            .map(|account| account.email.clone())
+            .ok_or("Connect Gmail before undoing this action")?;
+        let request_id = MutationRequestId(self.next_mutation_request);
+        self.next_mutation_request = self.next_mutation_request.wrapping_add(1).max(1);
+        self.restore_pending_value(undo.previous.clone());
+        self.normalize();
+        self.bump_list();
+        self.bump_reader();
+        undo.phase = UndoPhase::UndoPending { request_id };
+        Ok(Update {
+            effects: vec![Effect::SendWorker(WorkerCommand::MutateMessageInCatalog {
+                request_id,
+                generation: self.cache_generation,
+                account_email,
+                message_id: undo.message_id.clone(),
+                locator: undo.locator.clone(),
+                catalog: undo.catalog.clone(),
+                mutation,
+            })],
+            ..Default::default()
+        })
+    }
+
+    fn inverse_mutation(&self, undo: &UndoOperation) -> Result<MessageMutation, &'static str> {
+        let inbox_mailbox = undo
+            .catalog
+            .find(&FolderId::Inbox)
+            .map(|folder| folder.mailbox.clone())
+            .ok_or("Gmail did not expose an Inbox mailbox to restore this message")?;
+        match &undo.forward {
+            MessageMutation::Archive => Ok(MessageMutation::RestoreArchive { inbox_mailbox }),
+            MessageMutation::MoveToTrash { mailbox } => Ok(MessageMutation::RestoreFromTrash {
+                inbox_mailbox,
+                trash_mailbox: mailbox.clone(),
+                restore_inbox: undo_was_in_inbox(&undo.previous),
+                labels: undo_labels(&undo.previous),
+            }),
+            _ => Err("This message action cannot be undone"),
+        }
+    }
+
+    fn restore_pending_value(&mut self, previous: PendingValue) {
+        match previous {
+            PendingValue::Removed(rows) => self.restore_removed_rows(rows),
+            PendingValue::Bool(_) | PendingValue::Label(_) => {}
+        }
+    }
+
+    // Gmail search/All Mail rows do not currently carry system-label membership.  They are
+    // therefore actionable unless the row is known to be Trash; the transport remains the
+    fn can_archive_message(&self, message: &MessageSummary) -> bool {
+        self.can_change_selected_message() && message.in_inbox && !message.in_trash
+    }
+
+    fn can_trash_message(&self, message: &MessageSummary) -> bool {
+        self.can_change_selected_message() && !message.in_trash
+    }
+
+    fn can_archive_selected(&self) -> bool {
+        self.selected_message()
+            .is_some_and(|message| self.can_archive_message(message))
+    }
+
+    fn can_trash_selected(&self) -> bool {
+        self.selected_message()
+            .is_some_and(|message| self.can_trash_message(message))
+    }
+
+    fn apply_to_visible_representations(&mut self, id: &MessageId, mutation: &MessageMutation) {
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            for message in &mut mailbox.messages {
+                if &message.id == id {
+                    mutation.apply(message);
+                }
+            }
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            for message in messages {
+                if &message.id == id {
+                    mutation.apply(message);
+                }
+            }
+        }
+    }
+
+    /// Removes only projections that Gmail's operation makes ineligible. Archive leaves All
+    /// Mail/label/search rows alone; trash removes every non-Trash projection. The removed
+    /// rows are retained exactly so a definite failure can restore their original order.
+    fn remove_from_views(&mut self, id: &MessageId, archive: bool) -> PendingValue {
+        let should_remove = |message: &MessageSummary| {
+            if archive {
+                message.folder_id == FolderId::Inbox
+            } else {
+                message.folder_id != FolderId::Trash
+            }
+        };
+        let mut removed = Vec::new();
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            let mut index = 0;
+            while index < mailbox.messages.len() {
+                if mailbox.messages[index].id == *id && should_remove(&mailbox.messages[index]) {
+                    removed.push(RemovedMessage {
+                        view: RemovedMessageView::Folder,
+                        message: mailbox.messages.remove(index),
+                        index,
+                    });
+                } else {
+                    index += 1;
+                }
+            }
+            mailbox.metadata.loaded_count = mailbox.messages.len();
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            let mut index = 0;
+            while index < messages.len() {
+                if messages[index].id == *id && should_remove(&messages[index]) {
+                    removed.push(RemovedMessage {
+                        view: RemovedMessageView::Search,
+                        message: messages.remove(index),
+                        index,
+                    });
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        PendingValue::Removed(removed)
+    }
+
+    fn restore_removed_rows(&mut self, rows: Vec<RemovedMessage>) {
+        for row in rows {
+            match row.view {
+                RemovedMessageView::Folder => {
+                    if let Some(mailbox) = self.mailbox.as_mut()
+                        && !mailbox
+                            .messages
+                            .iter()
+                            .any(|message| message.id == row.message.id)
+                    {
+                        let index = row.index.min(mailbox.messages.len());
+                        mailbox.messages.insert(index, row.message);
+                        mailbox.metadata.loaded_count = mailbox.messages.len();
+                    }
+                }
+                RemovedMessageView::Search => {
+                    if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search
+                        && !messages.iter().any(|message| message.id == row.message.id)
+                    {
+                        messages.insert(row.index.min(messages.len()), row.message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_reconciled_to_visible_representations(
+        &mut self,
+        id: &MessageId,
+        state: &ReconciledMessageState,
+    ) {
+        let update = |message: &mut MessageSummary| {
+            if &message.id == id {
+                message.unread = state.unread;
+                message.starred = state.starred;
+                message.in_inbox = state.in_inbox;
+                message.in_trash = state.in_trash;
+                message.labels = state.labels.clone();
+            }
+        };
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.messages.iter_mut().for_each(&update);
+            mailbox.messages.retain(Self::belongs_in_projection);
+            mailbox.metadata.loaded_count = mailbox.messages.len();
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            messages.iter_mut().for_each(update);
+            messages.retain(Self::belongs_in_projection);
+        }
+    }
+
+    fn restore_reconciled_rows(
+        &mut self,
+        rows: Vec<RemovedMessage>,
+        state: &ReconciledMessageState,
+    ) {
+        let rows = rows
+            .into_iter()
+            .filter_map(|mut row| {
+                row.message.unread = state.unread;
+                row.message.starred = state.starred;
+                row.message.in_inbox = state.in_inbox;
+                row.message.in_trash = state.in_trash;
+                row.message.labels = state.labels.clone();
+                Self::belongs_in_projection(&row.message).then_some(row)
+            })
+            .collect();
+        self.restore_removed_rows(rows);
+    }
+
+    fn belongs_in_projection(message: &MessageSummary) -> bool {
+        match &message.folder_id {
+            FolderId::Inbox => message.in_inbox,
+            FolderId::Trash => message.in_trash,
+            FolderId::AllMail => !message.in_trash,
+            FolderId::Starred => message.starred && !message.in_trash,
+            FolderId::Sent => !message.in_trash,
+            FolderId::Label(label) => message.labels.contains(label) && !message.in_trash,
+        }
+    }
+
+    fn restore_boolean_to_visible_representations(
+        &mut self,
+        id: &MessageId,
+        mutation: &MessageMutation,
+        value: bool,
+    ) {
+        let restore = |message: &mut MessageSummary| {
+            if &message.id == id {
+                match mutation {
+                    MessageMutation::SetRead(_) => message.unread = value,
+                    MessageMutation::SetStarred(_) => message.starred = value,
+                    _ => {}
+                }
+            }
+        };
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.messages.iter_mut().for_each(&restore);
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            messages.iter_mut().for_each(restore);
+        }
+    }
+
+    fn restore_label_to_visible_representations(
+        &mut self,
+        id: &MessageId,
+        mutation: &MessageMutation,
+        applied: bool,
+    ) {
+        let MessageMutation::SetLabel { mailbox, .. } = mutation else {
+            return;
+        };
+        let restore = |message: &mut MessageSummary| {
+            if &message.id == id {
+                message.labels.retain(|label| label != mailbox);
+                if applied {
+                    message.labels.push(mailbox.clone());
+                    message.labels.sort();
+                    message.labels.dedup();
+                }
+            }
+        };
+        if let Some(mailbox_view) = self.mailbox.as_mut() {
+            mailbox_view.messages.iter_mut().for_each(&restore);
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            messages.iter_mut().for_each(restore);
+        }
+    }
+
+    fn remove_message_from_all_visible_representations(&mut self, id: &MessageId) {
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.messages.retain(|message| &message.id != id);
+            mailbox.metadata.loaded_count = mailbox.messages.len();
+        }
+        if let ServerSearchState::Loaded { messages, .. } = &mut self.server_search {
+            messages.retain(|message| &message.id != id);
+        }
+    }
+
     fn set_cache_limit(&mut self, limit: usize) -> Update {
         if !cache::is_valid_limit(limit) || self.cache_limit == limit {
             return Update::default();
@@ -2619,13 +3109,13 @@ impl AppState {
             };
         }
         let source_subject = if let Some(id) = source_id.as_ref() {
-            let Some(subject) = self.mailbox.as_ref().and_then(|mailbox| {
-                mailbox
-                    .messages
-                    .iter()
-                    .find(|message| &message.id == id)
-                    .map(|message| message.subject.clone())
-            }) else {
+            // The selected row may be an ephemeral Gmail server-search result, not a member
+            // of the currently loaded folder. Resolve through the same accessor as selection.
+            let Some(subject) = self
+                .selected_message()
+                .filter(|message| &message.id == id)
+                .map(|message| message.subject.clone())
+            else {
                 return Update {
                     feedback: Some("The source message is no longer in this mailbox"),
                     ..Default::default()

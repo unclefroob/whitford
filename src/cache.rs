@@ -162,6 +162,17 @@ pub fn persist_confirmed_mutation(
     id: &MessageId,
     mutation: &MessageMutation,
 ) -> io::Result<()> {
+    persist_confirmed_message_mutation(account_email, id, mutation)
+}
+
+/// Applies a confirmed Gmail mutation to every cached folder projection containing the
+/// canonical message ID. This deliberately does not assume that the action originated in
+/// Inbox: Gmail IDs can legitimately appear in several cached views with different locators.
+pub fn persist_confirmed_message_mutation(
+    account_email: &str,
+    id: &MessageId,
+    mutation: &MessageMutation,
+) -> io::Result<()> {
     persist_confirmed_mutation_at(&cache_root(), account_email, id, mutation)
 }
 
@@ -172,19 +183,67 @@ fn persist_confirmed_mutation_at(
     mutation: &MessageMutation,
 ) -> io::Result<()> {
     mutate_stored_mailbox_at(cache, account_email, |view| {
-        if matches!(
-            mutation,
-            MessageMutation::Archive | MessageMutation::MoveToTrash { .. }
-        ) && view.folder_id == FolderId::Inbox
-        {
-            view.messages.retain(|message| &message.id != id);
-        } else if let Some(message) = view.messages.iter_mut().find(|message| &message.id == id) {
-            mutation.apply(message);
+        for message in &mut view.messages {
+            if &message.id == id {
+                match mutation {
+                    MessageMutation::Archive => message.in_inbox = false,
+                    MessageMutation::MoveToTrash { .. } => {
+                        message.in_inbox = false;
+                        message.in_trash = true;
+                    }
+                    MessageMutation::RestoreArchive { .. } => {
+                        message.in_inbox = true;
+                        message.in_trash = false;
+                    }
+                    MessageMutation::RestoreFromTrash { restore_inbox, .. } => {
+                        message.in_inbox = *restore_inbox;
+                        message.in_trash = false;
+                    }
+                    MessageMutation::SetRead(_)
+                    | MessageMutation::SetStarred(_)
+                    | MessageMutation::SetLabel { .. } => {}
+                }
+            }
+        }
+        match mutation {
+            // Archive removes only the Inbox projection. All Mail/label views remain useful
+            // local representations of the same canonical Gmail message.
+            MessageMutation::Archive if view.folder_id == FolderId::Inbox => {
+                view.messages.retain(|message| &message.id != id);
+            }
+            // Gmail MOVE to Trash makes every non-Trash cached projection stale. We cannot
+            // synthesize a new Trash row without an authoritative Trash locator.
+            MessageMutation::MoveToTrash { .. } if view.folder_id != FolderId::Trash => {
+                view.messages.retain(|message| &message.id != id);
+            }
+            // An Undo confirmation carries no authoritative locator/summary with which to
+            // synthesize a previously evicted Inbox or Trash cache row. Leave existing views
+            // intact and let the next folder refresh repopulate them; this never marks an
+            // unconfirmed local Undo as durable.
+            MessageMutation::RestoreArchive { .. } | MessageMutation::RestoreFromTrash { .. } => {}
+            _ => {
+                for message in &mut view.messages {
+                    if &message.id == id {
+                        mutation.apply(message);
+                    }
+                }
+            }
         }
     })
 }
 
 pub fn persist_reconciled_inbox(
+    account_email: &str,
+    id: &MessageId,
+    state: Option<&ReconciledMessageState>,
+) -> io::Result<()> {
+    persist_reconciled_message_state(account_email, id, state)
+}
+
+/// Compatibility state supplied by the current worker is authoritative for Inbox membership.
+/// Attribute updates apply to every cached representation; absence removes only Inbox, not an
+/// unrelated All Mail/label cache row.
+pub fn persist_reconciled_message_state(
     account_email: &str,
     id: &MessageId,
     state: Option<&ReconciledMessageState>,
@@ -201,13 +260,16 @@ fn persist_reconciled_inbox_at(
     mutate_stored_mailbox_at(cache, account_email, |view| {
         if state.is_none() && view.folder_id == FolderId::Inbox {
             view.messages.retain(|message| &message.id != id);
-        } else if let (Some(state), Some(message)) = (
-            state,
-            view.messages.iter_mut().find(|message| &message.id == id),
-        ) {
-            message.unread = state.unread;
-            message.starred = state.starred;
-            message.labels = state.labels.clone();
+        } else if let Some(state) = state {
+            for message in &mut view.messages {
+                if &message.id == id {
+                    message.unread = state.unread;
+                    message.starred = state.starred;
+                    message.in_inbox = state.in_inbox;
+                    message.in_trash = state.in_trash;
+                    message.labels = state.labels.clone();
+                }
+            }
         }
     })
 }
@@ -1371,6 +1433,8 @@ mod tests {
             received_at_unix: Some(i64::from(uid)),
             unread: false,
             starred: false,
+            in_inbox: true,
+            in_trash: false,
             labels: Vec::new(),
             attachment_state: AttachmentState::Known(Vec::new()),
             used_fallback: false,
@@ -2093,6 +2157,61 @@ mod tests {
                 .map(|message| message.id.clone())
                 .collect::<Vec<_>>(),
             vec![MessageId::gmail(2)]
+        );
+    }
+
+    #[test]
+    fn confirmed_archive_updates_inbox_without_evicting_all_mail_projection() {
+        let root = TestRoot::new();
+        let catalog = crate::model::FolderCatalog::bounded(vec![
+            crate::model::FolderDescriptor {
+                id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                display_name: "Inbox".into(),
+                kind: crate::model::FolderKind::Inbox,
+            },
+            crate::model::FolderDescriptor {
+                id: FolderId::AllMail,
+                mailbox: "[Gmail]/All Mail".into(),
+                display_name: "All Mail".into(),
+                kind: crate::model::FolderKind::AllMail,
+            },
+        ]);
+        let mut inbox = snapshot(&[1]);
+        inbox.folder_catalog = catalog.clone();
+        replace_folder_and_save_at(&root.0, &account(), FolderId::Inbox, inbox, 50, 1).unwrap();
+
+        let mut all_mail = snapshot(&[1]);
+        all_mail.folder_catalog = catalog;
+        all_mail.messages[0].folder_id = FolderId::AllMail;
+        all_mail.messages[0].locator.folder_id = FolderId::AllMail;
+        all_mail.messages[0].locator.mailbox = "[Gmail]/All Mail".into();
+        replace_folder_and_save_at(&root.0, &account(), FolderId::AllMail, all_mail, 50, 2)
+            .unwrap();
+
+        persist_confirmed_mutation_at(
+            &root.0,
+            EMAIL,
+            &MessageId::gmail(1),
+            &MessageMutation::Archive,
+        )
+        .unwrap();
+        assert!(
+            load_folder_from(&root.0, EMAIL, &FolderId::Inbox, 50, 3)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            load_folder_from(&root.0, EMAIL, &FolderId::AllMail, 50, 3)
+                .unwrap()
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>(),
+            vec![MessageId::gmail(1)]
         );
     }
 }

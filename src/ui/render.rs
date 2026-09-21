@@ -59,7 +59,18 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
         "retry-search",
         matches!(snapshot.server_search, ServerSearchView::Failed(_)),
     );
-    for action in ["archive", "mark-read", "delete", "star", "toggle-label"] {
+    // Archive and Trash have different Gmail semantics (and, in particular, are not
+    // meaningful for a message already in Trash).  Keep their availability tied to
+    // the state-provided, selection-specific capabilities rather than the folder
+    // currently displayed.
+    set_action_enabled(ui, "archive", snapshot.can_archive);
+    set_action_enabled(ui, "delete", snapshot.can_move_to_trash);
+    set_action_enabled(
+        ui,
+        "undo-message-operation",
+        undo_action_enabled(snapshot.undo_message_operation.as_ref()),
+    );
+    for action in ["mark-read", "star", "toggle-label"] {
         set_action_enabled(ui, action, snapshot.can_mutate);
     }
     set_action_enabled(
@@ -67,10 +78,10 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
         "retry-drafts",
         snapshot.draft_catalog_state == DraftCatalogState::Failed,
     );
-    let can_reply = matches!(snapshot.session, SessionState::Ready)
-        && matches!(&snapshot.reader, ReaderState::Loaded { body, .. } if !(if body.reply_context.reply_to.is_empty() { &body.reply_context.from } else { &body.reply_context.reply_to }).is_empty())
-        && matches!(snapshot.composer, ComposerState::Closed);
+    let (can_reply, can_reply_all, can_forward) = reply_action_availability(snapshot);
     set_action_enabled(ui, "reply", can_reply);
+    set_action_enabled(ui, "reply-all", can_reply_all);
+    set_action_enabled(ui, "forward", can_forward);
     render_composer(ui, snapshot);
     if ui.last_list_revision.get() != snapshot.list_revision {
         render_messages(ui, snapshot);
@@ -81,6 +92,34 @@ pub(super) fn render(ui: &Ui, snapshot: &ViewSnapshot) {
         render_reader(ui, snapshot);
         ui.last_reader_revision.set(snapshot.reader_revision);
     }
+}
+
+/// Reply actions are based on the loaded message body, not its list provenance. This
+/// keeps a Gmail server-search result equivalent to a message opened from a folder.
+fn reply_action_availability(snapshot: &ViewSnapshot) -> (bool, bool, bool) {
+    let can_compose = matches!(snapshot.session, SessionState::Ready)
+        && matches!(snapshot.composer, ComposerState::Closed);
+    let Some(body) = (match &snapshot.reader {
+        ReaderState::Loaded { body, .. } => Some(body),
+        _ => None,
+    }) else {
+        return (false, false, false);
+    };
+    let has_recipient = reply_target_available(&body.reply_context);
+    (
+        can_compose && has_recipient,
+        can_compose && has_recipient,
+        can_compose,
+    )
+}
+
+fn reply_target_available(context: &crate::model::ReplyContext) -> bool {
+    !(if context.reply_to.is_empty() {
+        &context.from
+    } else {
+        &context.reply_to
+    })
+    .is_empty()
 }
 
 fn render_label_menu(ui: &Ui, snapshot: &ViewSnapshot) {
@@ -941,6 +980,28 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
             )),
         ));
     }
+    if let Some(operation) = &snapshot.undo_message_operation {
+        let detail = if operation.pending {
+            format!(
+                "{} — waiting for Gmail before this action can be undone.",
+                operation.title
+            )
+        } else {
+            format!(
+                "{} — Undo remains available until you take another message action.",
+                operation.title
+            )
+        };
+        banners.push((
+            "Undo message action".to_owned(),
+            detail,
+            operation.can_undo.then_some((
+                "Undo",
+                "win.undo-message-operation",
+                "Undo this message action",
+            )),
+        ));
+    }
     match snapshot.server_search {
         ServerSearchView::Loading => banners.push((
             "Searching Gmail".to_owned(),
@@ -1001,6 +1062,10 @@ fn render_banners(ui: &Ui, snapshot: &ViewSnapshot) {
         .set_visible(ui.list_banner.first_child().is_some());
     ui.reader_banner
         .set_visible(ui.reader_banner.first_child().is_some());
+}
+
+fn undo_action_enabled(operation: Option<&crate::state::UndoMessageOperationView>) -> bool {
+    operation.is_some_and(|operation| operation.can_undo)
 }
 
 fn last_sync(snapshot: &ViewSnapshot) -> String {
@@ -1414,6 +1479,41 @@ mod tests {
         assert_eq!(reply_subject_label("Status"), "Re: Status");
         assert_eq!(reply_subject_label("RE: Status"), "RE: Status");
         assert_eq!(reply_subject_label("  "), "Re: (No subject)");
+    }
+
+    #[test]
+    fn reply_target_prefers_reply_to_and_accepts_sender() {
+        let mut context = crate::model::ReplyContext::default();
+        assert!(!reply_target_available(&context));
+
+        context.from.push(crate::model::ReplyAddress {
+            name: None,
+            email: "sender@example.test".into(),
+        });
+        assert!(reply_target_available(&context));
+
+        context.reply_to.push(crate::model::ReplyAddress {
+            name: None,
+            email: "reply@example.test".into(),
+        });
+        assert!(reply_target_available(&context));
+    }
+
+    #[test]
+    fn undo_action_only_enables_for_the_current_confirmed_operation() {
+        let mut operation = crate::state::UndoMessageOperationView {
+            id: 7,
+            message_id: crate::model::MessageId::gmail(42),
+            title: "Status".into(),
+            can_undo: false,
+            pending: true,
+        };
+        assert!(!undo_action_enabled(Some(&operation)));
+
+        operation.can_undo = true;
+        operation.pending = false;
+        assert!(undo_action_enabled(Some(&operation)));
+        assert!(!undo_action_enabled(None));
     }
 
     #[test]

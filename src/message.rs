@@ -53,6 +53,8 @@ pub fn map_summary(raw: RawMessageSummary) -> MessageSummary {
         received_at_unix: received_at.or(raw.internal_date_unix),
         unread: !raw.flags.seen,
         starred: raw.flags.flagged,
+        in_inbox: raw.in_inbox,
+        in_trash: raw.in_trash,
         labels: raw.labels,
         attachment_state: raw.attachment_state,
         used_fallback,
@@ -401,6 +403,8 @@ mod tests {
             rfc822_size: Some(90_000),
             header: bytes.to_vec(),
             attachment_state: AttachmentState::Known(Vec::new()),
+            in_inbox: true,
+            in_trash: false,
             labels: Vec::new(),
         }
     }
@@ -472,6 +476,8 @@ mod tests {
         assert_eq!(message.sender, "Mara Chen");
         assert_eq!(message.subject, "Hello");
         assert!(message.unread && message.starred);
+        assert!(message.in_inbox);
+        assert!(!message.in_trash);
         let huge = format!("Subject: {}\r\n\r\n", "🙂".repeat(20_000));
         assert!(map_summary(summary(huge.as_bytes())).subject.len() <= 2_048);
     }

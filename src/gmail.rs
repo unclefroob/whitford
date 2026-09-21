@@ -48,6 +48,8 @@ pub struct RawMessageSummary {
     pub rfc822_size: Option<u32>,
     pub header: Vec<u8>,
     pub attachment_state: AttachmentState,
+    pub in_inbox: bool,
+    pub in_trash: bool,
     pub labels: Vec<String>,
 }
 
@@ -94,6 +96,8 @@ struct SummaryCandidate {
     size: Option<u32>,
     header: Option<Vec<u8>>,
     attachment_state: AttachmentState,
+    in_inbox: bool,
+    in_trash: bool,
     labels: Vec<String>,
 }
 
@@ -152,6 +156,17 @@ fn user_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     labels
 }
 
+fn gmail_label_state<'a>(labels: impl IntoIterator<Item = &'a str>) -> (Vec<String>, bool, bool) {
+    let labels = labels.into_iter().collect::<Vec<_>>();
+    let in_inbox = labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case("\\Inbox"));
+    let in_trash = labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case("\\Trash"));
+    (user_labels(labels), in_inbox, in_trash)
+}
+
 fn quote_label(label: &str) -> Option<String> {
     (!label.is_empty()
         && label.len() <= crate::model::MAX_FOLDER_MAILBOX_BYTES
@@ -166,13 +181,61 @@ fn mutation_store_query(mutation: &MessageMutation) -> Option<String> {
         MessageMutation::SetStarred(true) => Some("+FLAGS.SILENT (\\Flagged)".into()),
         MessageMutation::SetStarred(false) => Some("-FLAGS.SILENT (\\Flagged)".into()),
         MessageMutation::Archive => Some("-X-GM-LABELS.SILENT (\\Inbox)".into()),
+        MessageMutation::RestoreArchive { .. } => Some("+X-GM-LABELS.SILENT (\\Inbox)".into()),
         MessageMutation::SetLabel { mailbox, applied } => Some(format!(
             "{}X-GM-LABELS.SILENT ({})",
             if *applied { "+" } else { "-" },
             quote_label(mailbox)?
         )),
-        MessageMutation::MoveToTrash { .. } => None,
+        MessageMutation::MoveToTrash { .. } | MessageMutation::RestoreFromTrash { .. } => None,
     }
+}
+
+fn restore_labels_query(restore_inbox: bool, labels: &[String]) -> Option<String> {
+    if labels.len() > crate::model::MAX_MESSAGE_LABELS {
+        return None;
+    }
+    let mut values = Vec::with_capacity(labels.len() + usize::from(restore_inbox));
+    if restore_inbox {
+        values.push("\\Inbox".to_owned());
+    }
+    for label in labels {
+        values.push(quote_label(label)?);
+    }
+    if values.is_empty() {
+        return Some(String::new());
+    }
+    Some(format!("+X-GM-LABELS.SILENT ({})", values.join(" ")))
+}
+
+fn mutation_catalog_is_valid(catalog: &FolderCatalog, mutation: &MessageMutation) -> bool {
+    match mutation {
+        MessageMutation::MoveToTrash { mailbox } => catalog
+            .find(&FolderId::Trash)
+            .is_some_and(|folder| folder.mailbox == *mailbox),
+        MessageMutation::RestoreArchive { inbox_mailbox } => catalog
+            .find(&FolderId::Inbox)
+            .is_some_and(|folder| folder.mailbox == *inbox_mailbox),
+        MessageMutation::RestoreFromTrash {
+            inbox_mailbox,
+            trash_mailbox,
+            restore_inbox,
+            labels,
+        } => {
+            catalog
+                .find(&FolderId::Inbox)
+                .is_some_and(|folder| folder.mailbox == *inbox_mailbox)
+                && catalog
+                    .find(&FolderId::Trash)
+                    .is_some_and(|folder| folder.mailbox == *trash_mailbox)
+                && restore_labels_query(*restore_inbox, labels).is_some()
+        }
+        _ => true,
+    }
+}
+
+fn partial_restore_is_uncertain(mutation: &MessageMutation, first_store_succeeded: bool) -> bool {
+    first_store_succeeded && matches!(mutation, MessageMutation::RestoreFromTrash { .. })
 }
 
 pub fn valid_retention_limit(limit: usize) -> bool {
@@ -697,6 +760,13 @@ async fn search_all_mail_inner(
             .await
             .map_err(|_| GmailError::Protocol)?;
         candidates.extend(fetches.into_iter().map(|fetch| {
+            let (labels, in_inbox, in_trash) = gmail_label_state(
+                fetch
+                    .gmail_labels()
+                    .into_iter()
+                    .flatten()
+                    .map(|label| label.as_ref()),
+            );
             SummaryCandidate {
                 uid: fetch.uid,
                 x_gm_msgid: fetch.gmail_msg_id().copied(),
@@ -714,13 +784,9 @@ async fn search_all_mail_inner(
                     .header()
                     .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
                 attachment_state: attachment_state(fetch.bodystructure()),
-                labels: user_labels(
-                    fetch
-                        .gmail_labels()
-                        .into_iter()
-                        .flatten()
-                        .map(|label| label.as_ref()),
-                ),
+                in_inbox,
+                in_trash,
+                labels,
             }
         }));
     }
@@ -785,30 +851,35 @@ async fn fetch_folder_inner(
     let requested = uids.into_iter().collect::<BTreeSet<_>>();
     let candidates = fetches
         .into_iter()
-        .map(|fetch| SummaryCandidate {
-            uid: fetch.uid,
-            x_gm_msgid: fetch.gmail_msg_id().copied(),
-            flags: MessageFlags {
-                seen: fetch
-                    .flags()
-                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
-                flagged: fetch
-                    .flags()
-                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
-            },
-            internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
-            size: fetch.size,
-            header: fetch
-                .header()
-                .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
-            attachment_state: attachment_state(fetch.bodystructure()),
-            labels: user_labels(
+        .map(|fetch| {
+            let (labels, in_inbox, in_trash) = gmail_label_state(
                 fetch
                     .gmail_labels()
                     .into_iter()
                     .flatten()
                     .map(|label| label.as_ref()),
-            ),
+            );
+            SummaryCandidate {
+                uid: fetch.uid,
+                x_gm_msgid: fetch.gmail_msg_id().copied(),
+                flags: MessageFlags {
+                    seen: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                    flagged: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                },
+                internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
+                size: fetch.size,
+                header: fetch
+                    .header()
+                    .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
+                attachment_state: attachment_state(fetch.bodystructure()),
+                in_inbox,
+                in_trash,
+                labels,
+            }
         })
         .collect();
     let _ = session.logout().await;
@@ -893,30 +964,35 @@ async fn fetch_inbox_inner(
     let requested: BTreeSet<_> = uids.into_iter().collect();
     let candidates = fetches
         .into_iter()
-        .map(|fetch| SummaryCandidate {
-            uid: fetch.uid,
-            x_gm_msgid: fetch.gmail_msg_id().copied(),
-            flags: MessageFlags {
-                seen: fetch
-                    .flags()
-                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
-                flagged: fetch
-                    .flags()
-                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
-            },
-            internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
-            size: fetch.size,
-            header: fetch
-                .header()
-                .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
-            attachment_state: attachment_state(fetch.bodystructure()),
-            labels: user_labels(
+        .map(|fetch| {
+            let (labels, in_inbox, in_trash) = gmail_label_state(
                 fetch
                     .gmail_labels()
                     .into_iter()
                     .flatten()
                     .map(|label| label.as_ref()),
-            ),
+            );
+            SummaryCandidate {
+                uid: fetch.uid,
+                x_gm_msgid: fetch.gmail_msg_id().copied(),
+                flags: MessageFlags {
+                    seen: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                    flagged: fetch
+                        .flags()
+                        .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                },
+                internal_date_unix: fetch.internal_date().map(|date| date.timestamp()),
+                size: fetch.size,
+                header: fetch
+                    .header()
+                    .map(|value| value[..value.len().min(MAX_HEADER_BYTES)].to_vec()),
+                attachment_state: attachment_state(fetch.bodystructure()),
+                in_inbox,
+                in_trash,
+                labels,
+            }
         })
         .collect();
     let _ = session.logout().await;
@@ -983,6 +1059,8 @@ fn classify_summaries(
             rfc822_size: candidate.size,
             header,
             attachment_state: candidate.attachment_state,
+            in_inbox: candidate.in_inbox,
+            in_trash: candidate.in_trash,
             labels: candidate.labels,
         });
     }
@@ -995,19 +1073,29 @@ fn classify_summaries(
     }
 }
 
-pub async fn mutate_inbox(
+/// Applies a mutation using the supplied folder-local locator.  `MessageId` is
+/// the cross-folder identity; an IMAP UID is deliberately resolved again when
+/// its originating mailbox has changed underneath us.
+///
+/// The folder catalog is used only for mailbox discovery.  In particular, do
+/// not manufacture Gmail's localized All Mail or Trash mailbox paths here.
+pub async fn mutate_message(
     email: &str,
     access_token: &str,
     id: &MessageId,
     locator: &MessageLocator,
+    catalog: &FolderCatalog,
     mutation: &MessageMutation,
 ) -> MutationResult {
-    if id.gmail_value().is_none() || !locator.is_valid() || locator.folder_id != FolderId::Inbox {
+    if id.gmail_value().is_none() || !locator.is_valid() {
+        return MutationResult::DefiniteFailure(GmailError::Protocol);
+    }
+    if !mutation_catalog_is_valid(catalog, mutation) {
         return MutationResult::DefiniteFailure(GmailError::Protocol);
     }
     let attempted = timeout(
         Duration::from_secs(30),
-        mutate_inbox_inner(email, access_token, id, locator, mutation),
+        mutate_message_inner(email, access_token, id, locator, catalog, mutation),
     )
     .await;
     match attempted {
@@ -1016,7 +1104,7 @@ pub async fn mutate_inbox(
         Ok(Err(MutationAttemptError::Uncertain)) | Err(_) => {
             match timeout(
                 Duration::from_secs(20),
-                reconcile_inbox_inner(email, access_token, id),
+                reconcile_message_inner(email, access_token, id, locator, catalog),
             )
             .await
             {
@@ -1025,6 +1113,30 @@ pub async fn mutate_inbox(
             }
         }
     }
+}
+
+/// Compatibility entry point for callers which have not yet retained the
+/// current folder catalog.  New code must call [`mutate_message`].  It keeps
+/// the historical Inbox-only contract rather than guessing special-use paths.
+pub async fn mutate_inbox(
+    email: &str,
+    access_token: &str,
+    id: &MessageId,
+    locator: &MessageLocator,
+    mutation: &MessageMutation,
+) -> MutationResult {
+    if locator.folder_id != FolderId::Inbox {
+        return MutationResult::DefiniteFailure(GmailError::Protocol);
+    }
+    mutate_message(
+        email,
+        access_token,
+        id,
+        locator,
+        &FolderCatalog::inbox_only(),
+        mutation,
+    )
+    .await
 }
 
 async fn authenticated_session(
@@ -1038,47 +1150,76 @@ async fn authenticated_session(
         .map_err(|_| GmailError::AuthenticationFailed)
 }
 
-async fn mutate_inbox_inner(
+async fn mutate_message_inner(
     email: &str,
     access_token: &str,
     id: &MessageId,
     locator: &MessageLocator,
+    catalog: &FolderCatalog,
     mutation: &MessageMutation,
 ) -> Result<(), MutationAttemptError> {
     let mut session = authenticated_session(email, access_token)
         .await
         .map_err(MutationAttemptError::Definite)?;
-    let mailbox = session
-        .select(&locator.mailbox)
+    let resolved = resolve_message_locator(&mut session, id, locator, catalog)
         .await
-        .map_err(|_| MutationAttemptError::Definite(GmailError::InboxUnavailable))?;
-    if mailbox.uid_validity != Some(locator.uid_validity) {
-        return Err(MutationAttemptError::Definite(GmailError::MailboxChanged));
-    }
-    let identities: Vec<_> = session
-        .uid_fetch(locator.uid.to_string(), "(UID X-GM-MSGID)")
-        .await
-        .map_err(|_| MutationAttemptError::Definite(GmailError::Protocol))?
-        .try_collect()
-        .await
-        .map_err(|_| MutationAttemptError::Definite(GmailError::Protocol))?;
-    if identities.len() != 1
-        || identities[0].uid != Some(locator.uid)
-        || identities[0].gmail_msg_id().copied() != id.gmail_value()
-    {
-        return Err(MutationAttemptError::Definite(GmailError::MessageMissing));
-    }
+        .map_err(MutationAttemptError::Definite)?;
+    let mut partially_restored_from_trash = false;
     let result = match mutation {
         MessageMutation::MoveToTrash { mailbox } => {
             if quote_label(mailbox).is_none() {
                 return Err(MutationAttemptError::Definite(GmailError::Protocol));
             }
-            session.uid_mv(locator.uid.to_string(), mailbox).await
+            session.uid_mv(resolved.uid.to_string(), mailbox).await
+        }
+        MessageMutation::RestoreFromTrash {
+            restore_inbox,
+            labels,
+            ..
+        } => {
+            let query = restore_labels_query(*restore_inbox, labels)
+                .ok_or(MutationAttemptError::Definite(GmailError::Protocol))?;
+            if query.is_empty() {
+                match session
+                    .uid_store(resolved.uid.to_string(), "-X-GM-LABELS.SILENT (\\Trash)")
+                    .await
+                {
+                    Ok(stream) => stream.try_collect::<Vec<_>>().await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
+            } else {
+                let added = match session.uid_store(resolved.uid.to_string(), query).await {
+                    Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                match added {
+                    Ok(()) => match session
+                        .uid_store(resolved.uid.to_string(), "-X-GM-LABELS.SILENT (\\Trash)")
+                        .await
+                    {
+                        Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                            Ok(_) => Ok(()),
+                            Err(error) => {
+                                partially_restored_from_trash = true;
+                                Err(error)
+                            }
+                        },
+                        Err(error) => {
+                            partially_restored_from_trash = true;
+                            Err(error)
+                        }
+                    },
+                    Err(error) => Err(error),
+                }
+            }
         }
         _ => {
             let query = mutation_store_query(mutation)
                 .ok_or(MutationAttemptError::Definite(GmailError::Protocol))?;
-            match session.uid_store(locator.uid.to_string(), query).await {
+            match session.uid_store(resolved.uid.to_string(), query).await {
                 Ok(stream) => stream.try_collect::<Vec<_>>().await.map(|_| ()),
                 Err(error) => Err(error),
             }
@@ -1088,6 +1229,9 @@ async fn mutate_inbox_inner(
         Ok(()) => {
             let _ = session.logout().await;
             Ok(())
+        }
+        Err(_) if partial_restore_is_uncertain(mutation, partially_restored_from_trash) => {
+            Err(MutationAttemptError::Uncertain)
         }
         Err(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_))
             if !matches!(mutation, MessageMutation::MoveToTrash { .. }) =>
@@ -1101,54 +1245,175 @@ async fn mutate_inbox_inner(
     }
 }
 
-async fn reconcile_inbox_inner(
+/// Reconciles through All Mail when the catalog exposes it.  The literal
+/// `INBOX` used by the compatibility wrapper is intentionally absent here:
+/// after Archive the message is no longer searchable there.
+pub async fn reconcile_message(
     email: &str,
     access_token: &str,
     id: &MessageId,
+    locator: &MessageLocator,
+    catalog: &FolderCatalog,
+) -> Result<Option<ReconciledMessageState>, GmailError> {
+    if id.gmail_value().is_none() || !locator.is_valid() {
+        return Err(GmailError::Protocol);
+    }
+    timeout(
+        Duration::from_secs(20),
+        reconcile_message_inner(email, access_token, id, locator, catalog),
+    )
+    .await
+    .map_err(|_| GmailError::TimedOut)?
+}
+
+async fn reconcile_message_inner(
+    email: &str,
+    access_token: &str,
+    id: &MessageId,
+    locator: &MessageLocator,
+    catalog: &FolderCatalog,
 ) -> Result<Option<ReconciledMessageState>, GmailError> {
     let mut session = authenticated_session(email, access_token).await?;
-    session
-        .examine("INBOX")
-        .await
-        .map_err(|_| GmailError::InboxUnavailable)?;
-    let ids = session
-        .uid_search(format!(
-            "X-GM-MSGID {}",
-            id.gmail_value().ok_or(GmailError::Protocol)?
-        ))
-        .await
-        .map_err(|_| GmailError::Protocol)?;
-    let Some(uid) = ids.into_iter().next() else {
-        let _ = session.logout().await;
-        return Ok(None);
+    let resolved = resolve_message_locator(&mut session, id, locator, catalog).await;
+    let state = match resolved {
+        Ok(locator) => {
+            let values: Vec<_> = session
+                .uid_fetch(
+                    locator.uid.to_string(),
+                    "(UID X-GM-MSGID FLAGS X-GM-LABELS)",
+                )
+                .await
+                .map_err(|_| GmailError::Protocol)?
+                .try_collect()
+                .await
+                .map_err(|_| GmailError::Protocol)?;
+            values
+                .first()
+                .filter(|fetch| fetch.gmail_msg_id().copied() == id.gmail_value())
+                .map(|fetch| {
+                    let (labels, in_inbox, in_trash) = gmail_label_state(
+                        fetch
+                            .gmail_labels()
+                            .into_iter()
+                            .flatten()
+                            .map(|label| label.as_ref()),
+                    );
+                    ReconciledMessageState {
+                        unread: !fetch
+                            .flags()
+                            .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                        starred: fetch
+                            .flags()
+                            .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                        in_inbox,
+                        in_trash,
+                        labels,
+                    }
+                })
+                .ok_or(GmailError::Protocol)?
+                .into()
+        }
+        Err(GmailError::MessageMissing) => None,
+        Err(error) => return Err(error),
     };
+    let _ = session.logout().await;
+    Ok(state)
+}
+
+/// Candidate mailboxes are ordered by the caller's fresh locator, then Gmail
+/// special-use descriptors.  A UID found in one mailbox is never used in the
+/// next; every candidate is verified against X-GM-MSGID before it is returned.
+fn resolution_mailboxes(locator: &MessageLocator, catalog: &FolderCatalog) -> Vec<String> {
+    let mut mailboxes = vec![locator.mailbox.clone()];
+    for id in [FolderId::AllMail, FolderId::Inbox, FolderId::Trash] {
+        if let Some(folder) = catalog.find(&id)
+            && !mailboxes.iter().any(|mailbox| mailbox == &folder.mailbox)
+        {
+            mailboxes.push(folder.mailbox.clone());
+        }
+    }
+    mailboxes
+}
+
+async fn resolve_message_locator(
+    session: &mut async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>,
+    id: &MessageId,
+    supplied: &MessageLocator,
+    catalog: &FolderCatalog,
+) -> Result<MessageLocator, GmailError> {
+    let expected = id.gmail_value().ok_or(GmailError::Protocol)?;
+    for mailbox_name in resolution_mailboxes(supplied, catalog) {
+        let mailbox = match session.examine(&mailbox_name).await {
+            Ok(mailbox) => mailbox,
+            Err(_) => continue,
+        };
+        let Some(uid_validity) = mailbox.uid_validity else {
+            continue;
+        };
+        // The provided UID can only be trusted within the exact mailbox and
+        // UIDVALIDITY it was fetched from.  A changed UIDVALIDITY falls through
+        // to a canonical X-GM-MSGID search.
+        let direct_uid = (mailbox_name == supplied.mailbox
+            && uid_validity == supplied.uid_validity)
+            .then_some(supplied.uid);
+        if let Some(uid) = direct_uid
+            && uid_matches_message(session, uid, expected).await?
+        {
+            return resolved_locator(catalog, supplied, mailbox_name, uid_validity, uid);
+        }
+        // A locally retained UID can be stale even when UIDVALIDITY has not
+        // changed (for example, another client moved the message).  Search the
+        // same mailbox after a failed direct identity check before trying the
+        // other special-use mailboxes.
+        let candidates = session
+            .uid_search(format!("X-GM-MSGID {expected}"))
+            .await
+            .map_err(|_| GmailError::Protocol)?;
+        for uid in candidates.into_iter().filter(|uid| *uid != 0).take(8) {
+            if uid_matches_message(session, uid, expected).await? {
+                return resolved_locator(catalog, supplied, mailbox_name, uid_validity, uid);
+            }
+        }
+    }
+    Err(GmailError::MessageMissing)
+}
+
+async fn uid_matches_message(
+    session: &mut async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>,
+    uid: u32,
+    expected: u64,
+) -> Result<bool, GmailError> {
     let values: Vec<_> = session
-        .uid_fetch(uid.to_string(), "(UID X-GM-MSGID FLAGS X-GM-LABELS)")
+        .uid_fetch(uid.to_string(), "(UID X-GM-MSGID)")
         .await
         .map_err(|_| GmailError::Protocol)?
         .try_collect()
         .await
         .map_err(|_| GmailError::Protocol)?;
-    let state = values
-        .first()
-        .filter(|fetch| fetch.gmail_msg_id().copied() == id.gmail_value())
-        .map(|fetch| ReconciledMessageState {
-            unread: !fetch
-                .flags()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
-            starred: fetch
-                .flags()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
-            labels: user_labels(
-                fetch
-                    .gmail_labels()
-                    .into_iter()
-                    .flatten()
-                    .map(|label| label.as_ref()),
-            ),
-        });
-    let _ = session.logout().await;
-    state.ok_or(GmailError::Protocol).map(Some)
+    Ok(
+        matches!(values.as_slice(), [value] if value.uid == Some(uid) && value.gmail_msg_id().copied() == Some(expected)),
+    )
+}
+
+fn resolved_locator(
+    catalog: &FolderCatalog,
+    supplied: &MessageLocator,
+    mailbox: String,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<MessageLocator, GmailError> {
+    let folder_id = catalog
+        .folders
+        .iter()
+        .find(|folder| folder.mailbox == mailbox)
+        .map(|folder| folder.id.clone())
+        .unwrap_or_else(|| supplied.folder_id.clone());
+    Ok(MessageLocator {
+        folder_id,
+        mailbox,
+        uid_validity,
+        uid,
+    })
 }
 
 pub async fn fetch_body(
@@ -1682,6 +1947,21 @@ mod tests {
             Some("-X-GM-LABELS.SILENT (\\Inbox)")
         );
         assert_eq!(
+            mutation_store_query(&MessageMutation::RestoreArchive {
+                inbox_mailbox: "INBOX".into(),
+            })
+            .as_deref(),
+            Some("+X-GM-LABELS.SILENT (\\Inbox)")
+        );
+        assert_eq!(
+            restore_labels_query(true, &["Projects/Rust".into(), "A \\\"quoted".into()]).as_deref(),
+            Some("+X-GM-LABELS.SILENT (\\Inbox \"Projects/Rust\" \"A \\\\\\\"quoted\")")
+        );
+        assert_eq!(
+            restore_labels_query(false, &["Projects/Rust".into()]).as_deref(),
+            Some("+X-GM-LABELS.SILENT (\"Projects/Rust\")")
+        );
+        assert_eq!(
             mutation_store_query(&MessageMutation::SetLabel {
                 mailbox: "Project \\\"A".into(),
                 applied: true
@@ -1702,6 +1982,133 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn undo_mutations_require_catalog_discovered_special_use_mailboxes() {
+        let catalog = FolderCatalog::bounded(vec![
+            FolderDescriptor {
+                id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                display_name: "Inbox".into(),
+                kind: FolderKind::Inbox,
+            },
+            FolderDescriptor {
+                id: FolderId::Trash,
+                mailbox: "[Google Mail]/Papierkorb".into(),
+                display_name: "Papierkorb".into(),
+                kind: FolderKind::Trash,
+            },
+        ]);
+        assert!(mutation_catalog_is_valid(
+            &catalog,
+            &MessageMutation::RestoreArchive {
+                inbox_mailbox: "INBOX".into(),
+            }
+        ));
+        assert!(mutation_catalog_is_valid(
+            &catalog,
+            &MessageMutation::RestoreFromTrash {
+                inbox_mailbox: "INBOX".into(),
+                trash_mailbox: "[Google Mail]/Papierkorb".into(),
+                restore_inbox: false,
+                labels: vec!["Projects/Rust".into()],
+            }
+        ));
+        assert!(!mutation_catalog_is_valid(
+            &catalog,
+            &MessageMutation::RestoreFromTrash {
+                inbox_mailbox: "INBOX".into(),
+                trash_mailbox: "[Gmail]/Trash".into(),
+                restore_inbox: true,
+                labels: vec![],
+            }
+        ));
+    }
+
+    #[test]
+    fn system_membership_is_kept_separate_from_user_labels() {
+        let (labels, in_inbox, in_trash) =
+            gmail_label_state(["\\Inbox", "\\Trash", "Receipts", "Receipts"]);
+        assert!(in_inbox);
+        assert!(in_trash);
+        assert_eq!(labels, ["Receipts"]);
+    }
+
+    #[test]
+    fn partial_trash_restore_is_uncertain_but_first_store_rejection_is_not() {
+        let restore = MessageMutation::RestoreFromTrash {
+            inbox_mailbox: "INBOX".into(),
+            trash_mailbox: "Trash".into(),
+            restore_inbox: false,
+            labels: vec!["Receipts".into()],
+        };
+        assert!(partial_restore_is_uncertain(&restore, true));
+        assert!(!partial_restore_is_uncertain(&restore, false));
+        assert!(!partial_restore_is_uncertain(
+            &MessageMutation::Archive,
+            true
+        ));
+    }
+
+    #[test]
+    fn resolution_uses_discovered_special_use_paths_without_reusing_uids() {
+        let locator = MessageLocator {
+            folder_id: FolderId::Label("Receipts".into()),
+            mailbox: "Receipts".into(),
+            uid_validity: 7,
+            uid: 11,
+        };
+        let catalog = FolderCatalog::bounded(vec![
+            FolderDescriptor {
+                id: FolderId::AllMail,
+                mailbox: "[Google Mail]/Alles".into(),
+                display_name: "Alles".into(),
+                kind: FolderKind::AllMail,
+            },
+            FolderDescriptor {
+                id: FolderId::Inbox,
+                mailbox: "INBOX".into(),
+                display_name: "Inbox".into(),
+                kind: FolderKind::Inbox,
+            },
+            FolderDescriptor {
+                id: FolderId::Trash,
+                mailbox: "[Google Mail]/Papierkorb".into(),
+                display_name: "Papierkorb".into(),
+                kind: FolderKind::Trash,
+            },
+        ]);
+        assert_eq!(
+            resolution_mailboxes(&locator, &catalog),
+            vec![
+                "Receipts",
+                "[Google Mail]/Alles",
+                "INBOX",
+                "[Google Mail]/Papierkorb",
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_locator_uses_catalog_folder_identity_for_search_uid() {
+        let supplied = MessageLocator {
+            folder_id: FolderId::Inbox,
+            mailbox: "INBOX".into(),
+            uid_validity: 3,
+            uid: 4,
+        };
+        let catalog = FolderCatalog::bounded(vec![FolderDescriptor {
+            id: FolderId::AllMail,
+            mailbox: "All mail, localized".into(),
+            display_name: "All mail".into(),
+            kind: FolderKind::AllMail,
+        }]);
+        let resolved =
+            resolved_locator(&catalog, &supplied, "All mail, localized".into(), 99, 600).unwrap();
+        assert_eq!(resolved.folder_id, FolderId::AllMail);
+        assert_eq!(resolved.uid_validity, 99);
+        assert_eq!(resolved.uid, 600);
     }
 
     #[test]
@@ -1736,6 +2143,8 @@ mod tests {
             size: None,
             header,
             attachment_state: AttachmentState::Unknown,
+            in_inbox: false,
+            in_trash: false,
             labels: Vec::new(),
         };
         let mut missing_canonical = candidate(Some(3), Some(b"valid header".to_vec()));

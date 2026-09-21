@@ -3,8 +3,8 @@ use crate::{
     composer::{ComposeDraft, DraftAttachment},
     config, drafts, gmail, message,
     model::{
-        AccountIdentity, CacheUsage, FolderCatalog, FolderDescriptor, FolderId, MailProvider,
-        MailboxSnapshot, MessageBody, MessageId, MessageLocator, MessageMutation,
+        AccountIdentity, CacheUsage, FolderCatalog, FolderDescriptor, FolderId, FolderKind,
+        MailProvider, MailboxSnapshot, MessageBody, MessageId, MessageLocator, MessageMutation,
         ReconciledMessageState, SyncMetadata,
     },
     oauth::{self, AuthorizationUrl},
@@ -314,6 +314,18 @@ pub enum WorkerCommand {
         locator: MessageLocator,
         mutation: MessageMutation,
     },
+    /// Folder-independent mutation contract.  The catalog supplies the
+    /// account's discovered special-use mailbox paths; callers must not infer
+    /// localized Gmail paths from a FolderId.
+    MutateMessageInCatalog {
+        request_id: MutationRequestId,
+        generation: u64,
+        account_email: String,
+        message_id: MessageId,
+        locator: MessageLocator,
+        catalog: FolderCatalog,
+        mutation: MessageMutation,
+    },
     Shutdown,
 }
 impl fmt::Debug for WorkerCommand {
@@ -452,6 +464,30 @@ impl fmt::Debug for WorkerCommand {
                         MessageMutation::SetStarred(_) => "starred",
                         MessageMutation::Archive => "archive",
                         MessageMutation::MoveToTrash { .. } => "trash",
+                        MessageMutation::RestoreArchive { .. } => "restore-archive",
+                        MessageMutation::RestoreFromTrash { .. } => "restore-trash",
+                        MessageMutation::SetLabel { .. } => "label",
+                    },
+                )
+                .finish(),
+            Self::MutateMessageInCatalog {
+                request_id,
+                generation,
+                mutation,
+                ..
+            } => f
+                .debug_struct("MutateMessageInCatalog")
+                .field("request_id", request_id)
+                .field("generation", generation)
+                .field(
+                    "kind",
+                    &match mutation {
+                        MessageMutation::SetRead(_) => "read",
+                        MessageMutation::SetStarred(_) => "starred",
+                        MessageMutation::Archive => "archive",
+                        MessageMutation::MoveToTrash { .. } => "trash",
+                        MessageMutation::RestoreArchive { .. } => "restore-archive",
+                        MessageMutation::RestoreFromTrash { .. } => "restore-trash",
                         MessageMutation::SetLabel { .. } => "label",
                     },
                 )
@@ -1219,26 +1255,61 @@ async fn controller(
             ));
             continue;
         }
-        if matches!(&command, WorkerCommand::MutateMessage { .. }) {
-            let WorkerCommand::MutateMessage {
-                request_id,
-                generation,
-                account_email,
-                message_id,
-                locator,
-                mutation,
-            } = command
-            else {
-                unreachable!()
-            };
-            if let Err(error) = mutation_tx.send(MutationActorCommand::Mutate(MutationIo {
-                request_id,
-                generation,
-                account_email,
-                message_id,
-                locator,
-                mutation,
-            })) {
+        if matches!(
+            &command,
+            WorkerCommand::MutateMessage { .. } | WorkerCommand::MutateMessageInCatalog { .. }
+        ) {
+            let (request_id, generation, account_email, message_id, locator, catalog, mutation) =
+                match command {
+                    WorkerCommand::MutateMessage {
+                        request_id,
+                        generation,
+                        account_email,
+                        message_id,
+                        locator,
+                        mutation,
+                    } => {
+                        let catalog = legacy_mutation_catalog(&locator, &mutation);
+                        (
+                            request_id,
+                            generation,
+                            account_email,
+                            message_id,
+                            locator,
+                            catalog,
+                            mutation,
+                        )
+                    }
+                    WorkerCommand::MutateMessageInCatalog {
+                        request_id,
+                        generation,
+                        account_email,
+                        message_id,
+                        locator,
+                        catalog,
+                        mutation,
+                    } => (
+                        request_id,
+                        generation,
+                        account_email,
+                        message_id,
+                        locator,
+                        catalog,
+                        mutation,
+                    ),
+                    _ => unreachable!(),
+                };
+            if let Err(error) =
+                mutation_tx.send(MutationActorCommand::Mutate(Box::new(MutationIo {
+                    request_id,
+                    generation,
+                    account_email,
+                    message_id,
+                    locator,
+                    catalog,
+                    mutation,
+                })))
+            {
                 let MutationActorCommand::Mutate(failed) = error.0 else {
                     unreachable!()
                 };
@@ -1799,6 +1870,7 @@ async fn controller(
             | WorkerCommand::LoadSignature { .. }
             | WorkerCommand::SaveSignature { .. }
             | WorkerCommand::MutateMessage { .. }
+            | WorkerCommand::MutateMessageInCatalog { .. }
             | WorkerCommand::Shutdown => unreachable!(),
         };
         active = Some(Active { id, task, cleanup });
@@ -1864,11 +1936,66 @@ struct MutationIo {
     account_email: String,
     message_id: MessageId,
     locator: MessageLocator,
+    catalog: FolderCatalog,
     mutation: MessageMutation,
 }
 
+fn legacy_mutation_catalog(locator: &MessageLocator, mutation: &MessageMutation) -> FolderCatalog {
+    let mut folders = vec![FolderDescriptor {
+        id: locator.folder_id.clone(),
+        mailbox: locator.mailbox.clone(),
+        display_name: locator.mailbox.clone(),
+        kind: match &locator.folder_id {
+            FolderId::Inbox => FolderKind::Inbox,
+            FolderId::Sent => FolderKind::Sent,
+            FolderId::AllMail => FolderKind::AllMail,
+            FolderId::Trash => FolderKind::Trash,
+            FolderId::Starred => FolderKind::Starred,
+            FolderId::Label(_) => FolderKind::Label,
+        },
+    }];
+    // The legacy command already supplies a target resolved by the state
+    // catalog.  Preserve that path without hard-coding Gmail's Trash name.
+    if let MessageMutation::MoveToTrash { mailbox } = mutation {
+        folders.push(FolderDescriptor {
+            id: FolderId::Trash,
+            mailbox: mailbox.clone(),
+            display_name: mailbox.clone(),
+            kind: FolderKind::Trash,
+        });
+    }
+    if let MessageMutation::RestoreArchive { inbox_mailbox } = mutation {
+        folders.push(FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: inbox_mailbox.clone(),
+            display_name: inbox_mailbox.clone(),
+            kind: FolderKind::Inbox,
+        });
+    }
+    if let MessageMutation::RestoreFromTrash {
+        inbox_mailbox,
+        trash_mailbox,
+        ..
+    } = mutation
+    {
+        folders.push(FolderDescriptor {
+            id: FolderId::Inbox,
+            mailbox: inbox_mailbox.clone(),
+            display_name: inbox_mailbox.clone(),
+            kind: FolderKind::Inbox,
+        });
+        folders.push(FolderDescriptor {
+            id: FolderId::Trash,
+            mailbox: trash_mailbox.clone(),
+            display_name: trash_mailbox.clone(),
+            kind: FolderKind::Trash,
+        });
+    }
+    FolderCatalog::bounded(folders)
+}
+
 enum MutationActorCommand {
-    Mutate(MutationIo),
+    Mutate(Box<MutationIo>),
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -1902,11 +2029,12 @@ async fn mutation_actor(
             .filter(|value| value.email.eq_ignore_ascii_case(&command.account_email))
             .map(|value| Zeroizing::new(value.access_token.as_str().to_owned()));
         let outcome = if let Some(token) = credentials {
-            gmail::mutate_inbox(
+            gmail::mutate_message(
                 &command.account_email,
                 token.as_str(),
                 &command.message_id,
                 &command.locator,
+                &command.catalog,
                 &command.mutation,
             )
             .await
@@ -2494,6 +2622,7 @@ fn command_id(command: &WorkerCommand) -> Option<OperationId> {
         | WorkerCommand::LoadSignature { .. }
         | WorkerCommand::SaveSignature { .. }
         | WorkerCommand::MutateMessage { .. }
+        | WorkerCommand::MutateMessageInCatalog { .. }
         | WorkerCommand::Shutdown => None,
     }
 }
@@ -3908,7 +4037,7 @@ mod tests {
                 Arc::new(tokio::sync::Mutex::new(())),
             ));
             command_tx
-                .send(MutationActorCommand::Mutate(MutationIo {
+                .send(MutationActorCommand::Mutate(Box::new(MutationIo {
                     request_id: MutationRequestId(1),
                     generation: 7,
                     account_email: "person@example.com".into(),
@@ -3919,8 +4048,9 @@ mod tests {
                         uid_validity: 4,
                         uid: 9,
                     },
+                    catalog: FolderCatalog::inbox_only(),
                     mutation: MessageMutation::SetStarred(true),
-                }))
+                })))
                 .unwrap();
 
             assert!(drain_mutations(&command_tx).await);
@@ -3986,5 +4116,42 @@ mod tests {
         assert!(!debug.contains("Private project"));
         assert!(!debug.contains("private@example.com"));
         assert!(!debug.contains("gmail-msg"));
+    }
+
+    #[test]
+    fn catalog_mutation_command_redacts_catalog_and_keeps_special_use_target() {
+        let locator = MessageLocator {
+            folder_id: FolderId::AllMail,
+            mailbox: "[Gmail]/All Mail".into(),
+            uid_validity: 7,
+            uid: 11,
+        };
+        let catalog = legacy_mutation_catalog(
+            &locator,
+            &MessageMutation::MoveToTrash {
+                mailbox: "[Gmail]/Trash".into(),
+            },
+        );
+        assert_eq!(
+            catalog
+                .find(&FolderId::Trash)
+                .map(|folder| folder.mailbox.as_str()),
+            Some("[Gmail]/Trash")
+        );
+        let command = WorkerCommand::MutateMessageInCatalog {
+            request_id: MutationRequestId(10),
+            generation: 3,
+            account_email: "private@example.com".into(),
+            message_id: MessageId::gmail(42),
+            locator,
+            catalog,
+            mutation: MessageMutation::MoveToTrash {
+                mailbox: "[Gmail]/Trash".into(),
+            },
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("trash"));
+        assert!(!debug.contains("private@example.com"));
+        assert!(!debug.contains("[Gmail]/Trash"));
     }
 }

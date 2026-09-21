@@ -27,6 +27,12 @@ pub(crate) struct MessageListItem {
     pub(crate) selected: bool,
 }
 
+thread_local! {
+    // ToastOverlay owns presentation, while this reference lets a later state snapshot
+    // dismiss the exact operation's toast when Gmail rejects or consumes it.
+    static UNDO_TOAST: RefCell<Option<(u64, adw::Toast)>> = const { RefCell::new(None) };
+}
+
 #[derive(Clone)]
 pub struct Ui {
     pub window: adw::ApplicationWindow,
@@ -230,11 +236,38 @@ impl Ui {
         let include_visible_messages = self.last_list_revision.get() != state.list_revision();
         let snapshot = state.snapshot_for_render(include_visible_messages);
         drop(state);
+        self.sync_undo_message_toast(snapshot.undo_message_operation.as_ref());
         render::render(self, &snapshot);
     }
 
     pub(crate) fn toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+
+    fn sync_undo_message_toast(&self, operation: Option<&crate::state::UndoMessageOperationView>) {
+        UNDO_TOAST.with(|current| {
+            let mut current = current.borrow_mut();
+            if current
+                .as_ref()
+                .is_some_and(|(id, _)| operation.is_some_and(|operation| operation.id == *id))
+            {
+                return;
+            }
+            if let Some((_, toast)) = current.take() {
+                toast.dismiss();
+            }
+            let Some(operation) = operation else {
+                return;
+            };
+            let toast = adw::Toast::new(&format!("Message changed: {}", operation.title));
+            toast.set_button_label(Some("Undo"));
+            toast.set_action_name(Some("win.undo-message-operation"));
+            // The button's enabled state comes from the operation-specific window
+            // action. It stays unavailable until Gmail confirms the forward action.
+            toast.set_timeout(8);
+            self.toast_overlay.add_toast(toast.clone());
+            *current = Some((operation.id, toast));
+        });
     }
     pub(crate) fn send_message(&self) {
         self.flush_recipients();
