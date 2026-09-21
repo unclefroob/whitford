@@ -12,8 +12,11 @@
 .whitford-folder-list, .whitford-message-list, .whitford-reader { background-color: @view_bg_color; color: @view_fg_color; }
 .whitford-folder-row, .whitford-message-row { border: 0; background: transparent; color: @window_fg_color; padding: 0; }
 .whitford-folder-row { margin: 2px 10px; border-radius: 8px; }
-.whitford-folder-row:hover, .whitford-folder-row.selected, .whitford-message-row.selected { background-color: alpha(@accent_bg_color, 0.16); }
-.whitford-folder-row.selected, .whitford-filter-active { color: @accent_fg_color; }
+.whitford-folder-row:hover, .whitford-message-row.selected { background-color: alpha(@accent_bg_color, 0.16); }
+/* `accent_fg` is normally white. It is only legible when paired with the full
+ * accent surface, not a translucent tint on a light desktop theme. */
+.whitford-folder-row.selected { background-color: @accent_bg_color; color: @accent_fg_color; }
+.whitford-filter-active { color: @accent_color; }
 .whitford-count { min-width: 24px; min-height: 22px; border-radius: 6px; background-color: alpha(@accent_bg_color, 0.22); color: @window_fg_color; font-weight: 700; }
 .whitford-message-list { border-right: 1px solid @borders; }
 .whitford-message-row { border-bottom: 1px solid @borders; border-left: 3px solid transparent; }
@@ -30,7 +33,7 @@
 /* The remote document is isolated in WebKit; its edge follows the system surface. */
 .whitford-email-view { min-height: 620px; border: 1px solid @borders; border-radius: 10px; background-color: @view_bg_color; }
 .whitford-composer-toolbar button { min-width: 34px; min-height: 34px; padding: 4px; }
-.whitford-reader-action:first-child { color: @accent_fg_color; background-color: alpha(@accent_bg_color, 0.14); }
+.whitford-reader-action:first-child { color: @accent_fg_color; background-color: @accent_bg_color; }
 .whitford-online { color: @success_color; }
 .whitford-status, .dim-label { color: @insensitive_fg_color; }
 .whitford-status { padding: 28px; }
