@@ -4577,6 +4577,15 @@ impl AppState {
         self.save_preferences()
     }
     fn normalize(&mut self) {
+        // Once account-scoped mail is available, the legacy compatibility
+        // projection must never silently choose a message again.  Doing so
+        // lets a filter/search redraw replace a unified-reader selection with
+        // the first message from the original account.
+        if !self.account_mailboxes.is_empty() {
+            self.selected_message_id = None;
+            self.reconcile_account_selection();
+            return;
+        }
         let visible = self.visible_message_ids();
         if self
             .selected_message_id
@@ -4600,6 +4609,9 @@ impl AppState {
         }
     }
     fn move_selection(&mut self, step: isize) -> Update {
+        if self.selected_account_message.is_some() {
+            return self.move_account_selection(step);
+        }
         let visible = self.visible_message_ids();
         if visible.is_empty() {
             return Update::default();
@@ -4614,6 +4626,20 @@ impl AppState {
         self.selected_message_id = Some(visible[index].clone());
         self.bump_list();
         self.open_selected()
+    }
+    fn move_account_selection(&mut self, step: isize) -> Update {
+        let visible = self.account_visible_messages();
+        let Some(current) = self.selected_account_message.as_ref() else {
+            return Update::default();
+        };
+        let Some(index) = visible.iter().position(|message| &message.id == current) else {
+            return Update::default();
+        };
+        let next = index.saturating_add_signed(step).min(visible.len() - 1);
+        self.selected_message_id = None;
+        self.selected_account_message = Some(visible[next].id.clone());
+        self.bump_list();
+        self.open_selected_account()
     }
     fn open_selected(&mut self) -> Update {
         let Some(id) = self.selected_message_id.clone() else {

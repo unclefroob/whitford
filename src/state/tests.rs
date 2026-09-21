@@ -142,6 +142,12 @@ fn unified_reader_load_is_account_scoped_and_ignores_a_same_id_other_account() {
         selected_snapshot.selected_account_message,
         Some(selected.clone())
     );
+    // A later list normalization (for example after searching or filtering)
+    // must not restore the stale compatibility selection.
+    state.normalize();
+    let normalized = state.snapshot();
+    assert!(normalized.selected_message.is_none());
+    assert_eq!(normalized.selected_account_message, Some(selected.clone()));
     let (request_id, generation) = match update.effects.as_slice() {
         [
             Effect::SendWorker(WorkerCommand::FetchAccountBody {
