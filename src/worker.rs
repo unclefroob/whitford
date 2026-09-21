@@ -4174,17 +4174,10 @@ async fn remove_account(
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     cache_io: &Arc<Mutex<()>>,
 ) -> Result<(), ServiceFailure> {
-    // A registry row backed only by the old singleton secret is retained. Its
-    // removal belongs to the existing Disconnect flow; deleting it here would
-    // make it reappear on the next legacy restore.
-    match timeout(KEYRING_TIMEOUT, secrets::load_for_account(&account_id))
-        .await
-        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
-        .map_err(|_| failure(FailureKind::KeyringUnavailable, true, true))?
-    {
-        Some(_) => {}
-        None => return Err(failure(FailureKind::AuthorizationExpired, false, true)),
-    }
+    // Removal must work precisely when an account can no longer authenticate.
+    // `delete_for_account` is idempotent, so a missing/expired scoped token is
+    // not an error and must not prevent removing the registry row and cache.
+    // Legacy credentials use a different attribute set and remain untouched.
     emit_phase(tx, id, WorkerPhase::Disconnecting);
     let cache_account_id = account_id.clone();
     cache_blocking(cache_io.clone(), move || {
