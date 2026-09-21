@@ -51,7 +51,7 @@ pub(super) fn message_row(message: &MessageSummary, selected: bool) -> gtk::Box 
                 || "Time unavailable".into(),
                 |value| format_unix_local(Some(value), now_unix()),
             ))
-            .css_classes(["dim-label", "caption"])
+            .css_classes(["whitford-message-meta", "caption"])
             .build(),
     );
     copy.append(&top);
@@ -357,7 +357,9 @@ fn ellipsized(text: &str, strong: bool) -> gtk::Label {
     if strong {
         label.add_css_class("heading");
     } else {
-        label.add_css_class("dim-label");
+        // Read mail is not disabled. Keep its subject distinct from unread
+        // mail through weight, but retain enough contrast for long inboxes.
+        label.add_css_class("whitford-message-subject");
     }
     label
 }

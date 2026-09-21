@@ -23,6 +23,8 @@
 .whitford-message-row:hover { background-color: alpha(@window_fg_color, 0.05); }
 .whitford-message-row.selected { border-left-color: @accent_bg_color; }
 .whitford-message-row.unread { background-color: alpha(@accent_bg_color, 0.06); }
+/* Read mail uses normal content contrast, not the disabled-label token. */
+.whitford-message-subject, .whitford-message-meta { color: alpha(@view_fg_color, 0.74); }
 .whitford-avatar { min-width: 44px; min-height: 44px; border-radius: 999px; background-color: @card_bg_color; color: @window_fg_color; }
 .whitford-avatar.large { min-width: 50px; min-height: 50px; border: 1px solid @accent_bg_color; }
 .whitford-search { min-height: 38px; border-radius: 8px; border: 1px solid @borders; background-color: @card_bg_color; }
